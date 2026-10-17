@@ -12,10 +12,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 装 ldid
+        run: |
+          brew install ldid
+          ldid -h | head -3
+          
       - name: 装 Theos
         run: |
           export THEOS=$HOME/theos
-          git clone --recursive https://github.com/theos/theos.git $THEOS
+          git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
           curl -L -o $RUNNER_TEMP/sdks.tar.xz https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz || true
           mkdir -p $THEOS/sdks && tar -xf $RUNNER_TEMP/sdks.tar.xz -C $THEOS/sdks 2>/dev/null || true
           echo "THEOS=$THEOS" >> $GITHUB_ENV
