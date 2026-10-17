@@ -31,6 +31,27 @@ jobs:
           mkdir -p $THEOS/sdks && tar -xf $RUNNER_TEMP/sdks.tar.xz -C $THEOS/sdks 2>/dev/null || true
           echo "THEOS=$THEOS" >> $GITHUB_ENV
 
+      - name: 装 ldid（Theos 签名必需，缺了 make 会以 127 失败）
+        run: |
+          set -e
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          echo "--- 先看有没有预装 ---"
+          command -v ldid || echo "系统里没有 ldid"
+
+          brew install ldid || true
+
+          if ! command -v ldid >/dev/null 2>&1; then
+            echo "brew 没装上，改用官方预编译二进制"
+            curl -fsSL -o "$RUNNER_TEMP/ldid" https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64
+            chmod +x "$RUNNER_TEMP/ldid"
+            sudo mkdir -p /usr/local/bin
+            sudo mv "$RUNNER_TEMP/ldid" /usr/local/bin/ldid
+          fi
+
+          echo "--- 最终 ---"
+          command -v ldid
+          ldid 2>&1 | head -3 || true
+
       - name: 拉 imgui 源码
         run: |
           cd theos_cheat
@@ -40,10 +61,14 @@ jobs:
 
       - name: 编译
         run: |
+          set -e
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
           cd theos_cheat
           make package DEBUG=0 FINALPACKAGE=1 || make DEBUG=0 FINALPACKAGE=1
           echo "===== .theos 下所有 cheat.dylib（含 dSYM 里的）====="
           find .theos -name "cheat.dylib" -exec ls -l {} \; || true
+          echo "===== stage 目录 ====="
+          ls -lR .theos/_/Library/MobileSubstrate/DynamicLibraries/ 2>/dev/null || echo "stage 目录不存在"
 
       - name: 挑出真正的 dylib
         run: |
