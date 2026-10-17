@@ -35,12 +35,12 @@ jobs:
       - name: 编译
         run: |
           cd theos_cheat
-          make package DEBUG=0 FINALPACKAGE=1
+          make DEBUG=0 FINALPACKAGE=1
           find .theos -name "*.dylib" -exec cp {} "$RUNNER_TEMP/" \;
 
       - uses: actions/upload-artifact@v4
         with:
           name: cheat-dylib
           path: |
-            ${{ runner.temp }}/*.dylib
+            theos_cheat/.theos/obj/**/*.dylib
             theos_cheat/*.deb
