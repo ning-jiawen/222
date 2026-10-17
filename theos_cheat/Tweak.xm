@@ -38,7 +38,7 @@
 #import <time.h>
 #import <substrate.h>
 // iOS SDK 没有 sys/ptrace.h 和 sys/proc.h，这里手动声明
-extern int ptrace(int _request, pid_t _pid, caddr_t _addr, int _data);
+extern "C" int ptrace(int _request, pid_t _pid, caddr_t _addr, int _data);
 #ifndef PT_DENY_ATTACH
 #define PT_DENY_ATTACH 31
 #endif
