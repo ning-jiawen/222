@@ -30,8 +30,6 @@
 #import <mach-o/loader.h>
 #import <sys/sysctl.h>
 #import <sys/types.h>
-#import <sys/ptrace.h>
-#import <sys/proc.h>
 #import <mach/mach.h>
 #import <mach/task.h>
 #import <mach/exception_types.h>
@@ -39,6 +37,14 @@
 #import <unistd.h>
 #import <time.h>
 #import <substrate.h>
+// iOS SDK 没有 sys/ptrace.h 和 sys/proc.h，这里手动声明
+extern int ptrace(int _request, pid_t _pid, caddr_t _addr, int _data);
+#ifndef PT_DENY_ATTACH
+#define PT_DENY_ATTACH 31
+#endif
+#ifndef P_TRACED
+#define P_TRACED 0x00000800
+#endif
 
 #include "imgui.h"
 #include "imgui_impl_metal.h"
