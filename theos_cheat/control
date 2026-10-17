@@ -1,0 +1,9 @@
+Package: com.tuozhe.cheat
+Name: cheat
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: smoba IL2CPP helper skeleton
+Maintainer: local
+Author: local
+Section: Tweaks
+Depends: mobilesubstrate
