@@ -1,0 +1,135 @@
+name: build-cheat
+
+# 没有 Mac 也能编译外挂 dylib：把 theos_cheat 推上 GitHub，Actions 直接出 .dylib
+#
+# v3 修正（重要）：
+#   老版本用 `find .theos -name "*.dylib"` 抓产物，会命中
+#     .theos/obj/.../cheat.dylib.dSYM/Contents/Resources/DWARF/cheat.dylib
+#   那是调试符号文件，filetype = 0x0A = MH_DSYM，里面 __TEXT filesize = 0，一行业务代码都没有。
+#   它被注入 IPA 后，cimgui 的 LC_LOAD_WEAK_DYLIB 会静默跳过 —— 游戏照跑，hook 永不执行，
+#   表现为「三指下滑没菜单」，且不崩、不报错、看不出任何异常。
+#   本版改成：优先取 .theos/_ 的 stage 产物，排除 dSYM，并断言 filetype 必须是 6(MH_DYLIB)。
+
+on:
+  push:
+    branches: [main]
+    paths: ["theos_cheat/**", ".github/workflows/build-cheat.yml"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 装 Theos
+        run: |
+          set -e
+          export THEOS=$HOME/theos
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          curl -L -o $RUNNER_TEMP/sdks.tar.xz https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz || true
+          mkdir -p $THEOS/sdks && tar -xf $RUNNER_TEMP/sdks.tar.xz -C $THEOS/sdks 2>/dev/null || true
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+
+      - name: 装 ldid（Theos 签名必需，缺了 make 会以 127 失败）
+        run: |
+          set -e
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          echo "--- 先看有没有预装 ---"
+          command -v ldid || echo "系统里没有 ldid"
+
+          brew install ldid || true
+
+          if ! command -v ldid >/dev/null 2>&1; then
+            echo "brew 没装上，改用官方预编译二进制"
+            curl -fsSL -o "$RUNNER_TEMP/ldid" https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_macosx_arm64
+            chmod +x "$RUNNER_TEMP/ldid"
+            sudo mkdir -p /usr/local/bin
+            sudo mv "$RUNNER_TEMP/ldid" /usr/local/bin/ldid
+          fi
+
+          echo "--- 最终 ---"
+          command -v ldid
+          ldid 2>&1 | head -3 || true
+
+      - name: 拉 imgui 源码
+        run: |
+          cd theos_cheat
+          if [ ! -d imgui ]; then
+            git clone --depth 1 --branch v1.90.9 https://github.com/ocornut/imgui.git imgui
+          fi
+
+      - name: 编译
+        run: |
+          set -e
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          cd theos_cheat
+          make package DEBUG=0 FINALPACKAGE=1 || make DEBUG=0 FINALPACKAGE=1
+          echo "===== .theos 下所有 cheat.dylib（含 dSYM 里的）====="
+          find .theos -name "cheat.dylib" -exec ls -l {} \; || true
+          echo "===== stage 目录 ====="
+          ls -lR .theos/_/Library/MobileSubstrate/DynamicLibraries/ 2>/dev/null || echo "stage 目录不存在"
+
+      - name: 挑出真正的 dylib
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/out"
+          # 1) 优先 stage 目录（已 strip + 已 ldid 签名）
+          DYLIB=$(find theos_cheat/.theos/_ -type f -name "cheat.dylib" 2>/dev/null | head -1)
+          # 2) 退而求其次：obj 目录，但排除 dSYM
+          if [ -z "$DYLIB" ]; then
+            DYLIB=$(find theos_cheat/.theos -type f -name "cheat.dylib" -not -path "*dSYM*" 2>/dev/null | head -1)
+          fi
+          echo "pick: ${DYLIB:-<none>}"
+          if [ -z "$DYLIB" ]; then
+            echo "::error::没找到 cheat.dylib"
+            exit 1
+          fi
+          cp "$DYLIB" "$RUNNER_TEMP/out/cheat.dylib"
+          F="$RUNNER_TEMP/out/cheat.dylib"
+          ls -l "$F"
+          file "$F" || true
+
+      - name: 断言是真 dylib 且有代码
+        run: |
+          set -e
+          F="$RUNNER_TEMP/out/cheat.dylib"
+          FT=$(od -An -j 12 -N 4 -t u4 "$F" | tr -d ' \n')
+          echo "filetype = $FT   (6=MH_DYLIB 正确 / 10=MH_DSYM 错误)"
+          if [ "$FT" != "6" ]; then
+            echo "::error::产物 filetype=$FT 不是 MH_DYLIB，dyld 会静默跳过，等于没装"
+            exit 1
+          fi
+
+          SZ=$(stat -f%z "$F")
+          echo "size = $SZ"
+          if [ "$SZ" -lt 200000 ]; then
+            echo "::error::只有 $SZ 字节，不像成品 dylib"
+            exit 1
+          fi
+
+          TXT=$(otool -l "$F" | awk '/sectname __text/{c=1} c&&/^[[:space:]]*size /{print $2; exit}')
+          echo "__text size = ${TXT:-<none>}"
+          case "$TXT" in
+            0x*|0X*) ;;
+            *) echo "::error::dylib 里没有 __text 段"; exit 1 ;;
+          esac
+          TXT_D=$((TXT))
+          echo "__text bytes = $TXT_D"
+          if [ "$TXT_D" -lt 65536 ]; then
+            echo "::error::__text 只有 $TXT_D 字节，代码段空了"
+            exit 1
+          fi
+
+          echo "--- __TEXT 段 ---"
+          otool -l "$F" | grep -A4 "segname __TEXT" | head -12 || true
+          echo "--- arch ---"
+          lipo -info "$F" || true
+          echo "--- sha256 ---"
+          shasum -a 256 "$F"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cheat-dylib
+          path: ${{ runner.temp }}/out/*.dylib
+          if-no-files-found: error
