@@ -15,6 +15,15 @@
 //                   / startCountdownTimer / countdownTimerFired / showWithAnimation
 //    C. 屏幕诊断 —— 所有日志进 ImGui 面板，Windows 上看不到 NSLog 也能截图排查
 //
+//  v11-S（截图版，2026-10-18）—— 设备不越狱，唯一数据通道是手机截图：
+//    1. HUD 从「诊断文字」升级成「字段表阅读器」：每页 20 行，6 秒翻页，到底循环
+//    2. 字段缓冲 160 → 760 行，每行带 `名字 @十六进制偏移`，类头带 `(Nf)` 总字段数
+//    3. dump 名单改「包含匹配 + 相机优先」：CameraVP / CameraFocus / CameraOffs /
+//       CameraUpd / GuishiCamera / ActorManager / CBattleHeroInfo / Blood / ActorConfig / Player
+//    4. HUD 几何按屏幕算（17 Pro 横屏 874×402pt），左侧 62% 宽，10pt 等宽字，
+//       window / view / label 三层 userInteractionEnabled = NO，全程不吃触摸
+//    5. il2cpp 绑定从「15 秒一次」改成 12/22/35/50/70/95 秒六轮重试
+//
 //  对照原外挂（PxExtFFi 52MB）的防护点：
 //    sysctl / sysctlbyname / task_get_exception_ports / task_get_state  → 本文件已复刻
 //    _dyld_image_count / _dyld_get_image_name / dladdr / vm_region_64   → 本文件已复刻
@@ -118,12 +127,17 @@ static void pushLog(const char *fmt, ...) {
 #define LOG(fmt, ...) pushLog(fmt, ##__VA_ARGS__)
 
 // selfCheck 的字段表单独存一份：HUD 分页滚动显示，不用打开菜单也能截图核对
-#define MAXCHECK 160
-static char g_check[MAXCHECK][96];
+// v11-S（截图版）：缓冲 160 → 760 行，每页 20 行 → 十几页拍完；6 秒翻页并循环
+#define MAXCHECK   760
+#define CHECKLEN   112
+#define HUD_LINES   20
+#define HUD_DWELL  180          // CADisplayLink 30fps → 180 tick = 6 秒/页
+static char g_check[MAXCHECK][CHECKLEN];
 static int  g_checkN = 0;
+static int  g_hudPage = 0;      // HUD 当前页；selfCheck() 里要重置，所以提前声明
 
 static void checkLine(const char *fmt, ...) {
-    char buf[96];
+    char buf[CHECKLEN];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -607,7 +621,10 @@ static bool interestingField(const char *n) {
         "up", "level", "Level", "star", "Star", "hero", "Hero", "actor", "Actor",
         "id", "ID", "Id", "battle", "Battle", "player", "Player", "camera",
         "Camera", "view", "View", "proj", "Proj", "fov", "FOV", "visible",
-        "Visible", "alive", "Alive", "dead", "Dead", "distance", "Distance"
+        "Visible", "alive", "Alive", "dead", "Dead", "distance", "Distance",
+        // v11-S：相机/矩阵相关的补几个，截图时能排到每页最前面
+        "world", "World", "screen", "Screen", "vp", "VP", "rot", "Rot",
+        "quat", "Quat", "scale", "Scale", "trans", "Trans", "near", "far"
     };
     for (unsigned i = 0; i < sizeof(kw) / sizeof(kw[0]); i++) {
         if (strstr(n, kw[i])) return true;
@@ -617,56 +634,93 @@ static bool interestingField(const char *n) {
 
 static NSMutableString *g_dumpFile = nil;
 
-static void dumpClass(void *klass, const char *label) {
-    if (!klass) { CHECK("  %s: not found", label); return; }
+// v11-S：一行一个字段，只留「名字 @字节偏移」，够写 renderFrame 用了
+static void emitField(void *f) {
+    const char *fn = I2.field_get_name ? I2.field_get_name(f) : "?";
+    size_t off = I2.field_get_offset ? I2.field_get_offset(f) : 0;
+    if (g_dumpFile) [g_dumpFile appendFormat:@"  %s @%zX\n", fn ? fn : "?", off];
+    CHECK("%s @%zX", fn ? fn : "?", off);
+}
+
+// cap：这个类最多往 HUD 塞几行；all=1 时先排关键字字段，再用其余字段补满
+static void dumpClass(void *klass, const char *label, int cap, int all) {
+    if (!klass) { CHECK("%s: not found", label); return; }
+    if (!I2.class_get_fields) { CHECK("no class_get_fields"); return; }
+
     const char *ns = I2.class_get_namespace ? I2.class_get_namespace(klass) : "?";
-    CHECK("== %s.%s ==", ns ? ns : "?", label);
     if (g_dumpFile) [g_dumpFile appendFormat:@"\n== %s.%s ==\n", ns ? ns : "?", label];
 
     void *it = NULL, *f;
-    int total = 0, shown = 0;
-    while ((f = I2.class_get_fields(klass, &it)) && total++ < 400) {
-        const char *fn = I2.field_get_name(f);
-        size_t off = I2.field_get_offset ? I2.field_get_offset(f) : 0;
-        if (g_dumpFile) [g_dumpFile appendFormat:@"  %s @%zu\n", fn ? fn : "?", off];
-        if (interestingField(fn)) {
-            CHECK("  %s @%02zu", fn, off);
+    int total = 0;
+    while ((f = I2.class_get_fields(klass, &it)) && total < 900) total++;
+
+    // 头部写清总字段数：截图里看到 (18f) 就知道有没有被 cap 截掉
+    CHECK("== %s.%s (%df) ==", ns ? ns : "?", label, total);
+
+    int shown = 0;
+    for (int pass = 0; pass < (all ? 2 : 1) && shown < cap; pass++) {
+        it = NULL;
+        while ((f = I2.class_get_fields(klass, &it)) && shown < cap) {
+            bool key = interestingField(I2.field_get_name ? I2.field_get_name(f) : NULL);
+            if (pass == 0 && !key) continue;
+            if (pass == 1 && key) continue;
+            emitField(f);
             shown++;
         }
     }
-    if (total > shown) CHECK("  (%d fields, %d key)", total, shown);
+    if (shown < total) CHECK(".. %d/%d ..", shown, total);
 }
 
 static void selfCheck(void) {
-    CHECK("==== selfcheck ====");
+    g_checkN = 0;                 // 重跑时清空，否则页码翻倍
+    g_hudPage = 0;
+    CHECK("==== dump v11s ====");
     if (!I2.image) { CHECK("no game assembly"); return; }
     size_t n = I2.image_get_class_count ? I2.image_get_class_count(I2.image) : 0;
     CHECK("classes: %zu", n);
 
     g_dumpFile = [NSMutableString stringWithFormat:@"esp dump classes=%zu\n", n];
 
-    const char *keys[] = {"ActorManager", "CActorDisplaySystem", "ActorConfig",
-                          "HeroComponent", "CBattleHeroInfo", "Blood", "CPlayer",
-                          "Player", "Camera", "MobaCamera"};
-    int nk = sizeof(keys) / sizeof(keys[0]);
-    int found = 0;
-    for (size_t i = 0; i < n && found < 40; i++) {
-        void *k = I2.image_get_class(I2.image, i);
-        if (!k) continue;
-        const char *cn = I2.class_get_name(k);
-        if (!cn) continue;
-        for (int j = 0; j < nk; j++) {
-            if (strcmp(cn, keys[j]) == 0) {
-                void *parent = I2.class_get_parent ? I2.class_get_parent(k) : NULL;
-                CHECK("HIT %s.%s  parent=%s", I2.class_get_namespace(k), cn,
-                      parent ? I2.class_get_name(parent) : "?");
-                dumpClass(k, cn);
-                found++;
-                break;
-            }
+    // v11-S：包含匹配（metadata 类名可能被截断到 32 字符）+ 相机优先 + 每类限行
+    // 预算：约 230 行 → 12 页 × 6 秒 = 72 秒一轮，拍完就齐
+    static const struct { const char *kw; int maxCls; int cap; int all; } spec[] = {
+        {"CameraVP",            2, 18, 1},
+        {"CameraFocus",         1, 14, 1},
+        {"CameraOffs",          1, 12, 1},
+        {"CameraUpd",           1, 12, 1},
+        {"GuishiCamera",        2, 12, 1},
+        {"ActorManager",        1, 24, 1},
+        {"CActorDisplaySystem", 1, 14, 0},
+        {"CBattleHeroInfo",     1, 18, 1},
+        {"Hud3DBlood",          1, 12, 1},
+        {"Blood",               1, 12, 1},
+        {"ActorConfig",         1, 16, 1},
+    };
+    const int nsp = (int)(sizeof(spec) / sizeof(spec[0]));
+
+    void *seen[32];
+    int nseen = 0, found = 0;
+    for (int j = 0; j < nsp; j++) {
+        int hit = 0;
+        for (size_t i = 0; i < n && hit < spec[j].maxCls; i++) {
+            void *k = I2.image_get_class(I2.image, i);
+            if (!k) continue;
+            const char *cn = I2.class_get_name ? I2.class_get_name(k) : NULL;
+            if (!cn || !strstr(cn, spec[j].kw)) continue;
+            bool dup = false;
+            for (int s = 0; s < nseen; s++) { if (seen[s] == k) { dup = true; break; } }
+            if (dup) continue;
+            if (nseen < 32) seen[nseen++] = k;
+
+            const char *kns = I2.class_get_namespace ? I2.class_get_namespace(k) : "?";
+            CHECK("HIT %s.%s", kns ? kns : "?", cn);
+            dumpClass(k, cn, spec[j].cap, spec[j].all);
+            hit++;
+            found++;
         }
+        if (hit == 0) CHECK("%s: none", spec[j].kw);
     }
-    CHECK("==== done %d ====", found);
+    CHECK("==== %d cls ====", found);
 
     // 全量写文件，HUD 只显示筛过的
     if (g_dumpFile) {
@@ -761,26 +815,30 @@ static CADisplayLink *g_displayLink  = nil;
 static int            g_hudTick      = 0;
 
 static void renderOverlay(void);
-static int  g_hudPage = 0;
 
 static void updateHud(void) {
     if (!g_hudLabel) return;
-    NSMutableString *s = [NSMutableString stringWithCapacity:900];
-    [s appendString:@"ESP v2 loaded\n"];
-    [s appendFormat:@"asm %s  cls %zu\n",
+    NSMutableString *s = [NSMutableString stringWithCapacity:4096];
+    [s appendString:@"ESP v11s\n"];
+    [s appendFormat:@"asm %s cls %zu\n",
         g_imageName[0] ? g_imageName : "(none)",
         (I2.image && I2.image_get_class_count) ? I2.image_get_class_count(I2.image) : 0];
-    [s appendFormat:@"il2cpp %@  present %@  mx %@\n",
+    [s appendFormat:@"il2cpp %@ present %@ mx %@\n",
         g_il2cppOk ? @"OK" : @"FAIL",
         g_presentOn ? @"OK" : @"FAIL",
         g_vpReady ? @"OK" : @"todo"];
-    int pages = (g_checkN + 8) / 9;
+    int pages = (g_checkN + HUD_LINES - 1) / HUD_LINES;
     if (pages < 1) pages = 1;
     int page = g_hudPage % pages;
-    for (int i = page * 9; i < g_checkN && i < page * 9 + 9; i++) {
+    int first = page * HUD_LINES;
+    int last  = first + HUD_LINES;
+    if (last > g_checkN) last = g_checkN;
+    // 每页第一行写页码，单张截图也能对位
+    [s appendFormat:@"PAGE %d/%d\n", page + 1, pages];
+    for (int i = first; i < last; i++) {
         [s appendFormat:@"%s\n", g_check[i]];
     }
-    [s appendFormat:@"-- %d/%d --", page + 1, pages];
+    [s appendFormat:@"-- %d/%d -- loop", page + 1, pages];
     g_hudLabel.text = s;
 }
 
@@ -793,7 +851,7 @@ static void updateHud(void) {
     renderOverlay();
     int t = ++g_hudTick;
     if (t % 30 == 0) updateHud();
-    if (t % 120 == 0) g_hudPage++;      // 每 4 秒翻一页字段表
+    if (t % HUD_DWELL == 0) g_hudPage++;   // 6 秒翻一页，到底自动回第 1 页
 }
 @end
 
@@ -834,12 +892,18 @@ static void setupOverlay(void) {
 
     w.windowLevel = UIWindowLevelAlert + 100;
     w.backgroundColor = [UIColor clearColor];
+    // 关键：window 自己也是 UIView，默认 userInteractionEnabled=YES。
+    // 只把 rootViewController.view 关掉没用 —— hitTest 会落回 window 本身，
+    // 整个屏幕的触摸都会被它吃掉（esp9 就是卡在载入界面点不动的）。
+    w.userInteractionEnabled = NO;
 
     EspOverlayVC *vc = [[EspOverlayVC alloc] init];
     vc.view.frame = w.bounds;
     vc.view.backgroundColor = [UIColor clearColor];
-    vc.view.userInteractionEnabled = NO;      // 触摸穿透，游戏照常操作
+    vc.view.userInteractionEnabled = NO;      // 双保险：视图层也不收触摸
     w.rootViewController = vc;
+    w.hidden = NO;                            // 先上屏，safeAreaInsets 才有值
+    [w layoutIfNeeded];
 
     CAMetalLayer *ml = [CAMetalLayer layer];
     ml.device = MTLCreateSystemDefaultDevice();
@@ -850,15 +914,25 @@ static void setupOverlay(void) {
     ml.opaque = NO;
     [vc.view.layer addSublayer:ml];
 
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(6, 24, frame.size.width - 12, 300)];
-    l.numberOfLines = 0;
-    l.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
-    l.textColor = [UIColor greenColor];
-    l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
-    l.text = @"ESP v2 已加载（初始化中）";
-    [vc.view addSubview:l];
+    // v11-S HUD 几何：按屏幕算，不写死 —— 17 Pro 横屏 874×402pt
+    // 4 行状态 + HUD_LINES(20) 行字段，10pt Menlo 行高按 13pt 留余量
+    UIEdgeInsets si = w.safeAreaInsets;
+    CGFloat lh   = 13.0f;                    // 10pt Menlo 行高按 13 留余量，24 行不裁字
+    CGFloat hudW = frame.size.width * 0.62f;
+    if (hudW > 560) hudW = 560;
+    CGFloat hudH = (4 + HUD_LINES) * lh + 10;
+    if (hudH > frame.size.height - 16) hudH = frame.size.height - 16;
+    CGFloat ox = si.left + 4;  if (ox < 8) ox = 8;
+    CGFloat oy = si.top  + 4;  if (oy < 6) oy = 6;
 
-    w.hidden = NO;
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(ox, oy, hudW, hudH)];
+    l.numberOfLines = 0;
+    l.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
+    l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+    l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
+    l.text = @"ESP v11s booting";
+    [vc.view addSubview:l];
 
     g_overlayWin   = w;
     g_overlayLayer = ml;
@@ -891,7 +965,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v2 disarm");
+    ImGui::Text("build         : v11s dump (screenshot mode)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
@@ -1028,6 +1102,66 @@ static void installPresentHook(void) {
 // ============================================================================
 // 第 9 部分：入口
 // ============================================================================
+static bool g_gestureOn = false;      // 8 秒挂一次、绑成功后可能再挂一次，去重
+
+// 手势必须挂在「游戏的」window 上：overlay 是 userInteractionEnabled=NO，
+// 挂在自己身上等于失效。遍历所有 window，跳过我们那个。
+static void attachMenuGesture(void) {
+    if (g_gestureOn) return;
+    UIWindow *win = nil;
+    for (UIWindow *x in [UIApplication sharedApplication].windows) {
+        if (x == g_overlayWin) continue;
+        if (x.hidden || x.alpha < 0.01) continue;
+        win = x;
+        break;
+    }
+    if (!win) win = [UIApplication sharedApplication].keyWindow;
+    if (!win || win == g_overlayWin) { LOG("no keyWindow, swipe not attached"); return; }
+
+    UISwipeGestureRecognizer *g = [[UISwipeGestureRecognizer alloc]
+        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+            g_menuOpen = !g_menuOpen;
+        }] action:@selector(main)];
+    g.numberOfTouchesRequired = 3;
+    g.direction = UISwipeGestureRecognizerDirectionDown;
+    [win addGestureRecognizer:g];
+    g_gestureOn = true;
+    LOG("3-finger swipe attached");
+}
+
+static bool g_initDone = false;
+static dispatch_queue_t g_bindQ = NULL;
+
+// 绑定尝试时刻（秒）：12/22/35/50/70/95
+static const int kBindAt[] = {12, 22, 35, 50, 70, 95};
+#define kBIND_N ((int)(sizeof(kBindAt) / sizeof(kBindAt[0])))
+
+static void onIl2cppReady(void) {
+    selfCheck();
+    installPresentHook();
+    updateHud();
+    attachMenuGesture();
+    LOG("init done");
+}
+
+// v11-S：绑定改成多轮重试。整包重签装一次不容易，一次没绑上就白跑。
+static void bindAttempt(int round) {
+    if (g_il2cppOk) return;
+    if (!g_bindQ) g_bindQ = dispatch_queue_create("esp.bind", DISPATCH_QUEUE_SERIAL);
+    dispatch_async(g_bindQ, ^{
+        bindIl2cpp();
+        bool ok = g_il2cppOk;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (ok) {
+                if (!g_initDone) { g_initDone = true; onIl2cppReady(); }
+            } else {
+                updateHud();
+                LOG("bind round %d failed", round);
+            }
+        });
+    });
+}
+
 __attribute__((constructor)) static void cheat_entry(void) {
     // 干净包（无 PxExtFFi 外挂 / 无卡密系统）：ctor 只记一行日志。
     // 所有 ObjC / UIKit 一律推到主队列 —— esp7 就是死在 ctor 里碰 UIKit。
@@ -1045,31 +1179,19 @@ __attribute__((constructor)) static void cheat_entry(void) {
             updateHud();
         });
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                bindIl2cpp();
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    if (I2.image) selfCheck();
-                    installPresentHook();
-                    updateHud();
-
-                    UIWindow *win = [UIApplication sharedApplication].keyWindow;
-                    if (win) {
-                        UISwipeGestureRecognizer *g = [[UISwipeGestureRecognizer alloc]
-                            initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
-                                g_menuOpen = !g_menuOpen;
-                            }] action:@selector(main)];
-                        g.numberOfTouchesRequired = 3;
-                        g.direction = UISwipeGestureRecognizerDirectionDown;
-                        [win addGestureRecognizer:g];
-                        LOG("3-finger swipe attached");
-                    } else {
-                        LOG("no keyWindow, swipe not attached");
-                    }
-                    LOG("init done");
-                });
+        // v11-S：12/22/35/50/70/95 秒各试一次 il2cpp 绑定
+        for (int i = 0; i < kBIND_N; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)kBindAt[i] * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                if (g_il2cppOk) return;
+                bindAttempt(i);
             });
+        }
+
+        // 手势不等 il2cpp：绑不上也要能开菜单看日志
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            attachMenuGesture();
         });
     });
 }
