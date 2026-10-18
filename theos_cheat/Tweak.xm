@@ -750,6 +750,11 @@ static int    g_offCount   = -1;
 static int    g_offEntries = -1;
 static float  g_vp[16]     = {0};
 static bool   g_vpReady    = false;
+// v17.1：摄像机/视矩阵诊断变量也必须在这里声明 —— selfCheck 的诊断行在 ESP 段之前就用到它们
+static void  *g_camClass   = NULL;
+static void  *g_camInst    = NULL;
+static int    g_vpSrc      = -100;   // -100 未试 / -1 失败 / >=0 命中偏移
+static int    g_vpIsStruct = -1;
 
 // 泛型类没有固定命名空间，挨个试（空命名空间排第一）
 static const char *kNsGuess[] = {"", "UnityService.Collections", "Assets.Scripts.Common",
@@ -977,9 +982,6 @@ static void *findCls(const char *ns, const char *name) {
 }
 
 static void *g_mgrClass = NULL, *g_linkerClass = NULL, *g_vpClass = NULL;
-static void *g_camClass = NULL, *g_camInst = NULL;
-static int   g_vpSrc = -100;      // -100 未试 / -1 失败 / >=0 命中偏移
-static int   g_vpIsStruct = -1;
 
 // v17：按「字段类型名」找静态，处理 v16 漏掉的两种情况：
 //   ① 静态字段是 T[]（数组里放着目标对象）
