@@ -171,11 +171,22 @@ static void pushLog(const char *fmt, ...) {
 #define HUD_DWELL  180          // CADisplayLink 30fps → 180 tick = 6 秒/页
 static char g_check[MAXCHECK][CHECKLEN];
 static int  g_checkN = 0;
+static int  g_pinN   = -1;      // v46：前 N 行固定（类 dump / 绑定日志），永不覆盖；-1=未定
+// v47：一次性「事实行」按前缀钉住，永远显示在大 HUD 第一页，不随环形缓冲滚动
+#define PIN_N 6
+static char g_pinBuf[PIN_N][CHECKLEN];
+static int  g_freeze   = 0;     // v47：⏸ 冻结（不再接收新行 + 停止自动翻页）
+static int  g_frameStamp = 0;   // v47：帧序号（清陈旧 gone 条目用）
+static int  g_thT[16] = {0};    // v47：T 直方图（供不依赖 ActorManager 的白名单自证）
+static int  g_thN[16] = {0};
+static int  g_thC = 0;
 static int  g_hudPage = 0;      // HUD 当前页；selfCheck() 里要重置，所以提前声明
 static int    g_imgCount   = 0; // 扫过的 image 数
 static size_t g_clsScanned = 0; // 扫过的类数
 static int    g_found      = 0; // 本轮命中的类数
 static int    g_rescan     = 0; // 自动重扫轮次（手势回调要重置，所以放最前）
+
+static const char *g_pinTag[PIN_N] = { "DK ", "PSTR ", "CTX ", "WHITELIST", "CNT ", "TH " };
 
 static void checkLine(const char *fmt, ...) {
     char buf[CHECKLEN];
@@ -183,6 +194,26 @@ static void checkLine(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    if (g_freeze) return;                     // v47：冻结后不再接收新行
+    for (int i = 0; i < PIN_N; i++) {          // v47：按前缀钉住「一次性事实」
+        size_t tl = strlen(g_pinTag[i]);
+        if (strncmp(buf, g_pinTag[i], tl) == 0) {
+            snprintf(g_pinBuf[i], CHECKLEN, "%s", buf);
+            break;
+        }
+    }
+    if (g_checkN >= MAXCHECK) {
+        // v46：满了丢最旧的一行（但保留固定头），保住最新输出 —— 否则探针行永远进不来
+        int pin = (g_pinN < 0) ? 0 : g_pinN;
+        if (pin > MAXCHECK / 2) pin = MAXCHECK / 2;
+        if (pin < MAXCHECK - 1) {
+            memmove(g_check + (size_t)pin * CHECKLEN,
+                    g_check + (size_t)(pin + 1) * CHECKLEN,
+                    (size_t)(MAXCHECK - pin - 1) * CHECKLEN);
+            snprintf(g_check[MAXCHECK - 1], CHECKLEN, "%s", buf);
+            return;
+        }
+    }
     if (g_checkN < MAXCHECK) {
         snprintf(g_check[g_checkN], sizeof(g_check[0]), "%s", buf);
         g_checkN++;
@@ -824,7 +855,7 @@ static int    g_frameDead    = 0;     // 本帧判成死亡/失联的单位数
 static int    g_frameAll     = 0;     // 本帧实际检查过的单位数
 static void   bindLinkerFlags(void);
 // 死亡/失联的短期记忆（按 ObjID 记住「第一次看不到」的时刻），最多 64 个
-typedef struct { unsigned int id; float tGone; } GoneEnt;
+typedef struct { unsigned int id; float tGone; int lastF; } GoneEnt;
 static GoneEnt g_gone[64];
 static unsigned int g_seenId[64];     // 本帧已画过的 ObjID（去重）
 static int    g_seenN = 0;
@@ -978,7 +1009,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v45 ====");
+    CHECK("==== dump v47 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -989,7 +1020,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v45 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v47 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1955,16 +1986,32 @@ static void verifyIdentity(void) {
         static char th[120];
         int p = 0;
         th[0] = 0;
-        for (int i = 0; i < n && p < 100; i++)
+        for (int i = 0; i < n && p < 100; i++) {
             p += snprintf(th + p, sizeof(th) - p, "T%d=%d ", tv[i], tc[i]);
+            if (i < 16) { g_thT[i] = tv[i]; g_thN[i] = tc[i]; }
+        }
+        g_thC = n;
         CHECK("TH %s| u %d", th, g_lastCnt);
     }
     // 唯一定位英雄类型
-    if (hero > 0 && g_heroType < 0) {
-        int hit = 0, cand = -1;
-        for (int i = 0; i < n; i++) if (tc[i] == hero) { hit++; cand = tv[i]; }
-        if (hit == 1) { g_heroType = cand; CHECK("WHITELIST T=%d (hero %d)", cand, hero); }
-        else CHECK("WHITELIST none (hit %d, hero %d)", hit, hero);
+    if (g_heroType < 0) {
+        // v47：先按「数量」自证 —— 5v5 里主身英雄恒为 10，单边 5。
+        // 这一条不依赖任何 ActorManager 方法，比 GetHeroActorCount 稳。
+        int h10 = -1, h10n = 0, h5 = -1, h5n = 0;
+        for (int i = 0; i < n; i++) {
+            if (tc[i] == 10) { h10 = tv[i]; h10n++; }
+            if (tc[i] == 5)  { h5  = tv[i]; h5n++; }
+        }
+        if (h10n == 1)      { g_heroType = h10; CHECK("WHITELIST T=%d (cnt 10)", h10); }
+        else if (h5n == 1)  { g_heroType = h5;  CHECK("WHITELIST T=%d (cnt 5)",  h5); }
+        else if (hero > 0) {
+            int hit = 0, cand = -1;
+            for (int i = 0; i < n; i++) if (tc[i] == hero) { hit++; cand = tv[i]; }
+            if (hit == 1) { g_heroType = cand; CHECK("WHITELIST T=%d (hero %d)", cand, hero); }
+            else CHECK("WHITELIST none (hit %d, hero %d, h10n %d)", hit, hero, h10n);
+        } else {
+            CHECK("WHITELIST none (h10n %d h5n %d hero %d)", h10n, h5n, hero);
+        }
     }
 }
 
@@ -2245,14 +2292,20 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     }
     int cnt = 0;
     if (!rd((char *)dict + g_offCount, &cnt, sizeof(cnt))) {
-        if (g_diagFail < 6) { g_diagFail++; CHECK("Dcnt fail dict %p off %d", dict, g_offCount); }
-        dumpWords("Ddict", dict, 10);
+        if (g_diagFail < 6) {
+            g_diagFail++;
+            CHECK("Dcnt fail dict %p off %d", dict, g_offCount);
+            dumpWords("Ddict", dict, 10);      // v46：只在限流内转储，且每帧不再重复刷
+        }
         return;
     }
     void *entries = NULL;
     if (!rd((char *)dict + g_offEntries, &entries, sizeof(entries)) || !entries) {
-        if (g_diagFail < 6) { g_diagFail++; CHECK("Dent fail dict %p off %d -> %p", dict, g_offEntries, entries); }
-        dumpWords("Ddict", dict, 10);
+        if (g_diagFail < 6) {
+            g_diagFail++;
+            CHECK("Dent fail dict %p off %d -> %p", dict, g_offEntries, entries);
+            dumpWords("Ddict", dict, 10);
+        }
         return;
     }
     int cap = 0;
@@ -2291,6 +2344,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     g_prevInMatch = nowIn;
     // v20：读到单位 = 已经在对局里；只有这时才去碰相机/视矩阵（大厅里没有这些对象）
     g_inMatch = nowIn;
+    if (nowIn && g_pinN < 0) g_pinN = g_checkN;   // v46：把「类 dump + 绑定日志」固定住
 
     // v24：一次性内存转储。第一帧 + 每次进对局各打一份，一共最多 3 份。
     // D1/D2/D3 是原始字，D4/D5 同时试「数组数据在 0x18」和「在 0x20」两种可能，
@@ -2357,6 +2411,11 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
 
     int drawn = 0;
     g_scrW = sw; g_scrH = sh;                      // v39：ref2 判屏幕中心要用
+    g_frameStamp++;                                // v47
+    if ((g_frameStamp & 127) == 0) {               // 每 ~128 帧清一次超过 900 帧没出现的条目
+        for (int k = 0; k < 64; k++)
+            if (g_gone[k].id != 0 && g_frameStamp - g_gone[k].lastF > 900) { g_gone[k].id = 0; g_gone[k].tGone = 0; }
+    }
     g_seenN = 0;                                   // v35：本帧去重表清空
     g_frameDead = 0; g_frameAll = 0;
     if (cnt <= 0) {                                 // v35：换局/回大厅，清空生命周期记忆
@@ -2476,10 +2535,14 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         float goneAge = -1.0f;
         if (!g_flagTrust) { mesh = 1; logic = 1; }         // 旗标不可信 → 当作正常，绝不白屏
         if (mesh == 0 && logic == 0) {
-            if (gi < 0) {                                  // 第一次看不到：记时刻
-                for (int k = 0; k < 64; k++) if (g_gone[k].id == 0) { g_gone[k].id = objId; g_gone[k].tGone = nowT; gi = k; break; }
-                g_deadTotal++;
+            if (gi < 0 && g_offMeshVis >= 0) {              // 第一次看不到：记时刻
+                for (int k = 0; k < 64; k++) if (g_gone[k].id == 0) {
+                    g_gone[k].id = objId; g_gone[k].tGone = nowT;
+                    gi = k; g_deadTotal++;                  // v47：只有真分配到槽位才计数
+                    break;
+                }
             }
+            if (gi >= 0) g_gone[gi].lastF = g_frameStamp;
             if (gi >= 0) goneAge = nowT - g_gone[gi].tGone;
             // v36：撤回「超时丢弃」。视野外的敌人坐标可能是冻结的，丢掉就是主动放弃信息；
             // 只有 ObjID 从单位表里消失才真正不画（那种情况本来也进不来这个循环）。
@@ -2672,13 +2735,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v45  u%d r%d b%d p%d in%d d%d c%d  pg%d  full%d\n3-finger UP = full hud",
+            @"ESP v47  u%d r%d b%d p%d in%d d%d c%d  pg%d  full%d  fz%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
-            g_hudPage % 100, g_hudForce];
+            g_hudPage % 100, g_hudForce, g_freeze];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v45\n"];
+    [s appendString:@"ESP v47\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -2697,7 +2760,9 @@ static void updateHud(void) {
     {
         float winW = (float)g_overlayWin.bounds.size.width;
         float scl = (winW > 1.0f && g_camPxW > 0) ? ((float)g_camPxW / winW) : 0.0f;
-        [s appendFormat:@"HERO T %d (u %d) gone %d summon %d fog %d/%d\n",
+        for (int i = 0; i < PIN_N; i++)
+        if (g_pinBuf[i][0]) [s appendFormat:@"%s\n", g_pinBuf[i]];
+    [s appendFormat:@"HERO T %d (u %d) gone %d summon %d fog %d/%d\n",
         g_heroType, g_unitCount, g_deadTotal, g_mirrorSafe, g_fogRuns, FOG_RUNS];
     [s appendFormat:@"CTX %d PX %dx%d WIN %.0f SCL %.2f EXP %dx%d\n",
             g_ctxOff, g_camPxW, g_camPxH, winW, scl, g_expW, g_expH];
@@ -2822,7 +2887,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v45 booting";
+    l.text = @"ESP v47 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -2861,7 +2926,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v45 esp (pst-delta)");
+    ImGui::Text("build         : v47 esp (pinned+freeze)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
@@ -3139,7 +3204,22 @@ static void attachMenuGesture(void) {
             g_hudForce = g_hudForce ? 0 : 1; updateHud();
         }] forControlEvents:UIControlEventTouchUpInside];
         [win addSubview:bf];
-        LOG("buttons added ≡ / ▤");
+        // v47：⏸ 冻结 —— 不再接收新行、停止自动翻页，页内容不再移动，可以慢慢翻慢慢截
+        UIButton *bz = [UIButton buttonWithType:UIButtonTypeSystem];
+        bz.frame = CGRectMake(bx, 60 + (bw + 8) * 2, bw, bw);
+        bz.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
+        bz.layer.cornerRadius = 10;
+        bz.titleLabel.font = [UIFont boldSystemFontOfSize:20];
+        [bz setTitle:@"⏸" forState:UIControlStateNormal];
+        [bz setTitleColor:[UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:0.95]
+                 forState:UIControlStateNormal];
+        [bz addAction:[UIAction actionWithHandler:^(UIAction *a) {
+            g_freeze = g_freeze ? 0 : 1;
+            g_pageFreeze = g_freeze;
+            updateHud();
+        }] forControlEvents:UIControlEventTouchUpInside];
+        [win addSubview:bz];
+        LOG("buttons added ≡ / ▤ / ⏸");
     }
 }
 
