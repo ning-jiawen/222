@@ -24,6 +24,24 @@
 //       window / view / label 三层 userInteractionEnabled = NO，全程不吃触摸
 //    5. il2cpp 绑定从「15 秒一次」改成 12/22/35/50/70/95 秒六轮重试
 //
+//  v12 修（2026-10-18，esp11s 截图反馈：asm = Assembly-CSharp-firstpass.dll cls 7，dump 0 cls）：
+//    - 根因：12 秒时真正的 Assembly-CSharp.dll 还没被 Unity 加载，strstr("Assembly-CSharp")
+//      先把 firstpass（7 个类）选成主程序集，g_il2cppOk 被置真，后续重试全被
+//      `if (g_il2cppOk) return;` 掐掉 —— 永远 7 个类、永远 0 命中
+//    - 现在：firstpass 一律排除；选中程序集类数 < 1000 视为「没绑上」并继续重试
+//    - 重试时刻拉到 20~320 秒，覆盖热更新把 Assembly-CSharp.dll 装进来的时间点
+//    - 新增 4 指上滑 = 重新 dump / 重新绑定（overlay 不收触摸，菜单按钮点不动）
+//
+//  v13（2026-10-18，按原作者架构重构 dump 层）：
+//    把 PxExtFFi.bin 又扒了一遍：只有 27 个 il2cpp_* API 名字是明文，
+//    类名/字段名（ActorManager、Camera、Assets.Scripts.*）在 ascii / utf-16 / 反序里全是 0 命中
+//    —— 原作者把名字加密了，抄不到。但架构抄得到：
+//      他用的是 il2cpp_class_from_name + il2cpp_class_get_field_from_name，按名字取，
+//      全程没有「先挑一本程序集再枚举」这种动作。
+//    而那一步正是我们 12 秒撞上 Assembly-CSharp-firstpass.dll（7 类）的根源。
+//    所以本版：绑定只确认 domain；dump 遍历所有 image 的所有类按名字匹配；
+//    0 命中就每 15 秒自动重扫（最多 20 轮），另有 4 指上滑手动重扫。
+//
 //  对照原外挂（PxExtFFi 52MB）的防护点：
 //    sysctl / sysctlbyname / task_get_exception_ports / task_get_state  → 本文件已复刻
 //    _dyld_image_count / _dyld_get_image_name / dladdr / vm_region_64   → 本文件已复刻
@@ -135,6 +153,10 @@ static void pushLog(const char *fmt, ...) {
 static char g_check[MAXCHECK][CHECKLEN];
 static int  g_checkN = 0;
 static int  g_hudPage = 0;      // HUD 当前页；selfCheck() 里要重置，所以提前声明
+static int    g_imgCount   = 0; // 扫过的 image 数
+static size_t g_clsScanned = 0; // 扫过的类数
+static int    g_found      = 0; // 本轮命中的类数
+static int    g_rescan     = 0; // 自动重扫轮次（手势回调要重置，所以放最前）
 
 static void checkLine(const char *fmt, ...) {
     char buf[CHECKLEN];
@@ -565,45 +587,38 @@ static void bindIl2cpp(void) {
 
     if (!I2.domain_get) return;
     I2.domain = I2.domain_get();
+    if (!I2.domain) { LOG("domain not ready"); return; }        // il2cpp 还没起来，下一档再试
+    if (!I2.domain_get_assemblies) { LOG("no domain_get_assemblies"); return; }
 
     size_t n = 0;
     void **asms = I2.domain_get_assemblies(I2.domain, &n);
     LOG("assemblies: %zu", n);
 
-    // 选游戏主程序集：优先 Assembly-CSharp（类数最多的那个），
-    // 其次全局类数最多的。绝不能用 containsString:@"smoba" 先到先得 ——
-    // 那样会撞上 smoba.xxx 这类只有几个类的小程序集（classes: 7 的教训）。
-    void *bestImg = NULL;
-    const char *bestName = NULL;
-    size_t bestCount = 0;
-    int acCount = 0;
+    // v13：这里不再“选主程序集”。原作者反汇编里用的是
+    //   il2cpp_class_from_name / il2cpp_class_get_field_from_name —— 按名字直接取，
+    //   全程没有“先挑一本 DLL 再枚举”这一步。我们之前为了枚举类硬加了这一步，
+    //   于是 12 秒时撞上 Assembly-CSharp-firstpass.dll（7 类）就锁死了。
+    // 现在 binding 只负责：拿到 domain + 数一下有几个 image，剩下交给 dump 全量扫。
+    size_t n = 0;
+    void **asms = I2.domain_get_assemblies(I2.domain, &n);
+    g_imgCount = (int)n;
 
+    const char *bigName = "?";
+    size_t bigCount = 0, total = 0;
     for (size_t i = 0; i < n; i++) {
         void *img = I2.assembly_get_image(asms[i]);
-        const char *nm = I2.image_get_name(img);
-        if (!nm) continue;
+        if (!img) continue;
+        const char *nm = I2.image_get_name ? I2.image_get_name(img) : "?";
         size_t cc = I2.image_get_class_count ? I2.image_get_class_count(img) : 0;
-        LOG("  [%zu] %s  classes=%zu", i, nm, cc);
+        total += cc;
+        if (cc > bigCount) { bigCount = cc; bigName = nm ? nm : "?"; }
+        LOG("  [%zu] %s  classes=%zu", i, nm ? nm : "?", cc);
+    }
+    snprintf(g_imageName, sizeof(g_imageName), "%s", bigName);
 
-        if (cc > bestCount) { bestCount = cc; bestImg = img; bestName = nm; }
-
-        if (strstr(nm, "Assembly-CSharp")) {
-            acCount++;
-            if (!I2.image || cc > (I2.image_get_class_count ? I2.image_get_class_count(I2.image) : 0)) {
-                I2.image = img;
-                snprintf(g_imageName, sizeof(g_imageName), "%s", nm);
-            }
-        }
-    }
-    if (!I2.image && bestImg) {
-        I2.image = bestImg;
-        snprintf(g_imageName, sizeof(g_imageName), "%s", bestName ? bestName : "?");
-    }
-    if (I2.image) {
-        LOG("picked %s  classes=%zu  (Assembly-CSharp 命中 %d 个)",
-            g_imageName, I2.image_get_class_count ? I2.image_get_class_count(I2.image) : 0, acCount);
-    }
-    g_il2cppOk = (I2.image != NULL);
+    // 有 domain、有 image 就算“可用”——对错交给 dump 结果判断，不再自我宣布成功
+    g_il2cppOk = (I2.domain != NULL && n > 0);
+    LOG("bound: imgs=%d largest=%s cls=%zu", (int)n, g_imageName, total);
 }
 
 // ============================================================================
@@ -674,15 +689,20 @@ static void dumpClass(void *klass, const char *label, int cap, int all) {
 static void selfCheck(void) {
     g_checkN = 0;                 // 重跑时清空，否则页码翻倍
     g_hudPage = 0;
-    CHECK("==== dump v11s ====");
-    if (!I2.image) { CHECK("no game assembly"); return; }
-    size_t n = I2.image_get_class_count ? I2.image_get_class_count(I2.image) : 0;
-    CHECK("classes: %zu", n);
+    g_found = 0;
+    g_clsScanned = 0;
+    CHECK("==== dump v13 ====");
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump classes=%zu\n", n];
+    if (!I2.domain || !I2.domain_get_assemblies) { CHECK("no domain"); return; }
+    size_t n = 0;
+    void **asms = I2.domain_get_assemblies(I2.domain, &n);
+    g_imgCount = (int)n;
+    CHECK("images: %zu", n);
+    if (n == 0) return;
 
-    // v11-S：包含匹配（metadata 类名可能被截断到 32 字符）+ 相机优先 + 每类限行
-    // 预算：约 230 行 → 12 页 × 6 秒 = 72 秒一轮，拍完就齐
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump images=%zu\n", n];
+
+    // 列表：相机优先 + 单位/血条。maxCls = 最多收几个类，cap = 每类最多几行
     static const struct { const char *kw; int maxCls; int cap; int all; } spec[] = {
         {"CameraVP",            2, 18, 1},
         {"CameraFocus",         1, 14, 1},
@@ -697,30 +717,38 @@ static void selfCheck(void) {
         {"ActorConfig",         1, 16, 1},
     };
     const int nsp = (int)(sizeof(spec) / sizeof(spec[0]));
+    int hitN[16];
+    for (int j = 0; j < nsp; j++) hitN[j] = 0;
 
-    void *seen[32];
-    int nseen = 0, found = 0;
-    for (int j = 0; j < nsp; j++) {
-        int hit = 0;
-        for (size_t i = 0; i < n && hit < spec[j].maxCls; i++) {
-            void *k = I2.image_get_class(I2.image, i);
+    // v13：遍历「所有 image 的所有类」，不挑主程序集。
+    // 程序集在 20 秒、60 秒陆续装载，这一轮扫不到就下一轮 —— 不会再锁死在 7 个类的包上。
+    for (size_t a = 0; a < n; a++) {
+        void *img = I2.assembly_get_image(asms[a]);
+        if (!img) continue;
+        size_t cc = I2.image_get_class_count ? I2.image_get_class_count(img) : 0;
+        g_clsScanned += cc;
+        for (size_t i = 0; i < cc; i++) {
+            void *k = I2.image_get_class(img, i);
             if (!k) continue;
             const char *cn = I2.class_get_name ? I2.class_get_name(k) : NULL;
-            if (!cn || !strstr(cn, spec[j].kw)) continue;
-            bool dup = false;
-            for (int s = 0; s < nseen; s++) { if (seen[s] == k) { dup = true; break; } }
-            if (dup) continue;
-            if (nseen < 32) seen[nseen++] = k;
-
-            const char *kns = I2.class_get_namespace ? I2.class_get_namespace(k) : "?";
-            CHECK("HIT %s.%s", kns ? kns : "?", cn);
-            dumpClass(k, cn, spec[j].cap, spec[j].all);
-            hit++;
-            found++;
+            if (!cn) continue;
+            for (int j = 0; j < nsp; j++) {
+                if (hitN[j] >= spec[j].maxCls) continue;
+                if (!strstr(cn, spec[j].kw)) continue;
+                const char *kns = I2.class_get_namespace ? I2.class_get_namespace(k) : "?";
+                CHECK("HIT %s.%s", kns ? kns : "?", cn);
+                dumpClass(k, cn, spec[j].cap, spec[j].all);
+                hitN[j]++;
+                g_found++;
+                break;                    // 一个类只归第一个命中的关键词
+            }
         }
-        if (hit == 0) CHECK("%s: none", spec[j].kw);
     }
-    CHECK("==== %d cls ====", found);
+
+    for (int j = 0; j < nsp; j++) {
+        if (hitN[j] == 0) CHECK("%s: none", spec[j].kw);
+    }
+    CHECK("==== %d cls / %zu scanned ====", g_found, g_clsScanned);
 
     // 全量写文件，HUD 只显示筛过的
     if (g_dumpFile) {
@@ -795,7 +823,7 @@ static float g_vp[16] = {0};
 static bool  g_vpReady = false;
 
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
-    if (!I2.image) return;
+    if (!I2.domain) return;
     if (!g_vpReady) return;
     // TODO(自检后填)：遍历 ActorManager 单位列表 → 对每个单位 drawUnit
 }
@@ -819,10 +847,10 @@ static void renderOverlay(void);
 static void updateHud(void) {
     if (!g_hudLabel) return;
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v11s\n"];
-    [s appendFormat:@"asm %s cls %zu\n",
-        g_imageName[0] ? g_imageName : "(none)",
-        (I2.image && I2.image_get_class_count) ? I2.image_get_class_count(I2.image) : 0];
+    [s appendString:@"ESP v13\n"];
+    // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
+    [s appendFormat:@"imgs %d cls %zu hits %d%s\n",
+        g_imgCount, g_clsScanned, g_found, g_il2cppOk ? "" : " WAIT"];
     [s appendFormat:@"il2cpp %@ present %@ mx %@\n",
         g_il2cppOk ? @"OK" : @"FAIL",
         g_presentOn ? @"OK" : @"FAIL",
@@ -931,7 +959,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v11s booting";
+    l.text = @"ESP v13 booting";
     [vc.view addSubview:l];
 
     g_overlayWin   = w;
@@ -965,7 +993,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v11s dump (screenshot mode)");
+    ImGui::Text("build         : v13 dump (scan-all)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
@@ -1104,6 +1132,8 @@ static void installPresentHook(void) {
 // ============================================================================
 static bool g_gestureOn = false;      // 8 秒挂一次、绑成功后可能再挂一次，去重
 
+static void bindAttempt(int round);   // 手势回调要用，先声明
+
 // 手势必须挂在「游戏的」window 上：overlay 是 userInteractionEnabled=NO，
 // 挂在自己身上等于失效。遍历所有 window，跳过我们那个。
 static void attachMenuGesture(void) {
@@ -1127,20 +1157,51 @@ static void attachMenuGesture(void) {
     [win addGestureRecognizer:g];
     g_gestureOn = true;
     LOG("3-finger swipe attached");
+
+    // v13：4 指上滑 = 立刻重扫一遍（所有 image 全量扫）。
+    // 菜单里的 re-selfcheck 按钮在真机上是摆设 —— overlay 的 window 不收触摸，
+    // ImGui 的点按永远送不进来，所以补一个手势通道。
+    UISwipeGestureRecognizer *g2 = [[UISwipeGestureRecognizer alloc]
+        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+            if (g_il2cppOk) { g_rescan = 0; selfCheck(); updateHud(); LOG("manual re-dump"); }
+            else { bindAttempt(99); LOG("manual rebind"); }
+        }] action:@selector(main)];
+    g2.numberOfTouchesRequired = 4;
+    g2.direction = UISwipeGestureRecognizerDirectionUp;
+    [win addGestureRecognizer:g2];
+    LOG("4-finger swipe up = re-dump");
 }
 
 static bool g_initDone = false;
 static dispatch_queue_t g_bindQ = NULL;
 
-// 绑定尝试时刻（秒）：12/22/35/50/70/95
-static const int kBindAt[] = {12, 22, 35, 50, 70, 95};
+// 绑定尝试时刻（秒）。v13：domain 一出现就绑，之后靠 15 秒一轮的 rescan 等程序集装载。
+// 绑定时不再挑程序集，只确认 domain/image 存在；命中与否由 dump 结果说话。
+static const int kBindAt[] = {20, 30, 40, 50, 60, 75, 90, 110, 130, 160, 200, 260, 320};
 #define kBIND_N ((int)(sizeof(kBindAt) / sizeof(kBindAt[0])))
+
+// v13：扫不到就每 15 秒重扫一次（最多 20 轮），直到命中为止。
+// 这解决了“20 秒时程序集还没装载 → 一次空转到底”的整类问题。
+static void rescanTick(void) {
+    if (g_found > 0 || g_rescan >= 20) return;
+    g_rescan++;
+    selfCheck();
+    updateHud();
+    if (g_found == 0) {
+        LOG("rescan %d: 0 hit, next in 15s", g_rescan);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ rescanTick(); });
+    } else {
+        LOG("rescan %d: %d cls hit", g_rescan, g_found);
+    }
+}
 
 static void onIl2cppReady(void) {
     selfCheck();
     installPresentHook();
     updateHud();
     attachMenuGesture();
+    if (g_found == 0) rescanTick();
     LOG("init done");
 }
 
@@ -1179,7 +1240,7 @@ __attribute__((constructor)) static void cheat_entry(void) {
             updateHud();
         });
 
-        // v11-S：12/22/35/50/70/95 秒各试一次 il2cpp 绑定
+        // v13：20 秒起每档重试一次，直到 domain 就绪；之后 rescan 等程序集装载
         for (int i = 0; i < kBIND_N; i++) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)kBindAt[i] * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
