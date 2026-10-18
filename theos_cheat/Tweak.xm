@@ -49,6 +49,17 @@
 //    这次直接改成原作者的做法：il2cpp_class_from_name(image, ns, name) 精确取类，
 //    接口 / 编译器生成类 / 同名异命名空间都不可能误命中；字段全量输出（每类 cap 40）。
 //
+//  v16（2026-10-18，第一版真正画东西）：
+//    v15 证明三件事：① ActorManager 自己没有 ActorManager 类型的静态字段（单例在泛型基类）
+//                    ② DictionaryView`2 / TinyValueList`1 的字段偏移全是 0（泛型定义不可信）
+//                    ③ get_ActorList 是属性 getter，返回结构体，ABI 调用风险高
+//    所以 v16 全部走「纯内存读」，两条硬规矩：
+//      · 一切引擎内存访问用 vm_read_overwrite，坏指针返回失败而不是 SIGSEGV
+//      · 不调用游戏托管方法，只用 field_get_type → class_from_il2cpp_type 拿实例化类的真实偏移
+//    取法：沿父类链找 static 字段 → 值解引用 klass == ActorManager → 单例
+//          → ActorManager+0x10 (Context 字典) → _count/_entries → Entry.value → ActorLinker*
+//          → position @0x4C4 → worldToScreen(vp = CameraVPFrameCache._worldToClip @0x08) → 画框
+//
 //  对照原外挂（PxExtFFi 52MB）的防护点：
 //    sysctl / sysctlbyname / task_get_exception_ports / task_get_state  → 本文件已复刻
 //    _dyld_image_count / _dyld_get_image_name / dladdr / vm_region_64   → 本文件已复刻
@@ -530,9 +541,12 @@ typedef const char *(*t_class_get_name)(void *);
 typedef const char *(*t_class_get_namespace)(void *);
 typedef void *(*t_class_get_parent)(void *);
 typedef void *(*t_class_from_name)(void *, const char *, const char *);
+typedef void *(*t_class_from_il2cpp_type)(void *);          // v16：泛型实例化类型 → 真实类（偏移才对）
+typedef void *(*t_class_get_field_from_name)(void *, const char *);
 typedef void **(*t_class_get_fields)(void *, void **);
 typedef const char *(*t_field_get_name)(void *);
 typedef size_t (*t_field_get_offset)(void *);
+typedef int (*t_field_get_flags)(void *);                    // v16：区分 static / instance，避免误读崩溃
 typedef void *(*t_field_get_type)(void *);          // v14：字段类型，判断是不是 Vector3/Matrix4x4
 typedef const char *(*t_type_get_name)(void *);      // v14：类型名（原作者 27 个 API 里也有这个）
 typedef void (*t_field_get_value)(void *, void *, void *);
@@ -553,9 +567,12 @@ struct I2C {
     t_class_get_namespace         class_get_namespace;
     t_class_get_parent            class_get_parent;
     t_class_from_name             class_from_name;
+    t_class_from_il2cpp_type      class_from_il2cpp_type;
+    t_class_get_field_from_name   class_get_field_from_name;
     t_class_get_fields            class_get_fields;
     t_field_get_name              field_get_name;
     t_field_get_offset            field_get_offset;
+    t_field_get_flags             field_get_flags;
     t_field_get_type              field_get_type;
     t_type_get_name               type_get_name;
     t_field_get_value             field_get_value;
@@ -587,9 +604,12 @@ static void bindIl2cpp(void) {
     BINDF(class_get_namespace,        "il2cpp_class_get_namespace");
     BINDF(class_get_parent,           "il2cpp_class_get_parent");
     BINDF(class_from_name,            "il2cpp_class_from_name");
+    BINDF(class_from_il2cpp_type,     "il2cpp_class_from_il2cpp_type");
+    BINDF(class_get_field_from_name,  "il2cpp_class_get_field_from_name");
     BINDF(class_get_fields,           "il2cpp_class_get_fields");
     BINDF(field_get_name,             "il2cpp_field_get_name");
     BINDF(field_get_offset,           "il2cpp_field_get_offset");
+    BINDF(field_get_flags,            "il2cpp_field_get_flags");
     BINDF(field_get_type,             "il2cpp_field_get_type");
     BINDF(type_get_name,              "il2cpp_type_get_name");
     BINDF(field_get_value,            "il2cpp_field_get_value");
@@ -717,6 +737,18 @@ static const struct { const char *ns; const char *name; int cap; } g_targets[] =
 };
 #define NTARGET ((int)(sizeof(g_targets) / sizeof(g_targets[0])))
 
+// ---- v16：ESP 数据链（声明提前，selfCheck 要打诊断）----
+static void resolveEsp(void);
+static void  *g_mgr        = NULL;   // ActorManager 实例
+static void  *g_vpInst     = NULL;   // CameraVPFrameCache 实例
+static int    g_unitCount  = 0;
+static int    g_vpOk       = 0;
+static int    g_offDict    = -1;     // ActorManager + offDict -> Dictionary 对象
+static int    g_offCount   = -1;
+static int    g_offEntries = -1;
+static float  g_vp[16]     = {0};
+static bool   g_vpReady    = false;
+
 // 泛型类没有固定命名空间，挨个试（空命名空间排第一）
 static const char *kNsGuess[] = {"", "UnityService.Collections", "Assets.Scripts.Common",
                                  "System.Collections.Generic", "Assets.Scripts.GameLogic"};
@@ -771,7 +803,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v15 ====");
+    CHECK("==== dump v16 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -835,6 +867,13 @@ static void selfCheck(void) {
     }
 
     CHECK("==== %d cls / %zu scanned ====", foundN, g_clsScanned);
+
+    // v16：解析 ESP 数据链（实例 → 字典 → 偏移），结果直接进 HUD
+    resolveEsp();
+    CHECK("-- esp chain --");
+    CHECK("mgr %p vp %p ok %d", g_mgr, g_vpInst, g_vpOk);
+    CHECK("off dict %d cnt %d ent %d", g_offDict, g_offCount, g_offEntries);
+    CHECK("units %d", g_unitCount);
 
     // 全量写文件，HUD 只显示筛过的
     if (g_dumpFile) {
@@ -904,14 +943,169 @@ static void drawUnit(ImDrawList *dl, const ImVec2 &head, const ImVec2 &foot,
     }
 }
 
-// 视矩阵缓存：第一版先留空，自检拿到 Camera 字段名后填
-static float g_vp[16] = {0};
-static bool  g_vpReady = false;
+// ============================================================================
+// v16：ESP 数据链（实例 → 字典 → 单位）
+//
+// 两条硬原则：
+//  1) 所有引擎内存访问都走 vm_read_overwrite —— 地址无效只返回 KERN_FAILURE，
+//     不会 SIGSEGV。第一次画框最大的风险就是错位指针，这个做法把它消掉。
+//  2) 不调用游戏托管方法（get_ActorList 之类返回结构体，AArch64 是 sret，ABI 猜错直接闪退）。
+//     全部用「字段偏移 + 内存读」，和原作者一样把偏移写死，只是他的偏移来自加密名字表，
+//     我们的来自 v15 的 dump。
+// ============================================================================
+static bool rd(const void *addr, void *dst, size_t n) {
+    vm_size_t got = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr,
+                                         (vm_size_t)n, (vm_address_t)dst, &got);
+    return kr == KERN_SUCCESS && got == n;
+}
 
-static void renderFrame(ImDrawList *dl, float sw, float sh) {
+static void *findCls(const char *ns, const char *name) {
+    if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) return NULL;
+    size_t n = 0;
+    void **asms = I2.domain_get_assemblies(I2.domain, &n);
+    for (size_t a = 0; a < n; a++) {
+        void *img = I2.assembly_get_image(asms[a]);
+        if (!img) continue;
+        void *k = I2.class_from_name(img, ns, name);
+        if (k) return k;
+    }
+    return NULL;
+}
+
+static void *g_mgrClass = NULL, *g_linkerClass = NULL, *g_vpClass = NULL;
+
+// 单例：沿父类链找 static 字段，把值当指针安全读第一字（klass 指针），等于目标类就是它。
+// v15 的 dump 证明 ActorManager 自己没有 ActorManager 类型的静态字段 —— 单例在泛型基类上。
+static void *findInstanceByStatic(void *klass) {
+    if (!klass || !I2.class_get_fields || !I2.field_get_flags ||
+        !I2.field_static_get_value) return NULL;
+    void *k = klass;
+    for (int depth = 0; k && depth < 6; depth++) {
+        void *it = NULL, *f;
+        int guard = 0;
+        while ((f = I2.class_get_fields(k, &it)) && guard++ < 400) {
+            if (!(I2.field_get_flags(f) & 0x10)) continue;   // FIELD_ATTRIBUTE_STATIC
+            void *inst = NULL;
+            I2.field_static_get_value(f, &inst);
+            if (!inst) continue;
+            void *ik = NULL;
+            if (!rd(inst, &ik, sizeof(ik))) continue;
+            if (ik == klass) return inst;
+        }
+        k = I2.class_get_parent ? I2.class_get_parent(k) : NULL;
+    }
+    return NULL;
+}
+
+// updatableActorList 是 DictionaryView<UInt32,ActorLinker>（结构体），内部 Context 是
+// Dictionary<UInt32,Object> 的托管对象。泛型定义偏移不可信，必须经
+// field_get_type → class_from_il2cpp_type 拿到「实例化类」再取 _count / _entries 偏移。
+static void resolveDict(void *mgrClass) {
+    if (g_offDict >= 0 || !mgrClass) return;
+    if (!I2.class_get_field_from_name || !I2.field_get_type ||
+        !I2.class_from_il2cpp_type) return;
+
+    void *lf = I2.class_get_field_from_name(mgrClass, "updatableActorList");
+    if (!lf) return;
+    void *lt = I2.field_get_type(lf);
+    void *viewCls = lt ? I2.class_from_il2cpp_type(lt) : NULL;
+    if (!viewCls) return;
+    void *cf = I2.class_get_field_from_name(viewCls, "Context");
+    if (!cf) return;
+    void *ct = I2.field_get_type(cf);
+    void *dictCls = ct ? I2.class_from_il2cpp_type(ct) : NULL;
+    if (!dictCls) return;
+    void *cntF = I2.class_get_field_from_name(dictCls, "_count");
+    void *entF = I2.class_get_field_from_name(dictCls, "_entries");
+    if (!cntF || !entF) return;
+
+    g_offDict    = (int)I2.field_get_offset(lf);
+    g_offCount   = (int)I2.field_get_offset(cntF);
+    g_offEntries = (int)I2.field_get_offset(entF);
+}
+
+static void resolveEsp(void) {
     if (!I2.domain) return;
-    if (!g_vpReady) return;
-    // TODO(自检后填)：遍历 ActorManager 单位列表 → 对每个单位 drawUnit
+
+    if (!g_linkerClass) g_linkerClass = findCls("Assets.Scripts.GameLogic", "ActorLinker");
+    if (!g_vpClass)     g_vpClass     = findCls("Assets.Scripts.GameLogic", "CameraVPFrameCache");
+    if (!g_mgrClass)    g_mgrClass    = findCls("Assets.Scripts.GameLogic", "ActorManager");
+
+    if (!g_vpInst && g_vpClass) g_vpInst = findInstanceByStatic(g_vpClass);
+    if (g_vpInst && !g_vpReady) {
+        unsigned char buf[64];
+        if (rd((char *)g_vpInst + 0x08, buf, 64)) {
+            memcpy(g_vp, buf, 64);
+            unsigned char valid = 0;
+            if (rd((char *)g_vpInst + 0x50, &valid, 1) && valid) {
+                g_vpOk = 1;
+                g_vpReady = true;
+            }
+        }
+    }
+
+    if (!g_mgr && g_mgrClass) {
+        g_mgr = findInstanceByStatic(g_mgrClass);
+        if (g_mgr) resolveDict(g_mgrClass);
+    }
+}
+
+// Dictionary<UInt32,Object> 的 Entry：hashCode(4) next(4) key(4) pad(4) value(8) = 24B
+// 数组头 0x20（klass 8 + monitor 8 + bounds 8 + length 4 + pad 4）。
+static void renderFrame(ImDrawList *dl, float sw, float sh) {
+    if (!I2.domain || !g_vpReady || !g_mgr || !g_linkerClass) return;
+    if (g_offDict < 0 || g_offCount < 0 || g_offEntries < 0) return;
+
+    void *dict = NULL;
+    if (!rd((char *)g_mgr + g_offDict, &dict, sizeof(dict)) || !dict) return;
+
+    int cnt = 0;
+    if (!rd((char *)dict + g_offCount, &cnt, sizeof(cnt))) return;
+    void *entries = NULL;
+    if (!rd((char *)dict + g_offEntries, &entries, sizeof(entries)) || !entries) return;
+    int cap = 0;
+    if (!rd((char *)entries + 0x18, &cap, sizeof(cap))) return;
+
+    if (cnt < 0) cnt = 0;
+    if (cnt > cap) cnt = cap;
+    if (cnt > 64) cnt = 64;
+    g_unitCount = cnt;
+
+    int drawn = 0;
+    for (int i = 0; i < cnt && drawn < 32; i++) {
+        void *obj = NULL;
+        if (!rd((char *)entries + 0x20 + (size_t)i * 24 + 16, &obj, sizeof(obj))) continue;
+        if (!obj) continue;
+        void *ok = NULL;
+        if (!rd(obj, &ok, sizeof(ok)) || ok != g_linkerClass) continue;
+
+        float pos[3] = {0, 0, 0};
+        if (!rd((char *)obj + 0x4C4, pos, sizeof(pos))) continue;
+        unsigned char camp = 0;
+        rd((char *)obj + 0x504, &camp, 1);
+        unsigned int objId = 0;
+        rd((char *)obj + 0x4AC, &objId, 4);
+
+        Vec3 w = { pos[0], pos[1], pos[2] };
+        ImVec2 sp;
+        if (!worldToScreen(w, g_vp, sw, sh, sp)) continue;
+        if (sp.x < -200 || sp.x > sw + 200 || sp.y < -200 || sp.y > sh + 200) continue;
+
+        // 单位真实高度还没拿到（世界单位不是米），v16 先画固定尺寸框 + 圆点 + ID
+        float h  = 90.0f, wd = 45.0f;
+        ImU32 col = (camp == 0) ? IM_COL32(90, 190, 255, 230)
+                                : IM_COL32(255, 70, 70, 230);
+        if (g_showBox) {
+            dl->AddRect(ImVec2(sp.x - wd * 0.5f, sp.y - h),
+                        ImVec2(sp.x + wd * 0.5f, sp.y), col, 0, 0, 1.6f);
+        }
+        dl->AddCircleFilled(sp, 3.0f, col);
+        char buf[40];
+        snprintf(buf, sizeof(buf), "%u c%d", objId, (int)camp);
+        dl->AddText(ImVec2(sp.x + 6, sp.y - h - 12), col, buf);
+        drawn++;
+    }
 }
 
 // ============================================================================
@@ -933,10 +1127,11 @@ static void renderOverlay(void);
 static void updateHud(void) {
     if (!g_hudLabel) return;
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v15\n"];
+    [s appendString:@"ESP v16\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
-    [s appendFormat:@"imgs %d cls %zu hits %d%s\n",
-        g_imgCount, g_clsScanned, g_found, g_il2cppOk ? "" : " WAIT"];
+    // v16：再补单位数和 VP 状态
+    [s appendFormat:@"imgs %d cls %zu hits %d u %d%s\n",
+        g_imgCount, g_clsScanned, g_found, g_unitCount, g_il2cppOk ? "" : " WAIT"];
     [s appendFormat:@"il2cpp %@ present %@ mx %@\n",
         g_il2cppOk ? @"OK" : @"FAIL",
         g_presentOn ? @"OK" : @"FAIL",
@@ -966,6 +1161,7 @@ static void updateHud(void) {
     int t = ++g_hudTick;
     if (t % 30 == 0) updateHud();
     if (t % HUD_DWELL == 0) g_hudPage++;   // 6 秒翻一页，到底自动回第 1 页
+    if (t % 60 == 0 && (!g_vpReady || !g_mgr)) resolveEsp();  // v16：还没解析到就每 2 秒再试
 }
 @end
 
@@ -1045,7 +1241,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v15 booting";
+    l.text = @"ESP v16 booting";
     [vc.view addSubview:l];
 
     g_overlayWin   = w;
@@ -1079,7 +1275,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v15 dump (data+layout)");
+    ImGui::Text("build         : v16 esp (safe read)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
