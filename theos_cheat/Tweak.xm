@@ -848,6 +848,37 @@ static int    g_bktMov[4] = {0,0,0,0};
 static int    g_myCamp   = 0;         // 0 = 未知；由参考点那个英雄的 ActorCamp 定
 static int    g_rawOk    = 0;         // v40：rawHostId 是否可用（不用 <0 判断）
 static int    g_enemyN   = -1;        // 最近一次采样里的敌方主身数（5v5 应恒为 5）
+// v41：每个单位的轨迹（用来在「坐标冻结」时外推预测位置）
+typedef struct {
+    unsigned int id;
+    float p[3];
+    float v[3];
+    float tMove;
+    int   dkPrev;      // v44：上一帧 lastDeadKiller 是否非 0（边沿触发用）
+    float tDead;       // v44：判死时刻（用于 3 秒强制解锁）
+} TkEnt;
+// v42：死亡/轨迹相关字段（全部按名字取，取不到就是 -1，规则自动降级）
+static int    g_offDeadKiller = -1;   // lastDeadKiller
+static int    g_dkIsPtr       = -1;   // v43：1=对象指针 0=int id（由字段类型自证，不再猜）
+static int    g_offFrameNum   = -1;   // v43：lastPositionXZChangedFrameNum（位置更新的帧号）
+// v43：死亡计时（灰虚线 1.5s 淡出后不再画）
+typedef struct { unsigned int id; float t; } DeadEnt;
+static DeadEnt g_deadTbl[64];
+// v45：每个 id 记住「上一次采样到的记录末位」，用来算跨采样变化 dl（这才是判据）
+typedef struct { unsigned int id; float lx, lz; int n; } PstEnt;
+static PstEnt g_pst[16];
+static int    g_offEmptyActor = -1;   // IsEmptyActor：池回收标记
+static int    g_offPosRec     = -1;   // PositionRecords：定时记录位置的那个容器
+static int    g_posRecKind    = 0;    // 0=未知 1=List<Vector3> 2=Vector3[]
+static float  g_posRecGap     = 0;    // K_PositionRecordsTimeGap（静态常量，能读到就用它算时间轴）
+static int    g_pstRuns       = 0;    // PositionRecords 探针跑过几次（最多 3）
+static int    g_pidRuns       = 0;    // PlayerId 分组打印次数（最多 3）
+static void   bindExtraFlags(void);
+static void   probeExtras(void);
+static TkEnt g_tk[64];
+static NSMutableArray *g_keepAlive = nil;   // v41：手势/按钮 target 必须强持有，否则立刻释放
+static id  keepAlive(id o);
+static int projPred(float x, float y, float z, float sw, float sh, float *ox, float *oy);
 static int    w2sPx(float x, float y, float z, float *sx, float *sy);
 #define FOG_RUNS 24
 static float  g_fogLastT = 0;
@@ -947,7 +978,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v40 ====");
+    CHECK("==== dump v45 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -958,7 +989,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v40 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v45 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1511,8 +1542,69 @@ static void bindLinkerFlags(void) {
     if ((f = I2.class_get_field_from_name(g_linkerClass, "isMirrorActor")))   g_offMirror    = (int)I2.field_get_offset(f);
     if ((f = I2.class_get_field_from_name(g_linkerClass, "hostActor")))       g_offHostActor = (int)I2.field_get_offset(f);
     if ((f = I2.class_get_field_from_name(g_linkerClass, "callActor")))       g_offCallActor = (int)I2.field_get_offset(f);
+    // ---- v42：死亡 / 轨迹相关（同一个「按名字问偏移」的路子）
+    void *f2;
+    // v42/v43：lastDeadKiller 到底是「对象指针」还是「int id」，问字段类型 —— 不猜。
+    // 猜错的两种后果都很隐蔽：当 id 猜成指针 → 永远不判死；当指针猜成 id → 满屏灰虚线。
+    if ((f2 = I2.class_get_field_from_name(g_linkerClass, "lastDeadKiller"))) {
+        g_offDeadKiller = (int)I2.field_get_offset(f2);
+        void *dt = I2.field_get_type(f2);
+        const char *tn = (dt && I2.type_get_name) ? I2.type_get_name(dt) : "?";
+        // v44：用「值类型 / 引用类型」这个语义判断，不靠名字拼写。
+        // strstr("Int") 会把枚举（enDeadType 之类）误判成指针 —— 按指针读枚举 = 野指针。
+        void *kc = (dt && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(dt) : NULL;
+        if (kc && I2.class_is_valuetype) g_dkIsPtr = I2.class_is_valuetype(kc) ? 0 : 1;
+        else g_dkIsPtr = -1;                       // 未知：按 int 读，日志标 dk?
+        CHECK("DK off %d type %s ptr %d", g_offDeadKiller, tn ? tn : "?", g_dkIsPtr);
+    } else {
+        CHECK("DK no field");
+        g_dkIsPtr = 0;
+    }
+    if ((f2 = I2.class_get_field_from_name(g_linkerClass, "lastPositionXZChangedFrameNum")))
+        g_offFrameNum = (int)I2.field_get_offset(f2);
+    if ((f2 = I2.class_get_field_from_name(g_linkerClass, "IsEmptyActor")))    g_offEmptyActor = (int)I2.field_get_offset(f2);
+    if ((f2 = I2.class_get_field_from_name(g_linkerClass, "PositionRecords"))) {
+        g_offPosRec = (int)I2.field_get_offset(f2);
+        void *pt = I2.field_get_type(f2);
+        const char *pn = pt ? I2.type_get_name(pt) : NULL;
+        if (pn) {
+            size_t pl = strlen(pn);
+            if (strstr(pn, "List")) g_posRecKind = 1;
+            else if (pl > 2 && strcmp(pn + pl - 2, "[]") == 0) g_posRecKind = 2;
+        }
+        CHECK("PSTR off %d kind %d type %s", g_offPosRec, g_posRecKind, pn ? pn : "?");
+    } else {
+        CHECK("PSTR no PositionRecords");
+    }
+    if ((f2 = I2.class_get_field_from_name(g_linkerClass, "K_PositionRecordsTimeGap")) && I2.field_static_get_value) {
+        float gap = 0;
+        I2.field_static_get_value(f2, &gap);
+        if (gap > 0.0f && gap < 10.0f) g_posRecGap = gap;
+        CHECK("PSTR gap %.3f", g_posRecGap);
+    }
     CHECK("LFLAG mesh %d logic %d cam %d mirror %d host %d call %d",
           g_offMeshVis, g_offLogicVis, g_offInCam, g_offMirror, g_offHostActor, g_offCallActor);
+    CHECK("DEAD killer %d empty %d", g_offDeadKiller, g_offEmptyActor);
+}
+
+// v41：手势/控件 target 保活。UIGestureRecognizer 只保留 target 的 unsafe_unretained 引用，
+// 用 NSBlockOperation 当 target 时它出作用域就释放了 —— 之前 7 个手势全死就是这个原因。
+static id keepAlive(id o) {
+    if (!o) return nil;
+    if (!g_keepAlive) g_keepAlive = [NSMutableArray new];
+    [g_keepAlive addObject:o];
+    return o;
+}
+
+// v41：世界点 → 屏幕点（预测框用，复用已跑通的 W2S）
+static int projPred(float x, float y, float z, float sw, float sh, float *ox, float *oy) {
+    float px = 0, py = 0;
+    if (!w2sPx(x, y, z, &px, &py)) return 0;
+    float sc = (g_camPxW > 0 && sw > 1.0f) ? ((float)g_camPxW / sw)
+                                           : ((g_uiScale > 0.1f) ? g_uiScale : 3.0f);
+    *ox = px / sc;
+    *oy = sh - py / sc;
+    return 1;
 }
 
 // v39：把世界点投到 W2S 的像素空间，供 ref2 用（复用已经跑通的 ABI）
@@ -1597,6 +1689,91 @@ static int camRefPos(float lp[][3], int n, float *ox, float *oz) {
     }
     *ox = v.x; *oz = v.z;
     return 1;
+}
+
+// v42：探 PositionRecords 是否在「敌人不可见时仍然滚动」，并打印英雄的 PlayerId 分组。
+// 这两条决定「掌握动向」是真数据还是只能外推：
+//   PositionRecords 的 cnt/首尾在动 → 有真轨迹；全静止 → 客户端只有渲染层那一份副本。
+//   PlayerId 1..10 通常按阵营分组，一眼就能反推 camp（ActorMeta.ActorCamp 恒 0 的替代）。
+static void probeExtras(void) {
+    if (!g_lastEntries || g_lastCnt <= 0) return;
+    int lim = (g_lastCnt < 64) ? g_lastCnt : 64;
+    int pstN = 0, pidN = 0;
+    for (int i = 0; i < lim; i++) {
+        if (pstN >= 6 && pidN >= 5) break;
+        void *v = NULL, *k = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        if (rd(v, &k, sizeof(k)) && g_linkerClass && k != g_linkerClass) continue;
+
+        unsigned int id = 0;
+        rd((char *)v + 0x4AC, &id, 4);
+        int aT = 0, aC = 0, cfg = 0, pid = 0, hcfg = 0, rpid = 0;
+        readIdentity2(v, &aT, &aC, &cfg, &pid, &hcfg, &rpid);
+
+        // 只统计主身（分身/傀儡会污染 n 与 PlayerId 分组）
+        int mir = 0, host = 0, call = 0;
+        unsigned char bb = 0;
+        if (g_offMirror    >= 0) { bb = 0; rd((char *)v + g_offMirror,    &bb, 1); mir  = bb ? 1 : 0; }
+        if (g_offHostActor >= 0) { void *p = NULL; rd((char *)v + g_offHostActor, &p, sizeof(p)); host = p ? 1 : 0; }
+        if (g_offCallActor >= 0) { void *p = NULL; rd((char *)v + g_offCallActor, &p, sizeof(p)); call = p ? 1 : 0; }
+        int isHero = (g_heroType < 0) ? 1 : (aT == g_heroType);
+        if (mir || host || call) continue;
+
+        // ---- PlayerId 分组（按可靠性，这是 camp 恒 0 之后最省事的替代）
+        if (pidN < 5 && isHero) {
+            CHECK("HP id %u T %d pid %d raw %d cfg %d st %d", id, aT, pid, rpid, cfg, aC);
+            pidN++;
+        }
+
+        // ---- PositionRecords：同时打「记录末位 l」和「当前 position p」
+        if (pstN < 6 && isHero && g_offPosRec >= 0 && g_posRecKind > 0) {
+            void *rec = NULL;
+            if (rd((char *)v + g_offPosRec, &rec, sizeof(rec)) && rec) {
+                int cnt = -1;
+                void *data = NULL;
+                if (g_posRecKind == 1) { rd((char *)rec + 0x08, &data, sizeof(data)); rd((char *)rec + 0x10, &cnt, 4); }
+                else { data = rec; rd((char *)rec + 0x10, &cnt, 4); }
+                float cur[3] = {0, 0, 0}, last[3] = {0, 0, 0}, first[3] = {0, 0, 0};
+                rd((char *)v + 0x4C4, cur, sizeof(cur));
+                if (data && cnt > 0 && cnt <= 512) {
+                    int li = (cnt > 1) ? (cnt - 1) : 0;
+                    rd((char *)data + g_arrBase, first, sizeof(first));
+                    rd((char *)data + g_arrBase + (size_t)li * 12, last, sizeof(last));
+                }
+                int fn = -1;
+                if (g_offFrameNum >= 0) rd((char *)v + g_offFrameNum, &fn, sizeof(fn));
+                // ---- v45：跨采样变化量 dl = |l - l_上次采样|
+                float dl = -1.0f;
+                int ps = -1;
+                for (int x = 0; x < 16; x++) if (g_pst[x].id == id && id) { ps = x; break; }
+                if (ps < 0) {
+                    for (int x = 0; x < 16; x++) if (g_pst[x].id == 0) { ps = x; g_pst[x].id = id; g_pst[x].n = 0; break; }
+                }
+                if (ps >= 0) {
+                    if (g_pst[ps].n > 0) {
+                        float ddx = last[0] - g_pst[ps].lx, ddz = last[2] - g_pst[ps].lz;
+                        dl = sqrtf(ddx * ddx + ddz * ddz);
+                    }
+                    g_pst[ps].lx = last[0]; g_pst[ps].lz = last[2]; g_pst[ps].n++;
+                }
+                int lv = 1, mv = 1;
+                unsigned char lb = 0;
+                if (g_offLogicVis >= 0) { lb = 0; rd((char *)v + g_offLogicVis, &lb, 1); lv = lb ? 1 : 0; }
+                if (g_offMeshVis  >= 0) { lb = 0; rd((char *)v + g_offMeshVis,  &lb, 1); mv = lb ? 1 : 0; }
+                // 说明：|l - p| 不再是判据 —— 活着可见时记录末位本来就等于当前位置，
+                // 冻结时记录器写的也是那个冻结值，两种情况的 |l-p| 都≈0，区分不了。
+                // 判据是上面的 dl（跨采样变化）。
+                CHECK("PST id %u n %d p %.0f,%.0f l %.0f,%.0f dl %.0f lv%d mv%d fn %d gap %.2f",
+                      id, cnt, cur[0], cur[2], last[0], last[2], dl, lv, mv, fn, g_posRecGap);
+                pstN++;
+            } else {
+                CHECK("PST id %u rec null", id);
+                pstN++;
+            }
+        }
+    }
+    if (g_pidRuns < 3) g_pidRuns++;
+    if (g_pstRuns < 3) g_pstRuns++;
 }
 
 // v40：FOG 探针。判据只看「敌方主身」+「距离分桶 + 位移」。
@@ -2186,6 +2363,9 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         for (int k = 0; k < 64; k++) { g_gone[k].id = 0; g_gone[k].tGone = 0; }
         g_mirrorSafe = 0;
         for (int b = 0; b < 4; b++) { g_bktTot[b] = 0; g_bktMov[b] = 0; }   // v40：换局清空累计
+        for (int k = 0; k < 64; k++) { g_tk[k].id = 0; g_tk[k].v[0] = g_tk[k].v[2] = 0; }   // v41：换局清轨迹
+        for (int k = 0; k < 64; k++) { g_deadTbl[k].id = 0; g_deadTbl[k].t = 0; }             // v43：换局清死亡表
+        for (int k = 0; k < 16; k++) { g_pst[k].id = 0; g_pst[k].n = 0; }                       // v45：换局清 PST 记忆
         g_myCamp = 0; g_enemyN = -1;
     }
     for (int i = 0; i < cnt && drawn < 32; i++) {
@@ -2232,7 +2412,57 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
 
         // v36（对面改口，我认同）：分身/傀儡 **不清除**，改成细框 + 另一种颜色。
         // 元歌傀儡贴脸的时候，正是最需要看见的东西；过滤掉等于自断信息。
-        int isSummon = (mirror || host || call) ? 1 : 0;
+        // v42：死亡用 lastDeadKiller（!=0 = 已被击杀）为主判据；IsEmptyActor 作为池回收补充。
+        // _meshVisible/_logicVisible 在死亡后可能仍是 1（有尸体/影子），不能单独当死亡判据。
+        // v44：lastDeadKiller 可能「复活后不清零」（游戏留着做击杀回放）。
+        // 所以不能用「非 0 = 死亡」这种电平判据，改成：
+        //   边沿触发（0→非0 记死亡时刻）+ 活着证据（可见 或 位置动了）立即拉回
+        //   + 判死 3 秒还没被拉回就强制解锁（兜底）。
+        int isDead = 0;
+        int dkNow = 0;
+        if (g_offDeadKiller >= 0) {
+            if (g_dkIsPtr == 1) {                  // 引用类型：按 8 字节读
+                void *dk = NULL;
+                rd((char *)obj + g_offDeadKiller, &dk, sizeof(dk));
+                dkNow = dk ? 1 : 0;
+            } else {                               // 值类型（-1 未知也按 4 字节读，最安全）
+                int dv = 0;
+                rd((char *)obj + g_offDeadKiller, &dv, sizeof(dv));
+                dkNow = (dv != 0) ? 1 : 0;
+            }
+        }
+        if (g_dkIsPtr < 0) {                      // v45：类型未知，打一次原始 8 字节便于回看
+            static int s_dkRaw = 0;
+            if (!s_dkRaw) {
+                s_dkRaw = 1;
+                unsigned long long raw = 0;
+                rd((char *)obj + g_offDeadKiller, &raw, sizeof(raw));
+                CHECK("DK raw %016llx", raw);
+            }
+        }
+        int ti0 = -1;
+        for (int k = 0; k < 64; k++) if (g_tk[k].id == objId && objId) { ti0 = k; break; }
+        if (ti0 >= 0) {
+            if (dkNow && !g_tk[ti0].dkPrev) { g_tk[ti0].dkPrev = 1; g_tk[ti0].tDead = nowT; }
+            if (!dkNow) g_tk[ti0].dkPrev = 0;
+            int aliveEv = (mesh || logic) ? 1 : 0;
+            float adx = pos[0] - g_tk[ti0].p[0], adz = pos[2] - g_tk[ti0].p[2];
+            if (fabsf(adx) > 5.0f || fabsf(adz) > 5.0f) aliveEv = 1;
+            // v45：这里**不再**做时间兜底。死亡后复活要 20~40 秒，3 秒兜底只会在每一次正常死亡上误触发：
+            // 灰虚线 1.5s 消失后又被翻成「失联」，以灰实框永久挂在死亡点。
+            // 「字段复活不清零」那种情况，靠 aliveEv 就够（复活必然在泉水走动 → 位置差 >5 自动拉回）。
+            isDead = (g_tk[ti0].dkPrev && !aliveEv) ? 1 : 0;
+        }
+        if (g_offEmptyActor >= 0) {
+            unsigned char eb = 0; rd((char *)obj + g_offEmptyActor, &eb, 1);
+            if (eb) isDead = 1;
+        }
+        // v43：安全网只统计「真死亡」。失联（双旗标=0）在视野外很常见，绝不能算进去，
+        // 否则会误触「旗标不可信」而把失联/隐身状态整体关掉。
+        g_frameAll++;
+        if (isDead) g_frameDead++;
+        // v42：分身样式只对「英雄类型」生效 —— 否则红 buff 这类被挂载对象也会套上特殊框
+        int isSummon = ((mirror || host || call) && (g_heroType < 0 || aT == g_heroType)) ? 1 : 0;
         if (isSummon) g_mirrorSafe = 1;
 
         // ---- v35 规则3：死亡 / 失联 = 停滞 + 灰框 + 超时
@@ -2240,10 +2470,8 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         int gi = -1;
         for (int k = 0; k < 64; k++) if (g_gone[k].id == objId && g_gone[k].id != 0) { gi = k; break; }
         float goneAge = -1.0f;
-        g_frameAll++;
         if (!g_flagTrust) { mesh = 1; logic = 1; }         // 旗标不可信 → 当作正常，绝不白屏
         if (mesh == 0 && logic == 0) {
-            g_frameDead++;
             if (gi < 0) {                                  // 第一次看不到：记时刻
                 for (int k = 0; k < 64; k++) if (g_gone[k].id == 0) { g_gone[k].id = objId; g_gone[k].tGone = nowT; gi = k; break; }
                 g_deadTotal++;
@@ -2254,6 +2482,9 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
             // 于是这里只记年龄，用于在框上标「最后已知 N 秒前」。
         } else if (gi >= 0) {
             g_gone[gi].id = 0; g_gone[gi].tGone = 0;        // 又看得见了：清记忆
+        }
+        if (!isDead) {                                      // v43：活着 → 清死亡计时，避免复活后再死时立刻超时
+            for (int k = 0; k < 64; k++) if (g_deadTbl[k].id == objId) { g_deadTbl[k].id = 0; g_deadTbl[k].t = 0; }
         }
 
         if (g_unitDump < 6) {
@@ -2292,24 +2523,85 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         }
         if (sx < -200 || sx > sw + 200 || sy < -200 || sy > sh + 200) continue;
 
+        // ---- v41：轨迹与外推。视野外客户端拿不到新坐标（位置冻结），
+        // 所以用「最后一次移动的速度」外推一个预测点，画成橙色虚线框 + 连线 + 年龄。
+        float predX = 0, predY = 0, predAge = 0;
+        int havePred = 0;
+        {
+            int ti = -1;
+            for (int k = 0; k < 64; k++) if (g_tk[k].id == objId && objId != 0) { ti = k; break; }
+            if (ti < 0) {
+                for (int k = 0; k < 64; k++) if (g_tk[k].id == 0) {
+                    ti = k; g_tk[k].id = objId;
+                    g_tk[k].dkPrev = 0; g_tk[k].tDead = 0;      // v44
+                    g_tk[k].v[0] = g_tk[k].v[1] = g_tk[k].v[2] = 0;
+                    g_tk[k].p[0] = pos[0]; g_tk[k].p[1] = pos[1]; g_tk[k].p[2] = pos[2];
+                    g_tk[k].tMove = nowT;
+                    break;
+                }
+            }
+            if (ti >= 0) {
+                float ddx = pos[0] - g_tk[ti].p[0], ddz = pos[2] - g_tk[ti].p[2];
+                float dd = sqrtf(ddx * ddx + ddz * ddz);
+                if (dd > 3000.0f) {                       // 瞬移/重连/换视野：别外推
+                    g_tk[ti].v[0] = 0; g_tk[ti].v[2] = 0;
+                    g_tk[ti].tMove = nowT;
+                } else if (dd > 0.3f) {
+                    float dt = nowT - g_tk[ti].tMove; if (dt < 0.05f) dt = 0.05f;
+                    float nvx = ddx / dt, nvz = ddz / dt;
+                    float sp = sqrtf(nvx * nvx + nvz * nvz);
+                    if (sp > 3000.0f) { nvx *= 3000.0f / sp; nvz *= 3000.0f / sp; }
+                    g_tk[ti].v[0] = nvx; g_tk[ti].v[2] = nvz;
+                    g_tk[ti].tMove = nowT;
+                }
+                g_tk[ti].p[0] = pos[0]; g_tk[ti].p[1] = pos[1]; g_tk[ti].p[2] = pos[2];
+                predAge = nowT - g_tk[ti].tMove;
+                float sp = sqrtf(g_tk[ti].v[0] * g_tk[ti].v[0] + g_tk[ti].v[2] * g_tk[ti].v[2]);
+                if (predAge > 0.8f && sp > 20.0f) {       // 停了 0.8 秒以上、且此前真的在动
+                    float a = (predAge > 5.0f) ? 5.0f : predAge;
+                    if (projPred(g_tk[ti].p[0] + g_tk[ti].v[0] * a, g_tk[ti].p[1],
+                                 g_tk[ti].p[2] + g_tk[ti].v[2] * a, sw, sh, &predX, &predY))
+                        havePred = 1;
+                }
+            }
+        }
+
         // 单位真实高度还没拿到（世界单位不是米），先用固定尺寸框 + 圆点 + ID
         float h  = 90.0f, wd = 45.0f;
         ImU32 col = (camp == 0) ? IM_COL32(90, 190, 255, 230)
                                 : IM_COL32(255, 70, 70, 230);
         int deadStyle = 0;                                  // 0=正常 1=灰虚线淡出 2=隐身灰闪
-        if (mesh == 0 && logic == 0) {
-            // v36：灰色虚线，**不淡出、不丢弃**；年龄直接标在框上
-            col = IM_COL32(170, 170, 170, 200);
-            deadStyle = 1;
+        if (isDead) {
+            // v43 态③：死亡 —— 灰虚线 + 十字，1.5 秒后不再画
+            int di = -1;
+            for (int k = 0; k < 64; k++) if (g_deadTbl[k].id == objId && objId) { di = k; break; }
+            if (di < 0) {
+                for (int k = 0; k < 64; k++) if (g_deadTbl[k].id == 0) { g_deadTbl[k].id = objId; g_deadTbl[k].t = nowT; di = k; break; }
+            }
+            float dAge = (di >= 0) ? (nowT - g_deadTbl[di].t) : 0.0f;
+            if (dAge > 1.5f) continue;                 // 淡出结束：不再画
+            int ai = (int)(210 * (1.0f - dAge / 1.5f));
+            col = IM_COL32(190, 190, 190, ai < 40 ? 40 : ai);
+            deadStyle = 2;
         } else if (mesh == 0 && logic != 0) {
-            // 隐身（兰陵王/鬼谷子）：灰闪，这是透视的价值点，不当死亡处理
+            // 态④：隐身（兰陵王/鬼谷子）—— 灰闪，这是透视的价值点，不当死亡
             float blink = 0.5f + 0.5f * sinf(nowT * 6.0f);
             col = IM_COL32(220, 220, 220, (int)(90 + 120 * blink));
-            deadStyle = 2;
+            deadStyle = 3;
+        } else if (mesh == 0 && logic == 0) {
+            // v43 态②：存活但失联（雾里）—— 半透明灰**实框** + 年龄，永不丢弃
+            // 和死亡必须视觉可分：这里是实框，死亡是虚线 + 十字
+            col = IM_COL32(175, 175, 175, 130);
+            deadStyle = 1;
         }
         if (g_showBox) {
-            if (deadStyle == 1) {
+            if (deadStyle == 2) {
+                // 死亡：虚线框 + 十字
                 dashRect(dl, ImVec2(sx - wd * 0.5f, sy - h), ImVec2(sx + wd * 0.5f, sy), col);
+                dl->AddLine(ImVec2(sx - 10, sy - h * 0.5f), ImVec2(sx + 10, sy - h * 0.5f), col, 1.4f);
+                dl->AddLine(ImVec2(sx, sy - h * 0.5f - 10), ImVec2(sx, sy - h * 0.5f + 10), col, 1.4f);
+            } else if (deadStyle == 1) {
+                dl->AddRect(ImVec2(sx - wd * 0.5f, sy - h), ImVec2(sx + wd * 0.5f, sy), col, 0, 0, 1.2f);
             } else if (isSummon) {
                 // 分身/傀儡：细框 + 紫青色，明显区别于真身
                 dl->AddRect(ImVec2(sx - wd * 0.42f, sy - h * 0.9f),
@@ -2319,10 +2611,21 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
                             ImVec2(sx + wd * 0.5f, sy), col, 0, 0, 1.6f);
             }
         }
+        // v41：预测框 —— 橙色虚线 + 从最后已知位置的连线 + 年龄标签
+        if (havePred) {
+            dashRect(dl, ImVec2(predX - wd * 0.5f, predY - h), ImVec2(predX + wd * 0.5f, predY),
+                     IM_COL32(255, 185, 60, 200));
+            dl->AddLine(ImVec2(sx, sy), ImVec2(predX, predY), IM_COL32(255, 185, 60, 130), 1.2f);
+            char pb[32];
+            snprintf(pb, sizeof(pb), "~%.0fs", predAge);
+            dl->AddText(ImVec2(predX + 6, predY - h - 12), IM_COL32(255, 185, 60, 230), pb);
+        }
         dl->AddCircleFilled(ImVec2(sx, sy), 3.0f, col);
         char buf[72];
         if (deadStyle == 1 && goneAge >= 0)
-            snprintf(buf, sizeof(buf), "%u T%d C%d %s%.0fs", objId, aT, aC, isSummon ? "S " : "", goneAge);
+            snprintf(buf, sizeof(buf), "%u T%d C%d ?%.0fs", objId, aT, aC, goneAge);
+        else if (deadStyle == 2)
+            snprintf(buf, sizeof(buf), "%u dead", objId);
         else
             snprintf(buf, sizeof(buf), "%u T%d C%d H%d%s", objId, aT, aC, cfg, isSummon ? " S" : "");
         dl->AddText(ImVec2(sx + 6, sy - h - 12), col, buf);
@@ -2365,12 +2668,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v40  u%d r%d b%d p%d in%d d%d c%d\n3-finger UP = full hud",
-            g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState];
+            @"ESP v45  u%d r%d b%d p%d in%d d%d c%d  pg%d  full%d\n3-finger UP = full hud",
+            g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
+            g_hudPage % 100, g_hudForce];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v40\n"];
+    [s appendString:@"ESP v45\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -2431,6 +2735,8 @@ static void updateHud(void) {
     if (t % 90 == 0 && g_mgr && g_unitCount > 0 && g_verifyN < 3) { g_verifyN++; verifyIdentity(); }
     // v36：FOG 探针每 5 秒一次，最多 12 次（1 分钟），够看清机制就停，不刷页
     if (t % 150 == 0 && g_unitCount >= 40 && g_fogRuns < FOG_RUNS) { g_fogRuns++; fogProbe(); }
+    // v42：PositionRecords / PlayerId 分组，各跑 3 次就够
+    if (t % 150 == 0 && g_unitCount > 0 && (g_pstRuns < 3 || g_pidRuns < 3)) probeExtras();
     if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
 }
 @end
@@ -2512,7 +2818,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v40 booting";
+    l.text = @"ESP v45 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -2551,7 +2857,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v40 esp (fog-enemy-bucket)");
+    ImGui::Text("build         : v45 esp (pst-delta)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
@@ -2725,9 +3031,9 @@ static void attachMenuGesture(void) {
     if (!win || win == g_overlayWin) { LOG("no keyWindow, swipe not attached"); return; }
 
     UISwipeGestureRecognizer *g = [[UISwipeGestureRecognizer alloc]
-        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+        initWithTarget:keepAlive([NSBlockOperation blockOperationWithBlock:^{
             g_menuOpen = !g_menuOpen;
-        }] action:@selector(main)];
+        }]) action:@selector(main)];
     g.numberOfTouchesRequired = 3;
     g.direction = UISwipeGestureRecognizerDirectionDown;
     [win addGestureRecognizer:g];
@@ -2738,10 +3044,10 @@ static void attachMenuGesture(void) {
     // 菜单里的 re-selfcheck 按钮在真机上是摆设 —— overlay 的 window 不收触摸，
     // ImGui 的点按永远送不进来，所以补一个手势通道。
     UISwipeGestureRecognizer *g2 = [[UISwipeGestureRecognizer alloc]
-        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+        initWithTarget:keepAlive([NSBlockOperation blockOperationWithBlock:^{
             if (g_il2cppOk) { g_rescan = 0; selfCheck(); updateHud(); LOG("manual re-dump"); }
             else { bindAttempt(99); LOG("manual rebind"); }
-        }] action:@selector(main)];
+        }]) action:@selector(main)];
     g2.numberOfTouchesRequired = 4;
     g2.direction = UISwipeGestureRecognizerDirectionUp;
     [win addGestureRecognizer:g2];
@@ -2752,21 +3058,21 @@ static void attachMenuGesture(void) {
     //   3 指上滑 = 展开/收起完整 HUD（默认出框后自动收起）
     //   4 指下滑 = ESP 开/关
     UISwipeGestureRecognizer *g3 = [[UISwipeGestureRecognizer alloc]
-        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+        initWithTarget:keepAlive([NSBlockOperation blockOperationWithBlock:^{
             g_hudForce = g_hudForce ? 0 : 1;
             updateHud();
             LOG("hud force %d", g_hudForce);
-        }] action:@selector(main)];
+        }]) action:@selector(main)];
     g3.numberOfTouchesRequired = 3;
     g3.direction = UISwipeGestureRecognizerDirectionUp;
     [win addGestureRecognizer:g3];
 
     UISwipeGestureRecognizer *g4 = [[UISwipeGestureRecognizer alloc]
-        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+        initWithTarget:keepAlive([NSBlockOperation blockOperationWithBlock:^{
             g_espOn = g_espOn ? false : true;
             updateHud();
             LOG("esp %d", g_espOn ? 1 : 0);
-        }] action:@selector(main)];
+        }]) action:@selector(main)];
     g4.numberOfTouchesRequired = 4;
     g4.direction = UISwipeGestureRecognizerDirectionDown;
     [win addGestureRecognizer:g4];
@@ -2774,30 +3080,63 @@ static void attachMenuGesture(void) {
     // 现在首屏就有固定块；再加两个手势，想看哪页看哪页：
     //   2 指左滑 = 下一页，2 指右滑 = 上一页，2 指下滑 = 冻结/恢复自动翻页
     UISwipeGestureRecognizer *g5 = [[UISwipeGestureRecognizer alloc]
-        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+        initWithTarget:keepAlive([NSBlockOperation blockOperationWithBlock:^{
             g_hudPage++; updateHud(); LOG("page %d", g_hudPage);
-        }] action:@selector(main)];
+        }]) action:@selector(main)];
     g5.numberOfTouchesRequired = 2;
     g5.direction = UISwipeGestureRecognizerDirectionLeft;
     [win addGestureRecognizer:g5];
 
     UISwipeGestureRecognizer *g6 = [[UISwipeGestureRecognizer alloc]
-        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+        initWithTarget:keepAlive([NSBlockOperation blockOperationWithBlock:^{
             if (g_hudPage > 0) g_hudPage--; updateHud(); LOG("page %d", g_hudPage);
-        }] action:@selector(main)];
+        }]) action:@selector(main)];
     g6.numberOfTouchesRequired = 2;
     g6.direction = UISwipeGestureRecognizerDirectionRight;
     [win addGestureRecognizer:g6];
 
     UISwipeGestureRecognizer *g7 = [[UISwipeGestureRecognizer alloc]
-        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+        initWithTarget:keepAlive([NSBlockOperation blockOperationWithBlock:^{
             g_pageFreeze = g_pageFreeze ? 0 : 1; updateHud(); LOG("freeze %d", g_pageFreeze);
-        }] action:@selector(main)];
+        }]) action:@selector(main)];
     g7.numberOfTouchesRequired = 2;
     g7.direction = UISwipeGestureRecognizerDirectionDown;
     [win addGestureRecognizer:g7];
 
     LOG("2-finger L/R = page, 2-finger down = freeze");
+
+    // v41：多指手势在游戏里很容易被吃掉，另外放两个**常驻按钮**（右上角）：
+    //   ≡ 下一页     ▤ 大/小 HUD（长按无效）
+    // 用 block API（iOS 14+），UIAction 由按钮强持有，不存在 target 被释放的问题。
+    {
+        CGFloat bw = 44, bx = win.bounds.size.width - bw - 8;
+        UIButton *bp = [UIButton buttonWithType:UIButtonTypeSystem];
+        bp.frame = CGRectMake(bx, 60, bw, bw);
+        bp.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
+        bp.layer.cornerRadius = 10;
+        bp.titleLabel.font = [UIFont boldSystemFontOfSize:22];
+        [bp setTitle:@"≡" forState:UIControlStateNormal];
+        [bp setTitleColor:[UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:0.95]
+                 forState:UIControlStateNormal];
+        [bp addAction:[UIAction actionWithHandler:^(UIAction *a) {
+            g_hudPage++; updateHud();
+        }] forControlEvents:UIControlEventTouchUpInside];
+        [win addSubview:bp];
+
+        UIButton *bf = [UIButton buttonWithType:UIButtonTypeSystem];
+        bf.frame = CGRectMake(bx, 60 + bw + 8, bw, bw);
+        bf.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
+        bf.layer.cornerRadius = 10;
+        bf.titleLabel.font = [UIFont boldSystemFontOfSize:20];
+        [bf setTitle:@"▤" forState:UIControlStateNormal];
+        [bf setTitleColor:[UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:0.95]
+                 forState:UIControlStateNormal];
+        [bf addAction:[UIAction actionWithHandler:^(UIAction *a) {
+            g_hudForce = g_hudForce ? 0 : 1; updateHud();
+        }] forControlEvents:UIControlEventTouchUpInside];
+        [win addSubview:bf];
+        LOG("buttons added ≡ / ▤");
+    }
 }
 
 static bool g_initDone = false;
