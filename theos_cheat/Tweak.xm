@@ -794,9 +794,10 @@ static void  *g_uCamClass   = NULL;   // v23：UnityEngine.Camera —— 必须�
 static int    g_posOk       = 0;      // v23：坐标非零的单位数（大厅 vs 对局一看就知道）
 static int    g_camPxLogged = 0;      // v23：像素尺寸只打一次
 static int    g_cntRaw      = 0;      // v24：字典 _count 的原始值（夹紧前）
-static int    g_arrBase     = 0x18;   // v25：数组元素基址 —— 由「解引用后 klass == ActorLinker」决定，
-                                      //      不再写死。8 字节对象头 → 0x18；16 字节头 → 0x20
-static int    g_arrBaseVote = 0;      // v25：已由证据定过的次数（0 = 还没定）
+static int    g_arrBase     = 0x18;   // v27：固定 0x18，不自动翻。
+                                      // 依据：_entries@0x10 / _count@0x18 两条运行期实测已经把 8 字节头钉死，
+                                      // 所以「cap==0 → 16 字节头」「m20==1 → 基址 0x20」这两个推断都不成立。
+                                      // v26 把它们写进自动采纳，等于用错误推断改掉唯一正确的值 —— 撤掉。
 static int    g_diagFail    = 0;      // v24：链路失败日志配额（最多 6 条）
 static int    g_diagDump    = 0;      // v24：内存转储次数（开局各一次，最多 3 次）
 static int    g_curProbeN   = 0;      // v24：get_main / get_current 探测次数
@@ -856,7 +857,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v26 ====");
+    CHECK("==== dump v27 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -867,7 +868,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v26 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v27 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1367,39 +1368,34 @@ static void probeActorLists(void) {
             if (ent) rd((char *)ent + 0x10, &cap, sizeof(cap));
 
             void *v18 = NULL, *k18 = NULL, *v20 = NULL, *k20 = NULL;
-            void *v18b = NULL, *k18b = NULL, *v20b = NULL, *k20b = NULL;
+            void *v18b = NULL, *k18b = NULL;
             if (ent) {
                 if (rd((char *)ent + 0x18 + 16, &v18, sizeof(v18)) && v18) rd(v18, &k18, sizeof(k18));
                 if (rd((char *)ent + 0x20 + 16, &v20, sizeof(v20)) && v20) rd(v20, &k20, sizeof(k20));
-                if (rd((char *)ent + 0x18 + 24 + 16, &v18b, sizeof(v18b)) && v18b) rd(v18b, &k18b, sizeof(k18b));
-                if (rd((char *)ent + 0x20 + 24 + 16, &v20b, sizeof(v20b)) && v20b) rd(v20b, &k20b, sizeof(k20b));
+                // v27：只有 cnt >= 2 时第二个元素才存在；否则打 -1 表示「未知」，不要当成 0
+                if (cnt >= 2 && rd((char *)ent + 0x18 + 24 + 16, &v18b, sizeof(v18b)) && v18b)
+                    rd(v18b, &k18b, sizeof(k18b));
             }
             int m18 = (k18 && k18 == g_linkerClass) ? 1 : 0;
             int m20 = (k20 && k20 == g_linkerClass) ? 1 : 0;
-            int m18b = (k18b && k18b == g_linkerClass) ? 1 : 0;
-            int m20b = (k20b && k20b == g_linkerClass) ? 1 : 0;
+            int m18b = (cnt < 2) ? -1 : ((k18b && k18b == g_linkerClass) ? 1 : 0);
             if (shown++ < 8)
-                CHECK("L %s @%d ctx %p ent %p cnt %d cap %d m18 %d m18b %d m20 %d m20b %d",
-                      fn ? fn : "?", off, ctx, ent, cnt, cap, m18, m18b, m20, m20b);
-            // v26：cap 定头（与步长无关），klass 复核；两个元素都命中才算确认，避免单点巧合
-            if (best < 0) {
-                if (cap > 0 && cap < 65536) {
-                    if (m18) { best = off; bestBase = 0x18; }
-                } else if (cap == 0) {
-                    if (m20) { best = off; bestBase = 0x20; }
-                }
-                // cnt < 2 时第二个元素可能不存在，单元素命中照样接受
-                if (best < 0 && (m18 || m20)) { best = off; bestBase = m18 ? 0x18 : 0x20; }
-                if (m18 && !m18b) CHECK("L %s stride8? cnt %d cap %d", fn ? fn : "?", cnt, cap);
+                CHECK("L %s @%d ctx %p ent %p cnt %d cap %d m18 %d m18b %d m20 %d",
+                      fn ? fn : "?", off, ctx, ent, cnt, cap, m18, m18b, m20);
+            // v27：纯观测。只有「count 有值 + 基址 0x18 解得出 ActorLinker」才把这个字段记成候选，
+            // 绝不因为 m20 / cap==0 就改基址 —— 那两条推断在 8 字节头前提下不成立。
+            if (best < 0 && cap > 0 && cnt > 0 && m18) {
+                if (cnt < 2 || m18b == 1) { best = off; bestBase = 0x18; }
+                else CHECK("L %s m18 ok but m18b 0 (cnt %d) —— Entry 布局可疑", fn ? fn : "?", cnt);
             }
+            if (cap == 0 && shown <= 8) CHECK("L %s cap0 —— entries 不是数组或空数组", fn ? fn : "?");
+            if (m20 && !m18 && shown <= 8) CHECK("L %s m20 only —— 像步长 8 的指针数组", fn ? fn : "?");
         }
     }
     if (best >= 0) {
+        // 只换字段，不动基址（bestBase 恒为 0x18）
         if (best != g_offDict) { g_offDict = best; CHECK("L pick @%d", best); }
-        if (g_arrBase != bestBase || !g_arrBaseVote) {
-            g_arrBase = bestBase; g_arrBaseVote++;
-            CHECK("L base 0x%x", g_arrBase);
-        }
+        g_arrBase = 0x18;
     } else {
         CHECK("L none (DictionaryView 字段都没解出 ActorLinker)");
     }
@@ -1486,21 +1482,19 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         void *v18b = NULL, *k18b = NULL;
         if (rd((char *)entries + 0x18 + 16, &v18, sizeof(v18)) && v18) rd(v18, &k18, sizeof(k18));
         if (rd((char *)entries + 0x20 + 16, &v20, sizeof(v20)) && v20) rd(v20, &k20, sizeof(k20));
-        // v26：再解一次「第二个元素」（步长按 24）。用来区分 24 字节 Entry 和 8 字节纯指针数组：
-        // 24 字节 Entry 下 0x18 与 0x20 相差 8 字节，只会落在 key/pad 上，不可能同时命中；
-        // 而纯指针数组（步长 8）才会出现 0x18 和 0x20 都命中 —— 那正是对面担心的情形。
-        if (rd((char *)entries + 0x18 + 24 + 16, &v18b, sizeof(v18b)) && v18b) rd(v18b, &k18b, sizeof(k18b));
+        // v27：第二个元素只在 cnt>=2 时存在，否则读越界（rd 不会崩，但没有意义）
+        if (cntRaw >= 2 && rd((char *)entries + 0x18 + 24 + 16, &v18b, sizeof(v18b)) && v18b)
+            rd(v18b, &k18b, sizeof(k18b));
         CHECK("D4 base18 v %p k %p | base20 v %p k %p", v18, k18, v20, k20);
         int m18 = (k18 && k18 == g_linkerClass) ? 1 : 0;
         int m20 = (k20 && k20 == g_linkerClass) ? 1 : 0;
-        int m18b = (k18b && k18b == g_linkerClass) ? 1 : 0;   // 步长 24 的第二个元素
+        int m18b = (cntRaw < 2) ? -1 : ((k18b && k18b == g_linkerClass) ? 1 : 0);
         CHECK("D5 linker %p m18 %d m18b %d m20 %d cap %d", g_linkerClass, m18, m18b, m20, cap);
-        // v26：主判据换成 cap —— 8 字节头时 entries+0x10 是 max_length（>0），
-        // 16 字节头时那里是 bounds 指针的低 32 位（零基数组恒为 0）。这个判据与步长无关，不会被双命中骗。
-        if (cap > 0 && cap < 65536) { g_arrBase = 0x18; g_arrBaseVote++; }
-        else if (cap == 0) { g_arrBase = 0x20; g_arrBaseVote++; }
-        // 若 m18 成立而 m18b 不成立，说明这不是 24 字节 Entry（可能是 8 字节纯指针数组），单独记一行
-        if (m18 && !m18b) CHECK("D5 stride8? v18 %p v18b %p", v18, v18b);
+        // v27：这里只做记录，不改任何状态（基址恒 0x18）。
+        // cap>0 只是再次确认「entries+0x10 是 max_length」，与 8 字节头一致；
+        // m20 单独为 1 的含义是「这段内存像步长 8 的指针数组」，不是「基址 0x20」。
+        if (cap == 0) CHECK("D5 cap0 —— entries 不是数组或空数组");
+        if (m20 && !m18) CHECK("D5 m20 only —— 像步长 8 的指针数组");
     }
     // v17：第一个单位的坐标打一次，用来确认世界尺度（决定后面框的高度/距离怎么算）
     static bool s_posLogged = false;
@@ -1623,12 +1617,12 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v26  u%d r%d b%d p%d in%d d%d c%d\n3-finger UP = full hud",
+            @"ESP v27  u%d r%d b%d p%d in%d d%d c%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v26\n"];
+    [s appendString:@"ESP v27\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -1750,7 +1744,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v26 booting";
+    l.text = @"ESP v27 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -1787,7 +1781,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v26 esp (cap-verdict)");
+    ImGui::Text("build         : v27 esp (observe-only)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
