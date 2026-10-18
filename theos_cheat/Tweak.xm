@@ -793,6 +793,13 @@ static void  *g_uCamClass   = NULL;   // v23：UnityEngine.Camera —— 必须�
                                       // 永远查不到（截图里 api get_main 1 但 camcall no get_main 就是这么来的）
 static int    g_posOk       = 0;      // v23：坐标非零的单位数（大厅 vs 对局一看就知道）
 static int    g_camPxLogged = 0;      // v23：像素尺寸只打一次
+static int    g_cntRaw      = 0;      // v24：字典 _count 的原始值（夹紧前）
+static int    g_arrBase     = 0x18;   // v25：数组元素基址 —— 由「解引用后 klass == ActorLinker」决定，
+                                      //      不再写死。8 字节对象头 → 0x18；16 字节头 → 0x20
+static int    g_arrBaseVote = 0;      // v25：已由证据定过的次数（0 = 还没定）
+static int    g_diagFail    = 0;      // v24：链路失败日志配额（最多 6 条）
+static int    g_diagDump    = 0;      // v24：内存转储次数（开局各一次，最多 3 次）
+static int    g_curProbeN   = 0;      // v24：get_main / get_current 探测次数
 static bool   camStillValid(void);
 
 // 泛型类没有固定命名空间，挨个试（空命名空间排第一）
@@ -849,7 +856,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v23 ====");
+    CHECK("==== dump v26 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -860,7 +867,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v23 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v26 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1139,6 +1146,7 @@ static void probeCameraApi(void) {
     if (ucam) {
         CHECK("api get_main %d", I2.class_get_method_from_name(ucam, "get_main", 0) ? 1 : 0);
         CHECK("api w2sp %d", I2.class_get_method_from_name(ucam, "WorldToScreenPoint", 1) ? 1 : 0);
+        CHECK("api get_cur %d", I2.class_get_method_from_name(ucam, "get_current", 0) ? 1 : 0);
         CHECK("api w2cm %d", I2.class_get_method_from_name(ucam, "get_worldToCameraMatrix", 0) ? 1 : 0);
         CHECK("api projm %d", I2.class_get_method_from_name(ucam, "get_projectionMatrix", 0) ? 1 : 0);
     }
@@ -1233,8 +1241,11 @@ static void resolveEsp(void) {
 //  * 只有「get_main 这个方法本身不存在」才永久放弃，其它失败一律下一轮再试。
 static void resolveCam(void) {
     if (g_camCallState < 0) return;
-    if (!g_inMatch) return;
+    // v24：去掉 `if (!g_inMatch) return;` —— 这一行让相机逻辑在对局外一次都不跑，
+    // 于是 v23 的 c 永远是 0（而不是 -1），我们也就永远不知道 get_main 到底返回什么。
+    // get_main / get_current 都是纯属性读取，在大厅调用没有任何副作用。
     if (!I2.class_get_method_from_name) return;
+    if (!I2.domain) return;                       // v24：ticker 现在每秒都会调进来，先确认 il2cpp 已就绪
     // v23：用 g_uCamClass，绝不能用 g_camClass（那是 GuishiCamera）
     if (!g_uCamClass) g_uCamClass = findCls("UnityEngine", "Camera");
     if (!g_uCamClass) return;
@@ -1246,6 +1257,14 @@ static void resolveCam(void) {
     if (!fn) { g_camCallState = -1; CHECK("camcall no fn"); return; }
 
     void *cam = ((void *(*)(void *))fn)(g_miGetMain);
+    // v24：把 get_main 的返回值和 get_current 一起打一次。大厅里也打，否则「c 0」永远说不清。
+    if (g_curProbeN < 6) {
+        g_curProbeN++;
+        void *cur = NULL;
+        void *mc = I2.class_get_method_from_name(g_uCamClass, "get_current", 0);
+        if (mc) { void *f2 = *(void **)mc; if (f2) cur = ((void *(*)(void *))f2)(mc); }
+        CHECK("Dcam main %p cur %p", cam, cur);
+    }
     if (!cam) return;                             // 还没有相机，下一轮再试
     // v23：没换人就直接返回。换人（大厅相机 → 战斗相机）必须重新采纳，
     // 否则会一直拿大厅那台去投影。
@@ -1300,6 +1319,92 @@ static bool camStillValid(void) {
     return true;
 }
 
+// v24：把一段内存按 32 位字打出来。全部走 rd()，读不到就记一行，不会崩。
+static void dumpWords(const char *tag, const void *p, int n) {
+    if (n > 12) n = 12;
+    unsigned int w[12] = {0};
+    if (!rd(p, w, (size_t)n * 4)) { CHECK("%s rd fail %p", tag, p); return; }
+    char buf[12 * 9 + 16];
+    int o = 0;
+    for (int i = 0; i < n; i++) o += snprintf(buf + o, sizeof(buf) - o, " %08x", w[i]);
+    CHECK("%s%s", tag, buf);
+}
+
+// v25：把 ActorManager 上所有 DictionaryView 字段扫一遍，逐个解到 Context，再读
+// ent / cnt / cap，并同时用 0x18 和 0x20 两种基址去解第一个元素，看哪个 klass 等于 ActorLinker。
+// 结论直接采纳：哪个字段能解出 ActorLinker，就把 g_offDict 换成它，基址也一并定下来。
+// 这样「actorList@8 还是 updatableActorList@16」「0x18 还是 0x20」都不用再猜。
+static void probeActorLists(void) {
+    if (!g_mgr || !g_mgrClass || !I2.class_get_fields || !I2.field_get_type ||
+        !I2.type_get_name || !I2.field_get_name) return;
+    void *f = NULL;
+    int total = 0, shown = 0, best = -1, bestBase = 0x18;
+    // v25：class_get_fields 只给「本类自己声明的字段」，所以沿父类链走一遍
+    // —— actorList 这类字段很可能挂在 ActorManager 的基类上（findInstanceByStatic 也是这么走的）。
+    for (void *kc = g_mgrClass; kc && total < 300; kc = (I2.class_get_parent ? I2.class_get_parent(kc) : NULL)) {
+        void *it = NULL;
+        while ((f = I2.class_get_fields(kc, &it)) && total++ < 300) {
+            if (I2.field_get_flags && (I2.field_get_flags(f) & 0x10)) continue;  // 跳过 static
+            void *ft = I2.field_get_type(f);
+            const char *tn = ft ? I2.type_get_name(ft) : NULL;
+            if (!tn) continue;
+            // v25：除了 DictionaryView，也把「类型名里带 ActorLinker」的字段打出来
+            // —— 万一单位表其实是个 List<ActorLinker>/数组，也能一眼看到它在哪个偏移。
+            bool isDV = (strstr(tn, "DictionaryView") != NULL);
+            if (!isDV && !strstr(tn, "ActorLinker")) continue;
+            int off = (int)I2.field_get_offset(f);
+            const char *fn = I2.field_get_name(f);
+            if (!isDV) { if (shown++ < 8) CHECK("L %s @%d %s", fn ? fn : "?", off, tn); continue; }
+            void *ctx = NULL;
+            if (!rd((char *)g_mgr + off, &ctx, sizeof(ctx)) || !ctx) {
+                if (shown++ < 8) CHECK("L %s @%d ctx null", fn ? fn : "?", off);
+                continue;
+            }
+            void *ent = NULL;
+            int cnt = 0, cap = 0;
+            rd((char *)ctx + 0x10, &ent, sizeof(ent));
+            rd((char *)ctx + 0x18, &cnt, sizeof(cnt));
+            if (ent) rd((char *)ent + 0x10, &cap, sizeof(cap));
+
+            void *v18 = NULL, *k18 = NULL, *v20 = NULL, *k20 = NULL;
+            void *v18b = NULL, *k18b = NULL, *v20b = NULL, *k20b = NULL;
+            if (ent) {
+                if (rd((char *)ent + 0x18 + 16, &v18, sizeof(v18)) && v18) rd(v18, &k18, sizeof(k18));
+                if (rd((char *)ent + 0x20 + 16, &v20, sizeof(v20)) && v20) rd(v20, &k20, sizeof(k20));
+                if (rd((char *)ent + 0x18 + 24 + 16, &v18b, sizeof(v18b)) && v18b) rd(v18b, &k18b, sizeof(k18b));
+                if (rd((char *)ent + 0x20 + 24 + 16, &v20b, sizeof(v20b)) && v20b) rd(v20b, &k20b, sizeof(k20b));
+            }
+            int m18 = (k18 && k18 == g_linkerClass) ? 1 : 0;
+            int m20 = (k20 && k20 == g_linkerClass) ? 1 : 0;
+            int m18b = (k18b && k18b == g_linkerClass) ? 1 : 0;
+            int m20b = (k20b && k20b == g_linkerClass) ? 1 : 0;
+            if (shown++ < 8)
+                CHECK("L %s @%d ctx %p ent %p cnt %d cap %d m18 %d m18b %d m20 %d m20b %d",
+                      fn ? fn : "?", off, ctx, ent, cnt, cap, m18, m18b, m20, m20b);
+            // v26：cap 定头（与步长无关），klass 复核；两个元素都命中才算确认，避免单点巧合
+            if (best < 0) {
+                if (cap > 0 && cap < 65536) {
+                    if (m18) { best = off; bestBase = 0x18; }
+                } else if (cap == 0) {
+                    if (m20) { best = off; bestBase = 0x20; }
+                }
+                // cnt < 2 时第二个元素可能不存在，单元素命中照样接受
+                if (best < 0 && (m18 || m20)) { best = off; bestBase = m18 ? 0x18 : 0x20; }
+                if (m18 && !m18b) CHECK("L %s stride8? cnt %d cap %d", fn ? fn : "?", cnt, cap);
+            }
+        }
+    }
+    if (best >= 0) {
+        if (best != g_offDict) { g_offDict = best; CHECK("L pick @%d", best); }
+        if (g_arrBase != bestBase || !g_arrBaseVote) {
+            g_arrBase = bestBase; g_arrBaseVote++;
+            CHECK("L base 0x%x", g_arrBase);
+        }
+    } else {
+        CHECK("L none (DictionaryView 字段都没解出 ActorLinker)");
+    }
+}
+
 // Dictionary<UInt32,Object> 的 Entry：hashCode(4) next(4) key(4) pad(4) value(8) = 24B
 // 数组头 0x20（klass 8 + monitor 8 + bounds 8 + length 4 + pad 4）。
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
@@ -1311,32 +1416,53 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     {
         void *mk = NULL;
         if (!rd(g_mgr, &mk, sizeof(mk)) || !mk || (g_mgrClass && mk != g_mgrClass)) {
+            if (g_diagFail < 6) { g_diagFail++; CHECK("Dmgr bad %p k %p want %p", g_mgr, mk, g_mgrClass); }
             g_mgr = NULL; g_unitCount = 0; g_inMatch = 0; g_prevInMatch = 0;
             return;
         }
     }
 
+    // v24：每一步读失败都要留一行。v22/v23 在这里全是裸 return，所以 HUD 只剩 u 0，
+    // 根本分不清是空字典、偏移错、还是数组头错 —— 这就是「修了三个版本没框」的根源。
     void *dict = NULL;
-    if (!rd((char *)g_mgr + g_offDict, &dict, sizeof(dict)) || !dict) return;
-
+    if (!rd((char *)g_mgr + g_offDict, &dict, sizeof(dict)) || !dict) {
+        if (g_diagFail < 6) { g_diagFail++; CHECK("Ddict fail mgr %p off %d -> %p", g_mgr, g_offDict, dict); }
+        dumpWords("Dmgr", g_mgr, 8);              // v24：偏移错了也能看出 mgr 里到底放了什么
+        return;
+    }
     int cnt = 0;
-    if (!rd((char *)dict + g_offCount, &cnt, sizeof(cnt))) return;
+    if (!rd((char *)dict + g_offCount, &cnt, sizeof(cnt))) {
+        if (g_diagFail < 6) { g_diagFail++; CHECK("Dcnt fail dict %p off %d", dict, g_offCount); }
+        dumpWords("Ddict", dict, 10);
+        return;
+    }
     void *entries = NULL;
-    if (!rd((char *)dict + g_offEntries, &entries, sizeof(entries)) || !entries) return;
-    // v17：这个 il2cpp 的对象头是 8 字节（ActorManager 第一个字段在 @08 就是证据），
-    // 数组布局 = klass(8) + bounds(8) + length(4) + pad(4) → 长度在 0x10，元素从 0x18 起。
+    if (!rd((char *)dict + g_offEntries, &entries, sizeof(entries)) || !entries) {
+        if (g_diagFail < 6) { g_diagFail++; CHECK("Dent fail dict %p off %d -> %p", dict, g_offEntries, entries); }
+        dumpWords("Ddict", dict, 10);
+        return;
+    }
     int cap = 0;
-    if (!rd((char *)entries + 0x10, &cap, sizeof(cap))) return;
+    if (!rd((char *)entries + 0x10, &cap, sizeof(cap))) {
+        if (g_diagFail < 6) { g_diagFail++; CHECK("Dcap fail ent %p", entries); }
+        return;
+    }
+    g_cntRaw = cnt;
 
-    // v22：cnt/cap 是裸读出来的，垃圾值会让「in 1」在大厅里也成立，然后相机路径全跑起来。
-    // v20 截图里打出过 u 64（正好压在旧上限上），先挡掉不可能的量级。
-    if (cnt < 0 || cnt > 512 || cap <= 0 || cap > 65536) return;
-    if (cnt > cap) cnt = cap;
+    // v24：v22 那条 `cap <= 0 → return` 是设计错误 —— 一个可疑数字就把整条链全丢掉，
+    // 于是只剩 u 0。现在改成「记账 + 夹紧」：可疑就不采信，但一定把原始值留在 HUD 上。
+    int cntRaw = cnt;
+    if (cnt < 0 || cnt > 512) {
+        if (g_diagFail < 6) { g_diagFail++; CHECK("Dcnt range %d (cap %d)", cntRaw, cap); }
+        cnt = 0;
+    }
+    if (cap > 0 && cap < 65536 && cnt > cap) cnt = cap;
     if (cnt > 160) cnt = 160;                     // v22：原来 64 太小，实战里敌人可能排在后面
 
     // v22：进/出对局边沿。离开对局（载入中/回大厅）必须把相机和视矩阵整体作废，
     // 否则第二局就是拿着上一局已销毁的 Camera 在调 WorldToScreenPoint。
     int nowIn = (cnt > 0) ? 1 : 0;
+    bool edgeIn = (g_prevInMatch == 0 && nowIn == 1);   // v24：进对局那一下，多转储一份
     if (g_prevInMatch == 1 && nowIn == 0) {
         g_camObj = NULL; g_camCallState = 0; g_camBadN = 0; g_camKlass = NULL;
         g_vpReady = false; g_vpInst = NULL; g_vpSrc = -100;
@@ -1346,11 +1472,41 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     g_prevInMatch = nowIn;
     // v20：读到单位 = 已经在对局里；只有这时才去碰相机/视矩阵（大厅里没有这些对象）
     g_inMatch = nowIn;
+
+    // v24：一次性内存转储。第一帧 + 每次进对局各打一份，一共最多 3 份。
+    // D1/D2/D3 是原始字，D4/D5 同时试「数组数据在 0x18」和「在 0x20」两种可能，
+    // 用「第一个元素解引用后的 klass 是不是 ActorLinker」来裁决 —— 谁对看 match 那一位。
+    if (g_diagDump < 3 && (g_diagDump == 0 || edgeIn)) {
+        g_diagDump++;
+        CHECK("D0 mgr %p dict %p cnt %d ent %p cap %d", g_mgr, dict, cntRaw, entries, cap);
+        dumpWords("D1 mgr ", g_mgr, 6);
+        dumpWords("D2 dict", dict, 10);
+        dumpWords("D3 entr", entries, 8);
+        void *v18 = NULL, *v20 = NULL, *k18 = NULL, *k20 = NULL;
+        void *v18b = NULL, *k18b = NULL;
+        if (rd((char *)entries + 0x18 + 16, &v18, sizeof(v18)) && v18) rd(v18, &k18, sizeof(k18));
+        if (rd((char *)entries + 0x20 + 16, &v20, sizeof(v20)) && v20) rd(v20, &k20, sizeof(k20));
+        // v26：再解一次「第二个元素」（步长按 24）。用来区分 24 字节 Entry 和 8 字节纯指针数组：
+        // 24 字节 Entry 下 0x18 与 0x20 相差 8 字节，只会落在 key/pad 上，不可能同时命中；
+        // 而纯指针数组（步长 8）才会出现 0x18 和 0x20 都命中 —— 那正是对面担心的情形。
+        if (rd((char *)entries + 0x18 + 24 + 16, &v18b, sizeof(v18b)) && v18b) rd(v18b, &k18b, sizeof(k18b));
+        CHECK("D4 base18 v %p k %p | base20 v %p k %p", v18, k18, v20, k20);
+        int m18 = (k18 && k18 == g_linkerClass) ? 1 : 0;
+        int m20 = (k20 && k20 == g_linkerClass) ? 1 : 0;
+        int m18b = (k18b && k18b == g_linkerClass) ? 1 : 0;   // 步长 24 的第二个元素
+        CHECK("D5 linker %p m18 %d m18b %d m20 %d cap %d", g_linkerClass, m18, m18b, m20, cap);
+        // v26：主判据换成 cap —— 8 字节头时 entries+0x10 是 max_length（>0），
+        // 16 字节头时那里是 bounds 指针的低 32 位（零基数组恒为 0）。这个判据与步长无关，不会被双命中骗。
+        if (cap > 0 && cap < 65536) { g_arrBase = 0x18; g_arrBaseVote++; }
+        else if (cap == 0) { g_arrBase = 0x20; g_arrBaseVote++; }
+        // 若 m18 成立而 m18b 不成立，说明这不是 24 字节 Entry（可能是 8 字节纯指针数组），单独记一行
+        if (m18 && !m18b) CHECK("D5 stride8? v18 %p v18b %p", v18, v18b);
+    }
     // v17：第一个单位的坐标打一次，用来确认世界尺度（决定后面框的高度/距离怎么算）
     static bool s_posLogged = false;
     if (cnt > 0 && !s_posLogged) {
         void *o0 = NULL;
-        if (rd((char *)entries + 0x18 + 16, &o0, sizeof(o0)) && o0) {
+        if (rd((char *)entries + g_arrBase + 16, &o0, sizeof(o0)) && o0) {
             float p0[3] = {0, 0, 0};
             if (rd((char *)o0 + 0x4C4, p0, sizeof(p0))) {
                 CHECK("u0 %.1f %.1f %.1f", p0[0], p0[1], p0[2]);
@@ -1366,7 +1522,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         int pOk = 0, lim = (cnt < 24) ? cnt : 24;
         for (int i = 0; i < lim; i++) {
             void *o = NULL;
-            if (!rd((char *)entries + 0x18 + (size_t)i * 24 + 16, &o, sizeof(o)) || !o) continue;
+            if (!rd((char *)entries + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !o) continue;
             float pp[3] = {0, 0, 0};
             if (!rd((char *)o + 0x4C4, pp, sizeof(pp))) continue;
             if (pp[0] != 0.0f || pp[1] != 0.0f || pp[2] != 0.0f) pOk++;
@@ -1385,7 +1541,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     int drawn = 0;
     for (int i = 0; i < cnt && drawn < 32; i++) {
         void *obj = NULL;
-        if (!rd((char *)entries + 0x18 + (size_t)i * 24 + 16, &obj, sizeof(obj))) continue;
+        if (!rd((char *)entries + g_arrBase + (size_t)i * 24 + 16, &obj, sizeof(obj))) continue;
         if (!obj) continue;
         void *ok = NULL;
         if (!rd(obj, &ok, sizeof(ok)) || ok != g_linkerClass) continue;
@@ -1467,17 +1623,17 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v23  u%d p%d in%d d%d c%d\n3-finger UP = full hud",
-            g_unitCount, g_posOk, g_inMatch, g_boxDrawn, g_camCallState];
+            @"ESP v26  u%d r%d b%d p%d in%d d%d c%d\n3-finger UP = full hud",
+            g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v23\n"];
+    [s appendString:@"ESP v26\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
-    [s appendFormat:@"imgs %d cls %zu hits %d u %d p %d in %d c %d d %d%s\n",
-        g_imgCount, g_clsScanned, g_found, g_unitCount, g_posOk, g_inMatch, g_camCallState,
-        g_boxDrawn, g_il2cppOk ? "" : " WAIT"];
+    [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
+        g_imgCount, g_clsScanned, g_found, g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch,
+        g_camCallState, g_boxDrawn, g_il2cppOk ? "" : " WAIT"];
     [s appendFormat:@"il2cpp %@ present %@ mx %@\n",
         g_il2cppOk ? @"OK" : @"FAIL",
         g_presentOn ? @"OK" : @"FAIL",
@@ -1511,7 +1667,9 @@ static void updateHud(void) {
     // 否则 g_vpReady 一旦为 true 就永远走不到相机逻辑
     // v23：不再是「没有相机才取」——而是进对局后每秒无条件重取一次 Camera.main，
     // 指针变了（大厅→对局）就换。一次 il2cpp 调用，成本可以忽略。
-    if (t % 30 == 0 && g_inMatch) { resolveCam(); }
+    if (t % 30 == 0) { resolveCam(); }            // v24：不再依赖 inMatch
+    // v25：还没读到单位，就每 5 秒把 ActorManager 的字典字段重扫一遍（会自动换 g_offDict / g_arrBase）
+    if (t % 150 == 0 && g_mgr && g_unitCount == 0) { probeActorLists(); }
     if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
 }
 @end
@@ -1592,7 +1750,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v23 booting";
+    l.text = @"ESP v26 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -1629,7 +1787,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v23 esp (w2s+ucam)");
+    ImGui::Text("build         : v26 esp (cap-verdict)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
