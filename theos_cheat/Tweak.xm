@@ -42,6 +42,13 @@
 //    所以本版：绑定只确认 domain；dump 遍历所有 image 的所有类按名字匹配；
 //    0 命中就每 15 秒自动重扫（最多 20 轮），另有 4 指上滑手动重扫。
 //
+//  v14（2026-10-18，实测截图反馈：CameraVPFrameCache 拿到了，但单位侧被接口抢名额）：
+//    v13 用 strstr 模糊匹配 + 每关键词只收 1 个类，结果
+//      IActorManager(0f) 顶掉了 ActorManager、ICBattleHeroInfoPanel(0f) 顶掉了 CBattleHeroInfo、
+//      <astBloodBagInfo_bytes>e__FixedBuffer 顶掉了 Blood。
+//    这次直接改成原作者的做法：il2cpp_class_from_name(image, ns, name) 精确取类，
+//    接口 / 编译器生成类 / 同名异命名空间都不可能误命中；字段全量输出（每类 cap 40）。
+//
 //  对照原外挂（PxExtFFi 52MB）的防护点：
 //    sysctl / sysctlbyname / task_get_exception_ports / task_get_state  → 本文件已复刻
 //    _dyld_image_count / _dyld_get_image_name / dladdr / vm_region_64   → 本文件已复刻
@@ -526,6 +533,8 @@ typedef void *(*t_class_from_name)(void *, const char *, const char *);
 typedef void **(*t_class_get_fields)(void *, void **);
 typedef const char *(*t_field_get_name)(void *);
 typedef size_t (*t_field_get_offset)(void *);
+typedef void *(*t_field_get_type)(void *);          // v14：字段类型，判断是不是 Vector3/Matrix4x4
+typedef const char *(*t_type_get_name)(void *);      // v14：类型名（原作者 27 个 API 里也有这个）
 typedef void (*t_field_get_value)(void *, void *, void *);
 typedef void (*t_field_static_get_value)(void *, void *);
 typedef void **(*t_class_get_methods)(void *, void **);
@@ -547,6 +556,8 @@ struct I2C {
     t_class_get_fields            class_get_fields;
     t_field_get_name              field_get_name;
     t_field_get_offset            field_get_offset;
+    t_field_get_type              field_get_type;
+    t_type_get_name               type_get_name;
     t_field_get_value             field_get_value;
     t_field_static_get_value      field_static_get_value;
     t_class_get_methods           class_get_methods;
@@ -579,6 +590,8 @@ static void bindIl2cpp(void) {
     BINDF(class_get_fields,           "il2cpp_class_get_fields");
     BINDF(field_get_name,             "il2cpp_field_get_name");
     BINDF(field_get_offset,           "il2cpp_field_get_offset");
+    BINDF(field_get_type,             "il2cpp_field_get_type");
+    BINDF(type_get_name,              "il2cpp_type_get_name");
     BINDF(field_get_value,            "il2cpp_field_get_value");
     BINDF(field_static_get_value,     "il2cpp_field_static_get_value");
     BINDF(class_get_methods,          "il2cpp_class_get_methods");
@@ -645,12 +658,19 @@ static bool interestingField(const char *n) {
 
 static NSMutableString *g_dumpFile = nil;
 
-// v11-S：一行一个字段，只留「名字 @字节偏移」，够写 renderFrame 用了
+// v14：一行 = 名字 @偏移 类型名。类型是关键：
+//   m_vPosition 是 UnityEngine.Vector3 还是 int，直接决定能不能拿来做世界坐标。
 static void emitField(void *f) {
     const char *fn = I2.field_get_name ? I2.field_get_name(f) : "?";
     size_t off = I2.field_get_offset ? I2.field_get_offset(f) : 0;
-    if (g_dumpFile) [g_dumpFile appendFormat:@"  %s @%zX\n", fn ? fn : "?", off];
-    CHECK("%s @%zX", fn ? fn : "?", off);
+    const char *tn = NULL;
+    if (I2.field_get_type && I2.type_get_name) {
+        void *ft = I2.field_get_type(f);
+        if (ft) tn = I2.type_get_name(ft);
+    }
+    if (g_dumpFile) [g_dumpFile appendFormat:@"  %s @%zX : %s\n",
+                     fn ? fn : "?", off, tn ? tn : "?"];
+    CHECK("%s @%zX %s", fn ? fn : "?", off, tn ? tn : "?");
 }
 
 // cap：这个类最多往 HUD 塞几行；all=1 时先排关键字字段，再用其余字段补满
@@ -682,69 +702,69 @@ static void dumpClass(void *klass, const char *label, int cap, int all) {
     if (shown < total) CHECK(".. %d/%d ..", shown, total);
 }
 
+// v14：改用原作者的做法 —— il2cpp_class_from_name(image, ns, name) 精确取类。
+// 好处：接口（IActorManager）、编译器生成类（<astBloodBagInfo_bytes>e__FixedBuffer）、
+// 别处同名类，全都不会误命中；也不用枚举 6 万个类。
+static const struct { const char *ns; const char *name; int cap; } g_targets[] = {
+    {"Assets.Scripts.GameLogic",  "ActorManager",        36},
+    {"Assets.Scripts.GameLogic",  "ActorComponent",      30},
+    {"Assets.Scripts.GameSystem", "CBattleHeroInfo",     30},
+    {"Assets.Scripts.GameLogic",  "Blood",               22},
+    {"Assets.Scripts.GameLogic",  "ActorLinker",         22},
+    {"Assets.Scripts.GameSystem", "CActorDisplayHelper", 22},
+    {"Assets.Scripts.GameLogic",  "CameraVPFrameCache",   4},
+    {"Assets.Scripts.GameLogic",  "GuishiCamera",         8},
+};
+#define NTARGET ((int)(sizeof(g_targets) / sizeof(g_targets[0])))
+
 static void selfCheck(void) {
     g_checkN = 0;                 // 重跑时清空，否则页码翻倍
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v13 ====");
+    CHECK("==== dump v14 ====");
 
-    if (!I2.domain || !I2.domain_get_assemblies) { CHECK("no domain"); return; }
+    if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
+        CHECK("no il2cpp"); return;
+    }
     size_t n = 0;
     void **asms = I2.domain_get_assemblies(I2.domain, &n);
     g_imgCount = (int)n;
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v14 images=%zu\n", n];
 
-    // 列表：相机优先 + 单位/血条。maxCls = 最多收几个类，cap = 每类最多几行
-    static const struct { const char *kw; int maxCls; int cap; int all; } spec[] = {
-        {"CameraVP",            2, 18, 1},
-        {"CameraFocus",         1, 14, 1},
-        {"CameraOffs",          1, 12, 1},
-        {"CameraUpd",           1, 12, 1},
-        {"GuishiCamera",        2, 12, 1},
-        {"ActorManager",        1, 24, 1},
-        {"CActorDisplaySystem", 1, 14, 0},
-        {"CBattleHeroInfo",     1, 18, 1},
-        {"Hud3DBlood",          1, 12, 1},
-        {"Blood",               1, 12, 1},
-        {"ActorConfig",         1, 16, 1},
-    };
-    const int nsp = (int)(sizeof(spec) / sizeof(spec[0]));
-    int hitN[16];
-    for (int j = 0; j < nsp; j++) hitN[j] = 0;
-
-    // v13：遍历「所有 image 的所有类」，不挑主程序集。
-    // 程序集在 20 秒、60 秒陆续装载，这一轮扫不到就下一轮 —— 不会再锁死在 7 个类的包上。
+    // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
         void *img = I2.assembly_get_image(asms[a]);
         if (!img) continue;
-        size_t cc = I2.image_get_class_count ? I2.image_get_class_count(img) : 0;
-        g_clsScanned += cc;
-        for (size_t i = 0; i < cc; i++) {
-            void *k = I2.image_get_class(img, i);
-            if (!k) continue;
-            const char *cn = I2.class_get_name ? I2.class_get_name(k) : NULL;
-            if (!cn) continue;
-            for (int j = 0; j < nsp; j++) {
-                if (hitN[j] >= spec[j].maxCls) continue;
-                if (!strstr(cn, spec[j].kw)) continue;
-                const char *kns = I2.class_get_namespace ? I2.class_get_namespace(k) : "?";
-                CHECK("HIT %s.%s", kns ? kns : "?", cn);
-                dumpClass(k, cn, spec[j].cap, spec[j].all);
-                hitN[j]++;
-                g_found++;
-                break;                    // 一个类只归第一个命中的关键词
-            }
-        }
+        g_clsScanned += I2.image_get_class_count ? I2.image_get_class_count(img) : 0;
     }
 
-    for (int j = 0; j < nsp; j++) {
-        if (hitN[j] == 0) CHECK("%s: none", spec[j].kw);
+    int foundN = 0;
+    for (int t = 0; t < NTARGET; t++) {
+        void *klass = NULL;
+        void *hitImg = NULL;
+        for (size_t a = 0; a < n && !klass; a++) {
+            void *img = I2.assembly_get_image(asms[a]);
+            if (!img) continue;
+            klass = I2.class_from_name(img, g_targets[t].ns, g_targets[t].name);
+            if (klass) hitImg = img;
+        }
+        if (!klass) { CHECK("%s: none", g_targets[t].name); continue; }
+
+        CHECK("HIT %s.%s", g_targets[t].ns, g_targets[t].name);
+        if (g_dumpFile && hitImg && I2.image_get_name) {
+            const char *inm = I2.image_get_name(hitImg);
+            [g_dumpFile appendFormat:@"  (image %s)\n", inm ? inm : "?"];
+        }
+        dumpClass(klass, g_targets[t].name, g_targets[t].cap, 1);
+        foundN++;
+        g_found++;
     }
-    CHECK("==== %d cls / %zu scanned ====", g_found, g_clsScanned);
+
+    CHECK("==== %d/%d cls / %zu scanned ====", foundN, NTARGET, g_clsScanned);
 
     // 全量写文件，HUD 只显示筛过的
     if (g_dumpFile) {
@@ -843,7 +863,7 @@ static void renderOverlay(void);
 static void updateHud(void) {
     if (!g_hudLabel) return;
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v13\n"];
+    [s appendString:@"ESP v14\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     [s appendFormat:@"imgs %d cls %zu hits %d%s\n",
         g_imgCount, g_clsScanned, g_found, g_il2cppOk ? "" : " WAIT"];
@@ -955,7 +975,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v13 booting";
+    l.text = @"ESP v14 booting";
     [vc.view addSubview:l];
 
     g_overlayWin   = w;
@@ -989,7 +1009,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v13 dump (scan-all)");
+    ImGui::Text("build         : v14 dump (class_from_name)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
