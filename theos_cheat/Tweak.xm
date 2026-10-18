@@ -92,6 +92,7 @@
 #import <signal.h>
 #import <stdarg.h>
 #import <pthread.h>
+#import <math.h>              // v35：sinf 用于隐身灰闪，显式引入避免依赖传递包含
 
 // 不依赖 CydiaSubstrate / ellekit。
 // 依据：原外挂 PxExtFFi（52 MB）里 MSHookFunction / fishhook / substrate 出现次数全是 0，
@@ -793,7 +794,73 @@ static void  *g_uCamClass   = NULL;   // v23：UnityEngine.Camera —— 必须�
                                       // 永远查不到（截图里 api get_main 1 但 camcall no get_main 就是这么来的）
 static int    g_posOk       = 0;      // v23：坐标非零的单位数（大厅 vs 对局一看就知道）
 static int    g_camPxLogged = 0;      // v23：像素尺寸只打一次
-static int    g_ctxOff      = -1;     // v30：Context 在 DictionaryView 里的偏移（类=8 / 内联结构体=0）
+static int    g_ctxOff      = -1;
+// v33：单位身份。全部走元数据（字段类型 → class_from_il2cpp_type → 按名字取偏移），不猜偏移
+static void  *g_metaCls     = NULL;
+static int    g_offTheMeta  = -1;
+static int    g_metaStruct  = -1;     // 1 = ActorMeta 是内联结构体，0 = 引用
+static int    g_offAType    = -1;
+static int    g_offACamp    = -1;
+static int    g_offCfgId    = -1;
+static int    g_offPid      = -1;
+static int    g_offHostCfg  = -1;     // v34：HostConfigId（和 ConfigId 谁才是英雄 ID，一次定死）
+static int    g_offRawPid   = -1;     // v34：RawPlayerId
+static int    g_heroType    = -1;     // v34：自证出来的「英雄」ActorType；-1 = 未定，照旧全画
+static int    g_verifyN     = 0;      // v34：计数自证跑过几次（最多 3）
+static void  *g_lastDict    = NULL;   // v34：上一帧用的 dict / entries / count
+static void  *g_lastEntries = NULL;
+static int    g_lastCnt     = 0;
+// v35：生命周期字段（全部按名字从元数据取，取不到就是 -1，规则自动降级）
+static int    g_offMeshVis   = -1;    // _meshVisible    网格是否可见
+static int    g_offLogicVis  = -1;    // _logicVisible   逻辑是否可见
+static int    g_offInCam     = -1;    // _inCamera
+static int    g_offMirror    = -1;    // isMirrorActor   分身
+static int    g_offHostActor = -1;    // hostActor       被谁挂载（傀儡/召唤物）
+static int    g_offCallActor = -1;    // callActor
+static int    g_mirrorSafe   = 0;     // 只有确认存在「三个字段全 0」的干净单位，才允许按分身过滤
+static int    g_deadTotal    = 0;     // 累计判成死亡/失联的次数（HUD 用）
+static int    g_flagTrust    = 1;     // v35：一旦发现「大半单位都被判成死亡」，立即停用旗标判定
+static int    g_frameDead    = 0;     // 本帧判成死亡/失联的单位数
+static int    g_frameAll     = 0;     // 本帧实际检查过的单位数
+static void   bindLinkerFlags(void);
+// 死亡/失联的短期记忆（按 ObjID 记住「第一次看不到」的时刻），最多 64 个
+typedef struct { unsigned int id; float tGone; } GoneEnt;
+static GoneEnt g_gone[64];
+static unsigned int g_seenId[64];     // 本帧已画过的 ObjID（去重）
+static int    g_seenN = 0;
+// v36：FOG 探针的记忆（按 ObjID 记住上一次的位置/可见性），最多 16 个英雄
+typedef struct {
+    unsigned int id;
+    float p[3];
+    float t;
+    int   n;            // 采样过几次
+    int   movedOnce;    // 曾经动过（v37：frozen 的前提）
+    int   stillCnt;     // 连续不动的次数
+    int   frz;          // 已经计过 frozen（按唯一英雄计，不按采样次数累加）
+} FogEnt;
+static FogEnt g_fog[16];
+static int    g_fogRuns = 0;          // 探针跑过几次（最多 24 次 = 2 分钟）
+static int    g_rawHostId = -2;       // v38：GetRawHostPlayerActorId 的缓存（-2 = 还没问过）
+static float  g_scrW = 0, g_scrH = 0; // v39：最近一帧的窗口点数尺寸（ref2 判屏幕中心要用）
+// v40：只统计敌方主身，4 个桶：0-2k / 2-4k / 4-6k / 6k+
+static int    g_bktTot[4] = {0,0,0,0};
+static int    g_bktMov[4] = {0,0,0,0};
+static int    g_myCamp   = 0;         // 0 = 未知；由参考点那个英雄的 ActorCamp 定
+static int    g_rawOk    = 0;         // v40：rawHostId 是否可用（不用 <0 判断）
+static int    g_enemyN   = -1;        // 最近一次采样里的敌方主身数（5v5 应恒为 5）
+static int    w2sPx(float x, float y, float z, float *sx, float *sy);
+#define FOG_RUNS 24
+static float  g_fogLastT = 0;
+static void   fogProbe(void);
+static int    callInt0(void *self, const char *mname);
+static int    callInt1(void *self, const char *mname, int a);
+static void   verifyIdentity(void);
+static int    g_unitDump    = 0;      // 已 dump 身份的单位数（最多 6）
+static int    g_metaTried   = 0;      // 只尝试绑定一次，避免刷 HUD
+static void   bindMeta(void);
+static int    readIdentity(void *obj, int *aType, int *aCamp, int *cfg, int *pid);
+static int    readIdentity2(void *obj, int *aType, int *aCamp, int *cfg, int *pid,
+                            int *hostcfg, int *rawpid);     // v30：Context 在 DictionaryView 里的偏移（类=8 / 内联结构体=0）
 static int    g_camPxW      = 0;      // v30：相机的 pixelWidth
 static int    g_camPxH      = 0;      // v30：相机的 pixelHeight
 static int    g_expW        = 0;      // v30：UIKit 期望的像素宽（点×scale）
@@ -880,7 +947,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v31 ====");
+    CHECK("==== dump v40 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -891,7 +958,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v31 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v40 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1191,6 +1258,8 @@ static void resolveEsp(void) {
     if (!I2.domain) return;
 
     if (!g_linkerClass) g_linkerClass = findCls("Assets.Scripts.GameLogic", "ActorLinker");
+    if (g_linkerClass) bindMeta();        // v33：拿到 theMeta 的偏移与 ActorMeta 字段偏移
+    if (g_linkerClass) bindLinkerFlags(); // v35：拿到 _meshVisible / _logicVisible / 分身三兄弟
     if (!g_vpClass)     g_vpClass     = findCls("Assets.Scripts.GameLogic", "CameraVPFrameCache");
     if (!g_mgrClass)    g_mgrClass    = findCls("Assets.Scripts.GameLogic", "ActorManager");
     if (!g_camClass)    g_camClass    = findCls("Assets.Scripts.GameLogic", "GuishiCamera");
@@ -1366,6 +1435,390 @@ static bool camStillValid(void) {
     void *want = g_camKlass ? g_camKlass : g_uCamClass;
     if (want && k != want) return false;
     return true;
+}
+
+// v33：读托管字符串（il2cpp string = klass(8) + length(4) + UTF-16 chars）。
+// 8 字节对象头时 chars 在 0x0C；解不出来再试 0x14。
+static int readUtf16At(void *s, int off, char *out, int cap) {
+    int len = 0;
+    // v34：长度必须落在 1..64，读不到就判失败。不做「换个偏移再试」——
+    // 8 字节头下 chars 恒在 0x0C，回退到 0x14 只会在 length 异常时凑出一个
+    // 「长度合法、内容是垃圾」的字符串，属于假成功。
+    if (!rd((char *)s + 0x08, &len, sizeof(len))) return 0;
+    if (len <= 0 || len > 64) return 0;
+    unsigned short w[70] = {0};
+    if (!rd((char *)s + off, w, len * 2)) return 0;
+    int n = 0, bad = 0;
+    for (int i = 0; i < len && n < cap - 1; i++) {
+        unsigned short c = w[i];
+        if (c == 0 || c > 0x7E) { out[n++] = '?'; bad++; continue; }
+        out[n++] = (char)c;
+    }
+    out[n] = 0;
+    return (n > 0 && bad * 2 <= n) ? 1 : 0;
+}
+
+static void readName(void *s, char *out, int cap) {
+    out[0] = 0;
+    if (!s || cap < 2) return;
+    readUtf16At(s, 0x0C, out, cap);       // v34：只此一条路
+}
+
+// v33：theMeta 的位置和 ActorMeta 里那几个字段的偏移，全部问元数据要。
+// 和 Context 那次是同一招：字段类型 → class_from_il2cpp_type → 按名字取偏移。
+static void bindMeta(void) {
+    if (g_offTheMeta >= 0 || g_metaTried) return;
+    g_metaTried = 1;
+    if (!g_linkerClass || !I2.class_get_field_from_name || !I2.field_get_type ||
+        !I2.class_from_il2cpp_type) return;
+
+    void *f = I2.class_get_field_from_name(g_linkerClass, "theMeta");
+    if (!f) { CHECK("META no theMeta"); return; }
+    g_offTheMeta = (int)I2.field_get_offset(f);
+
+    void *ft = I2.field_get_type(f);
+    g_metaCls = ft ? I2.class_from_il2cpp_type(ft) : NULL;
+    if (!g_metaCls) { CHECK("META no class"); return; }
+    if (I2.class_is_valuetype) g_metaStruct = I2.class_is_valuetype(g_metaCls) ? 1 : 0;
+
+    void *fa = I2.class_get_field_from_name(g_metaCls, "ActorType");
+    void *fc = I2.class_get_field_from_name(g_metaCls, "ActorCamp");
+    void *fi = I2.class_get_field_from_name(g_metaCls, "ConfigId");
+    void *fp = I2.class_get_field_from_name(g_metaCls, "PlayerId");
+    void *fh = I2.class_get_field_from_name(g_metaCls, "HostConfigId");
+    void *fr = I2.class_get_field_from_name(g_metaCls, "RawPlayerId");
+    if (fa) g_offAType = (int)I2.field_get_offset(fa);
+    if (fc) g_offACamp = (int)I2.field_get_offset(fc);
+    if (fi) g_offCfgId = (int)I2.field_get_offset(fi);
+    if (fp) g_offPid   = (int)I2.field_get_offset(fp);
+    if (fh) g_offHostCfg = (int)I2.field_get_offset(fh);
+    if (fr) g_offRawPid  = (int)I2.field_get_offset(fr);
+
+    CHECK("META off %d struct %d | type %d camp %d cfg %d pid %d",
+          g_offTheMeta, g_metaStruct, g_offAType, g_offACamp, g_offCfgId, g_offPid);
+}
+
+// v35：把生命周期用到的几个字段偏移按名字问出来（不猜偏移）。
+// 任何一个取不到就保持 -1，对应的判据自动失效，退回「全画」，不会因为缺字段就白屏。
+static void bindLinkerFlags(void) {
+    static int tried = 0;
+    if (tried || !g_linkerClass || !I2.class_get_field_from_name) return;
+    tried = 1;
+    void *f;
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "_meshVisible")))    g_offMeshVis   = (int)I2.field_get_offset(f);
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "_logicVisible")))   g_offLogicVis  = (int)I2.field_get_offset(f);
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "_inCamera")))       g_offInCam     = (int)I2.field_get_offset(f);
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "isMirrorActor")))   g_offMirror    = (int)I2.field_get_offset(f);
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "hostActor")))       g_offHostActor = (int)I2.field_get_offset(f);
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "callActor")))       g_offCallActor = (int)I2.field_get_offset(f);
+    CHECK("LFLAG mesh %d logic %d cam %d mirror %d host %d call %d",
+          g_offMeshVis, g_offLogicVis, g_offInCam, g_offMirror, g_offHostActor, g_offCallActor);
+}
+
+// v39：把世界点投到 W2S 的像素空间，供 ref2 用（复用已经跑通的 ABI）
+static int w2sPx(float x, float y, float z, float *sx, float *sy) {
+    if (!g_camObj || !g_miW2S) return 0;
+    void *fn = *(void **)g_miW2S;
+    if (!fn) return 0;
+    Vec3 wp = { x, y, z };
+    Vec3 sp = ((Vec3 (*)(void *, Vec3, void *))fn)(g_camObj, wp, g_miW2S);
+    if (!(sp.z > 0.01f)) return 0;
+    if (!(sp.x > -1e6f && sp.x < 1e6f && sp.y > -1e6f && sp.y < 1e6f)) return 0;
+    *sx = sp.x; *sy = sp.y;
+    return 1;
+}
+
+// v38：这个 ObjID 是否处于「死亡/失联」记忆里（位置是冻结的，不能参与 FOG 统计）
+static int isGoneById(unsigned int id) {
+    if (id == 0) return 0;
+    for (int k = 0; k < 64; k++) if (g_gone[k].id == id && g_gone[k].id != 0) return 1;
+    return 0;
+}
+
+// v40：ref1 —— 按 GetRawHostPlayerActorId() 的 id 找本机主身。
+// 注意：id 用 unsigned 比较，是否可用由 g_rawOk 决定，绝不用「<0」当失败标志，
+// 否则 id 高位为 1 的正数会被误判成失败。
+static int heroIdxById(unsigned int *lid, int n) {
+    if (g_rawHostId == -2) {
+        if (!g_mgr) return -1;
+        int rc = callInt0(g_mgr, "GetRawHostPlayerActorId");
+        g_rawHostId = rc;
+        g_rawOk = (rc != -2 && rc != -3 && rc != -1) ? 1 : 0;   // -1/-2/-3 是调用失败码
+    }
+    if (!g_rawOk || g_rawHostId <= 0) return -1;
+    unsigned int want = (unsigned int)g_rawHostId;
+    for (int i = 0; i < n; i++) if (lid[i] == want) return i;
+    return -1;
+}
+
+// v40：ref2 —— W2S 投影最接近屏幕中心的那个主身（王者相机就是跟自己的）。
+// 阈值收到 fullW * 0.15 ≈ 393px：太松的话相机一旦不是本局那台，W2S 整体错位，
+// 我们仍会「挑到最近的那个」，静默给出错误参考点。
+static int heroIdxByScreen(float lp[][3], int n) {
+    float fullW = (g_camPxW > 0) ? (float)g_camPxW : (g_scrW * 3.0f);
+    float fullH = (g_camPxH > 0) ? (float)g_camPxH : (g_scrH * 3.0f);
+    if (fullW < 100.0f) return -1;
+    float ccx = fullW * 0.5f, ccy = fullH * 0.5f;
+    float best = 1e9f; int bi = -1;
+    for (int i = 0; i < n; i++) {
+        float px = 0, py = 0;
+        if (!w2sPx(lp[i][0], lp[i][1], lp[i][2], &px, &py)) continue;
+        float dd = fabsf(px - ccx) + fabsf(py - ccy);
+        if (dd < best) { best = dd; bi = i; }
+    }
+    return (bi >= 0 && best < fullW * 0.15f) ? bi : -1;
+}
+
+// v40：ref3 —— 相机 transform.position，带地理 gate（局内 Camera.main 是 null，
+// g_camObj 可能是大厅那台，坐标若不在英雄包围盒 ±2000 内就弃用）。
+static int camRefPos(float lp[][3], int n, float *ox, float *oz) {
+    static int s_tpWarn = 0;
+    if (!g_camObj || !g_uCamClass || !I2.class_get_method_from_name) return 0;
+    void *mTr = I2.class_get_method_from_name(g_uCamClass, "get_transform", 0);
+    if (!mTr || !*(void **)mTr) return 0;
+    void *tr = ((void *(*)(void *, void *))(*(void **)mTr))(g_camObj, mTr);
+    void *trCls = NULL;
+    if (!tr || !rd(tr, &trCls, sizeof(trCls)) || !trCls) return 0;
+    void *mPos = I2.class_get_method_from_name(trCls, "get_position", 0);
+    if (!mPos || !*(void **)mPos) return 0;
+    Vec3 v = ((Vec3 (*)(void *, void *))(*(void **)mPos))(tr, mPos);
+    if (!(v.x == v.x && v.z == v.z && (v.x != 0.0f || v.z != 0.0f))) return 0;
+    float mnx = 1e9f, mxx = -1e9f, mnz = 1e9f, mxz = -1e9f;
+    for (int i = 0; i < n; i++) {
+        if (lp[i][0] < mnx) mnx = lp[i][0];
+        if (lp[i][0] > mxx) mxx = lp[i][0];
+        if (lp[i][2] < mnz) mnz = lp[i][2];
+        if (lp[i][2] > mxz) mxz = lp[i][2];
+    }
+    if (v.x < mnx - 2000.0f || v.x > mxx + 2000.0f ||
+        v.z < mnz - 2000.0f || v.z > mxz + 2000.0f) {
+        if (!s_tpWarn) { s_tpWarn = 1; CHECK("FOGV camPos rejected (camera not in map)"); }
+        return 0;
+    }
+    *ox = v.x; *oz = v.z;
+    return 1;
+}
+
+// v40：FOG 探针。判据只看「敌方主身」+「距离分桶 + 位移」。
+// 队友永远可见（小地图一直有），远处的队友会一直在动 —— 混进 6k+ 就会把结论灌成
+// 「全图实时下发」，和之前用英雄质心是同一类假阳性。所以这里先定本阵营，只统计敌人。
+static void fogProbe(void) {
+    if (!g_lastEntries || g_lastCnt <= 0) return;
+    if (g_unitCount < 40) return;                 // 兵线没出来不采样
+    if (g_heroType < 0) {
+        if (g_fogRuns == 0) CHECK("FOGV skip (heroType unknown)");
+        return;
+    }
+    float now = (float)CACurrentMediaTime();
+    int lim = (g_lastCnt < 64) ? g_lastCnt : 64;
+
+    unsigned int lid[16]; float lp[16][3]; int lT[16], lC[16], lmv[16], llv[16], lcam[16];
+    int n = 0, summon = 0;
+    for (int i = 0; i < lim && n < 16; i++) {
+        void *v = NULL, *k = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        if (rd(v, &k, sizeof(k)) && g_linkerClass && k != g_linkerClass) continue;
+        int T = 0, C = 0;
+        readIdentity2(v, &T, &C, NULL, NULL, NULL, NULL);
+        if (T != g_heroType) continue;
+        int mv = 1, lv = 1, cam = 0, mir = 0, host = 0, call = 0;
+        unsigned char bb = 0;
+        if (g_offMeshVis  >= 0) { bb = 0; rd((char *)v + g_offMeshVis,  &bb, 1); mv  = bb ? 1 : 0; }
+        if (g_offLogicVis >= 0) { bb = 0; rd((char *)v + g_offLogicVis, &bb, 1); lv  = bb ? 1 : 0; }
+        if (g_offInCam    >= 0) { bb = 0; rd((char *)v + g_offInCam,    &bb, 1); cam = bb ? 1 : 0; }
+        if (g_offMirror   >= 0) { bb = 0; rd((char *)v + g_offMirror,   &bb, 1); mir = bb ? 1 : 0; }
+        if (g_offHostActor >= 0) { void *p = NULL; rd((char *)v + g_offHostActor, &p, sizeof(p)); host = p ? 1 : 0; }
+        if (g_offCallActor >= 0) { void *p = NULL; rd((char *)v + g_offCallActor, &p, sizeof(p)); call = p ? 1 : 0; }
+        if (mir || host || call) { summon++; continue; }        // 分身/傀儡单独计
+        unsigned int id = 0;
+        rd((char *)v + 0x4AC, &id, 4);
+        lid[n] = id; lT[n] = T; lC[n] = C; lmv[n] = mv; llv[n] = lv; lcam[n] = cam;
+        lp[n][0] = lp[n][1] = lp[n][2] = 0;
+        rd((char *)v + 0x4C4, lp[n], sizeof(float) * 3);
+        n++;
+    }
+    if (n == 0) { CHECK("FOGV none (unitCount %d)", g_unitCount); return; }
+
+    // ---- 参考点：ref1 → ref2 → ref3
+    int i1 = heroIdxById(lid, n);
+    int i2 = heroIdxByScreen(lp, n);
+    if (i1 >= 0 && i2 >= 0 && i1 != i2) {
+        float dx = lp[i1][0] - lp[i2][0], dz = lp[i1][2] - lp[i2][2];
+        float dd = sqrtf(dx * dx + dz * dz);
+        if (dd > 1500.0f)
+            CHECK("REF MISMATCH r1 %.0f,%.0f r2 %.0f,%.0f d %.0f",
+                  lp[i1][0], lp[i1][2], lp[i2][0], lp[i2][2], dd);
+    }
+    float rx = 0, rz = 0; int refSrc = 0, refIdx = -1;
+    if (i1 >= 0)      { rx = lp[i1][0]; rz = lp[i1][2]; refSrc = 1; refIdx = i1; }
+    else if (i2 >= 0) { rx = lp[i2][0]; rz = lp[i2][2]; refSrc = 2; refIdx = i2; }
+    else if (camRefPos(lp, n, &rx, &rz)) { refSrc = 3; }
+    if (!refSrc) { CHECK("FOGV skip (no local pos) rawHost %d ok %d", g_rawHostId, g_rawOk); return; }
+
+    if (g_myCamp == 0 && refIdx >= 0) g_myCamp = lC[refIdx];     // 本阵营 = 参考点英雄的 ActorCamp
+
+    int mov = 0, rt = 0, fz = 0, ninit = 0, enemies = 0;
+    float dmin = 1e9f, dmax = 0;
+    for (int i = 0; i < n; i++) {
+        int isMe = (i == refIdx);
+        int isAlly = (g_myCamp != 0 && lC[i] == g_myCamp);
+        int sl = -1;
+        for (int x = 0; x < 16; x++) if (g_fog[x].id == lid[i] && lid[i] != 0) { sl = x; break; }
+        if (sl < 0) {
+            for (int x = 0; x < 16; x++) if (g_fog[x].id == 0) { sl = x; break; }
+            if (sl >= 0) {
+                g_fog[sl].id = lid[i]; g_fog[sl].n = 0;
+                g_fog[sl].movedOnce = 0; g_fog[sl].stillCnt = 0; g_fog[sl].frz = 0;
+                g_fog[sl].t = now;
+            }
+        }
+        float dv = -1.0f;
+        if (sl >= 0) {
+            if (g_fog[sl].n > 0) {
+                float dx = lp[i][0] - g_fog[sl].p[0], dz = lp[i][2] - g_fog[sl].p[2];
+                dv = sqrtf(dx * dx + dz * dz);
+            }
+            g_fog[sl].p[0] = lp[i][0]; g_fog[sl].p[1] = lp[i][1]; g_fog[sl].p[2] = lp[i][2];
+            g_fog[sl].n++;
+            if (dv > 0.5f) { g_fog[sl].movedOnce = 1; g_fog[sl].stillCnt = 0; }
+            else if (dv >= 0.0f) {
+                if (!g_fog[sl].movedOnce) ninit++;
+                else if (++g_fog[sl].stillCnt >= 2 && !g_fog[sl].frz) { g_fog[sl].frz = 1; fz++; }
+            }
+        }
+        float dx = lp[i][0] - rx, dz = lp[i][2] - rz;
+        float dc = sqrtf(dx * dx + dz * dz);
+        if (!isMe && dc < dmin) dmin = dc;
+        if (!isMe && dc > dmax) dmax = dc;
+        if (g_myCamp != 0 && !isMe && !isAlly) enemies++;   // 本阵营未知时不数，避免把队友算成敌人
+        if (i < 6)
+            CHECK("FOG %u T%d C%d mv%d lv%d cam%d dv %.1f d %.0f%s",
+                  lid[i], lT[i], lC[i], lmv[i], llv[i], lcam[i], dv, dc,
+                  isGoneById(lid[i]) ? " gone" : (isAlly ? " ally" : ""));
+        // ---- v40：只有「敌方主身」进桶；队友永远可见，进来就是假阳性
+        if (isMe || isAlly || g_myCamp == 0) continue;
+        if (isGoneById(lid[i])) continue;
+        int bk = (dc < 2000.0f) ? 0 : (dc < 4000.0f) ? 1 : (dc < 6000.0f) ? 2 : 3;
+        g_bktTot[bk]++;
+        if (dv > 0.5f) { g_bktMov[bk]++; mov++; }
+    }
+    g_enemyN = (g_myCamp != 0) ? enemies : -1;
+
+    CHECK("FOGV t %d/%d n %d enemy %d summon %d | mov %d still %d ninit %d | rng %.0f..%.0f ref %d raw %d ok %d camp %d",
+          g_fogRuns, FOG_RUNS, n, enemies, summon, mov, fz, ninit, dmin, dmax,
+          refSrc, g_rawHostId, g_rawOk, g_myCamp);
+    CHECK("BUCKET(cum) enemy 0-2k %d/%d | 2-4k %d/%d | 4-6k %d/%d | 6k+ %d/%d",
+          g_bktMov[0], g_bktTot[0], g_bktMov[1], g_bktTot[1],
+          g_bktMov[2], g_bktTot[2], g_bktMov[3], g_bktTot[3]);
+    g_fogLastT = now;
+}
+
+// v35：灰虚线框（ImGui 没有原生虚线，按段画）
+static void dashRect(ImDrawList *dl, ImVec2 a, ImVec2 b, ImU32 col) {
+    const float seg = 6.0f;
+    for (float x = a.x; x < b.x; x += seg * 2.0f) {
+        float e = x + seg; if (e > b.x) e = b.x;
+        dl->AddLine(ImVec2(x, a.y), ImVec2(e, a.y), col, 1.4f);
+        dl->AddLine(ImVec2(x, b.y), ImVec2(e, b.y), col, 1.4f);
+    }
+    for (float y = a.y; y < b.y; y += seg * 2.0f) {
+        float e = y + seg; if (e > b.y) e = b.y;
+        dl->AddLine(ImVec2(a.x, y), ImVec2(a.x, e), col, 1.4f);
+        dl->AddLine(ImVec2(b.x, y), ImVec2(b.x, e), col, 1.4f);
+    }
+}
+
+// v34：调用 ActorManager 上的无参/单参 int 方法。ABI 与 get_pixelWidth 完全相同：
+// 返回值在 w0，MethodInfo* 放在最后一个参数寄存器。
+static int callInt0(void *self, const char *mname) {
+    if (!self || !g_mgrClass || !I2.class_get_method_from_name) return -1;
+    void *mi = I2.class_get_method_from_name(g_mgrClass, mname, 0);
+    if (!mi) return -2;
+    void *fn = *(void **)mi;
+    if (!fn) return -3;
+    return ((int (*)(void *, void *))fn)(self, mi);
+}
+
+static int callInt1(void *self, const char *mname, int a) {
+    if (!self || !g_mgrClass || !I2.class_get_method_from_name) return -1;
+    void *mi = I2.class_get_method_from_name(g_mgrClass, mname, 1);
+    if (!mi) return -2;
+    void *fn = *(void **)mi;
+    if (!fn) return -3;
+    return ((int (*)(void *, int, void *))fn)(self, a, mi);
+}
+
+// v34：拿 ActorManager 自己的计数去给 ActorType 定语义。
+// hero==(T==X 的个数) 且唯一 → X 就是英雄，白名单自动生成，不用人肉对截图。
+static void verifyIdentity(void) {
+    if (!g_mgr || !g_lastEntries || g_lastCnt <= 0) return;
+    int tv[16] = {0}, tc[16] = {0}, n = 0;
+    int lim = (g_lastCnt < 64) ? g_lastCnt : 64;
+    for (int i = 0; i < lim; i++) {
+        void *v = NULL, *k = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        if (rd(v, &k, sizeof(k)) && g_linkerClass && k != g_linkerClass) continue;
+        int T = 0;
+        readIdentity2(v, &T, NULL, NULL, NULL, NULL, NULL);
+        int j = 0;
+        for (; j < n; j++) if (tv[j] == T) { tc[j]++; break; }
+        if (j == n && n < 16) { tv[n] = T; tc[n] = 1; n++; }
+    }
+    int total = callInt0(g_mgr, "GetActorTotalCount");
+    int hero = callInt0(g_mgr, "GetHeroActorCount");
+    int organ = callInt0(g_mgr, "GetOrganActorCount");
+    int sold = callInt0(g_mgr, "GetSoldierActorCount");
+    int dragon = callInt0(g_mgr, "GetDragonActorCount");
+    int buff = callInt0(g_mgr, "GetBuffMonsterCount");
+    int c1 = callInt1(g_mgr, "GetCampActorCount", 1);
+    int c2 = callInt1(g_mgr, "GetCampActorCount", 2);
+    CHECK("CNT total %d hero %d organ %d soldier %d dragon %d buff %d c1 %d c2 %d",
+          total, hero, organ, sold, dragon, buff, c1, c2);
+    if (n > 0) {
+        static char th[120];
+        int p = 0;
+        th[0] = 0;
+        for (int i = 0; i < n && p < 100; i++)
+            p += snprintf(th + p, sizeof(th) - p, "T%d=%d ", tv[i], tc[i]);
+        CHECK("TH %s| u %d", th, g_lastCnt);
+    }
+    // 唯一定位英雄类型
+    if (hero > 0 && g_heroType < 0) {
+        int hit = 0, cand = -1;
+        for (int i = 0; i < n; i++) if (tc[i] == hero) { hit++; cand = tv[i]; }
+        if (hit == 1) { g_heroType = cand; CHECK("WHITELIST T=%d (hero %d)", cand, hero); }
+        else CHECK("WHITELIST none (hit %d, hero %d)", hit, hero);
+    }
+}
+
+// v33：读一个单位的身份。结构体内联就直接算地址，是类就再解一次指针。
+static int readIdentity2(void *obj, int *aType, int *aCamp, int *cfg, int *pid,
+                          int *hostcfg, int *rawpid) {
+    if (aType) *aType = 0;
+    if (aCamp) *aCamp = 0;
+    if (cfg) *cfg = 0;
+    if (pid) *pid = 0;
+    if (hostcfg) *hostcfg = 0;
+    if (rawpid) *rawpid = 0;
+    if (!obj || g_offTheMeta < 0) return 0;
+    void *meta = (char *)obj + g_offTheMeta;
+    if (!g_metaStruct) {                       // 引用：再解一次
+        void *p = NULL;
+        if (!rd(meta, &p, sizeof(p)) || !p) return 0;
+        meta = p;
+    }
+    if (g_offAType >= 0 && aType) rd((char *)meta + g_offAType, aType, 4);
+    if (g_offACamp >= 0 && aCamp) rd((char *)meta + g_offACamp, aCamp, 4);
+    if (g_offCfgId >= 0 && cfg)   rd((char *)meta + g_offCfgId, cfg, 4);
+    if (g_offPid   >= 0 && pid)   rd((char *)meta + g_offPid,   pid, 4);
+    if (g_offHostCfg >= 0 && hostcfg) rd((char *)meta + g_offHostCfg, hostcfg, 4);
+    if (g_offRawPid  >= 0 && rawpid)  rd((char *)meta + g_offRawPid,  rawpid, 4);
+    return 1;
+}
+
+// 老调用点用这个薄的
+static int readIdentity(void *obj, int *aType, int *aCamp, int *cfg, int *pid) {
+    return readIdentity2(obj, aType, aCamp, cfg, pid, NULL, NULL);
 }
 
 // v24：把一段内存按 32 位字打出来。全部走 rd()，读不到就记一行，不会崩。
@@ -1634,6 +2087,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v28：把「当前认定的 dict / entries / cap」和它们前 16 字节原样存下来，供首屏显示。
     // r 出现 0x56004660 这种堆指针形态时，只有原始 dword 能说明问题。
     g_dictPtr = dict; g_entPtr = entries; g_capNow = cap;
+    g_lastDict = dict; g_lastEntries = entries; g_lastCnt = (cnt > 0) ? cnt : 0;   // v34：供自证用
     { unsigned int a[8] = {0}; rd(dict, a, sizeof(a)); for (int i = 0; i < 8; i++) g_dw[i] = a[i]; }
     { unsigned int b[8] = {0}; rd(g_mgr, b, sizeof(b)); for (int i = 0; i < 8; i++) g_mw[i] = b[i]; }
 
@@ -1725,6 +2179,15 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     if (!useW2S && !g_vpReady) return;
 
     int drawn = 0;
+    g_scrW = sw; g_scrH = sh;                      // v39：ref2 判屏幕中心要用
+    g_seenN = 0;                                   // v35：本帧去重表清空
+    g_frameDead = 0; g_frameAll = 0;
+    if (cnt <= 0) {                                 // v35：换局/回大厅，清空生命周期记忆
+        for (int k = 0; k < 64; k++) { g_gone[k].id = 0; g_gone[k].tGone = 0; }
+        g_mirrorSafe = 0;
+        for (int b = 0; b < 4; b++) { g_bktTot[b] = 0; g_bktMov[b] = 0; }   // v40：换局清空累计
+        g_myCamp = 0; g_enemyN = -1;
+    }
     for (int i = 0; i < cnt && drawn < 32; i++) {
         void *obj = NULL;
         if (!rd((char *)entries + g_arrBase + (size_t)i * 24 + 16, &obj, sizeof(obj))) continue;
@@ -1740,6 +2203,68 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         rd((char *)obj + 0x504, &camp, 1);
         unsigned int objId = 0;
         rd((char *)obj + 0x4AC, &objId, 4);
+
+        // v33：身份（ActorType / ActorCamp / ConfigId / PlayerId）
+        // v34：再带上 HostConfigId / RawPlayerId，一次把「英雄 ID 在哪个字段」定死
+        int aT = 0, aC = 0, cfg = 0, pid = 0, hcfg = 0, rpid = 0;
+        readIdentity2(obj, &aT, &aC, &cfg, &pid, &hcfg, &rpid);
+        // v34：白名单一旦自证成功，就只画英雄；没自证出来时保持「全画」，不会白跑
+        if (g_heroType >= 0 && aT != g_heroType) { continue; }
+
+        // ---- v35 规则1：身份用 ObjID —— 同一帧同一个 ObjID 只画一次
+        // （逻辑 actor 与 mesh actor 会各自进列表，不去重就会出现「框特别粗」）
+        {
+            int dup = 0;
+            for (int k = 0; k < g_seenN; k++) if (g_seenId[k] == objId) { dup = 1; break; }
+            if (dup) continue;
+            if (g_seenN < 64) g_seenId[g_seenN++] = objId;
+        }
+
+        // ---- v35 规则2：活跃度只看 _meshVisible / _logicVisible
+        int mesh = 1, logic = 1, inCam = 0, mirror = 0, host = 0, call = 0;
+        unsigned char b = 0;
+        if (g_offMeshVis  >= 0) { b = 0; rd((char *)obj + g_offMeshVis,  &b, 1); mesh  = b ? 1 : 0; }
+        if (g_offLogicVis >= 0) { b = 0; rd((char *)obj + g_offLogicVis, &b, 1); logic = b ? 1 : 0; }
+        if (g_offInCam    >= 0) { b = 0; rd((char *)obj + g_offInCam,    &b, 1); inCam = b ? 1 : 0; }
+        if (g_offMirror   >= 0) { b = 0; rd((char *)obj + g_offMirror,   &b, 1); mirror = b ? 1 : 0; }
+        if (g_offHostActor >= 0) { void *p = NULL; rd((char *)obj + g_offHostActor, &p, sizeof(p)); host = p ? 1 : 0; }
+        if (g_offCallActor >= 0) { void *p = NULL; rd((char *)obj + g_offCallActor, &p, sizeof(p)); call = p ? 1 : 0; }
+
+        // v36（对面改口，我认同）：分身/傀儡 **不清除**，改成细框 + 另一种颜色。
+        // 元歌傀儡贴脸的时候，正是最需要看见的东西；过滤掉等于自断信息。
+        int isSummon = (mirror || host || call) ? 1 : 0;
+        if (isSummon) g_mirrorSafe = 1;
+
+        // ---- v35 规则3：死亡 / 失联 = 停滞 + 灰框 + 超时
+        float nowT = (float)CACurrentMediaTime();
+        int gi = -1;
+        for (int k = 0; k < 64; k++) if (g_gone[k].id == objId && g_gone[k].id != 0) { gi = k; break; }
+        float goneAge = -1.0f;
+        g_frameAll++;
+        if (!g_flagTrust) { mesh = 1; logic = 1; }         // 旗标不可信 → 当作正常，绝不白屏
+        if (mesh == 0 && logic == 0) {
+            g_frameDead++;
+            if (gi < 0) {                                  // 第一次看不到：记时刻
+                for (int k = 0; k < 64; k++) if (g_gone[k].id == 0) { g_gone[k].id = objId; g_gone[k].tGone = nowT; gi = k; break; }
+                g_deadTotal++;
+            }
+            if (gi >= 0) goneAge = nowT - g_gone[gi].tGone;
+            // v36：撤回「超时丢弃」。视野外的敌人坐标可能是冻结的，丢掉就是主动放弃信息；
+            // 只有 ObjID 从单位表里消失才真正不画（那种情况本来也进不来这个循环）。
+            // 于是这里只记年龄，用于在框上标「最后已知 N 秒前」。
+        } else if (gi >= 0) {
+            g_gone[gi].id = 0; g_gone[gi].tGone = 0;        // 又看得见了：清记忆
+        }
+
+        if (g_unitDump < 6) {
+            void *nm = NULL;
+            rd((char *)obj + 0x4B0, &nm, sizeof(nm));
+            char sbuf[24];
+            readName(nm, sbuf, sizeof(sbuf));
+            CHECK("U%d id %u T %d C %d cfg %d host %d pid %d raw %d | %s",
+                  g_unitDump, objId, aT, aC, cfg, hcfg, pid, rpid, sbuf);
+            g_unitDump++;
+        }
 
         float sx = 0, sy = 0;
         if (useW2S) {
@@ -1771,15 +2296,43 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         float h  = 90.0f, wd = 45.0f;
         ImU32 col = (camp == 0) ? IM_COL32(90, 190, 255, 230)
                                 : IM_COL32(255, 70, 70, 230);
+        int deadStyle = 0;                                  // 0=正常 1=灰虚线淡出 2=隐身灰闪
+        if (mesh == 0 && logic == 0) {
+            // v36：灰色虚线，**不淡出、不丢弃**；年龄直接标在框上
+            col = IM_COL32(170, 170, 170, 200);
+            deadStyle = 1;
+        } else if (mesh == 0 && logic != 0) {
+            // 隐身（兰陵王/鬼谷子）：灰闪，这是透视的价值点，不当死亡处理
+            float blink = 0.5f + 0.5f * sinf(nowT * 6.0f);
+            col = IM_COL32(220, 220, 220, (int)(90 + 120 * blink));
+            deadStyle = 2;
+        }
         if (g_showBox) {
-            dl->AddRect(ImVec2(sx - wd * 0.5f, sy - h),
-                        ImVec2(sx + wd * 0.5f, sy), col, 0, 0, 1.6f);
+            if (deadStyle == 1) {
+                dashRect(dl, ImVec2(sx - wd * 0.5f, sy - h), ImVec2(sx + wd * 0.5f, sy), col);
+            } else if (isSummon) {
+                // 分身/傀儡：细框 + 紫青色，明显区别于真身
+                dl->AddRect(ImVec2(sx - wd * 0.42f, sy - h * 0.9f),
+                            ImVec2(sx + wd * 0.42f, sy), IM_COL32(200, 130, 255, 220), 0, 0, 1.0f);
+            } else {
+                dl->AddRect(ImVec2(sx - wd * 0.5f, sy - h),
+                            ImVec2(sx + wd * 0.5f, sy), col, 0, 0, 1.6f);
+            }
         }
         dl->AddCircleFilled(ImVec2(sx, sy), 3.0f, col);
-        char buf[40];
-        snprintf(buf, sizeof(buf), "%u c%d", objId, (int)camp);
+        char buf[72];
+        if (deadStyle == 1 && goneAge >= 0)
+            snprintf(buf, sizeof(buf), "%u T%d C%d %s%.0fs", objId, aT, aC, isSummon ? "S " : "", goneAge);
+        else
+            snprintf(buf, sizeof(buf), "%u T%d C%d H%d%s", objId, aT, aC, cfg, isSummon ? " S" : "");
         dl->AddText(ImVec2(sx + 6, sy - h - 12), col, buf);
         drawn++;
+    }
+    // v35 安全网：一帧里 >90% 的单位都被判成死亡/失联，只可能是旗标偏移不对，
+    // 这时立刻停用旗标判定（回到 v34 行为），并留一行日志自证，避免整屏空框白跑一版。
+    if (g_flagTrust && g_frameAll >= 4 && g_frameDead * 10 > g_frameAll * 9) {
+        g_flagTrust = 0;
+        CHECK("LFLAG distrust dead %d/%d", g_frameDead, g_frameAll);
     }
     g_boxDrawn = drawn;
     if (drawn > 0) g_hudWasGood = 1;
@@ -1812,12 +2365,12 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v31  u%d r%d b%d p%d in%d d%d c%d\n3-finger UP = full hud",
+            @"ESP v40  u%d r%d b%d p%d in%d d%d c%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v31\n"];
+    [s appendString:@"ESP v40\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -1836,7 +2389,9 @@ static void updateHud(void) {
     {
         float winW = (float)g_overlayWin.bounds.size.width;
         float scl = (winW > 1.0f && g_camPxW > 0) ? ((float)g_camPxW / winW) : 0.0f;
-        [s appendFormat:@"CTX %d PX %dx%d WIN %.0f SCL %.2f EXP %dx%d\n",
+        [s appendFormat:@"HERO T %d (u %d) gone %d summon %d fog %d/%d\n",
+        g_heroType, g_unitCount, g_deadTotal, g_mirrorSafe, g_fogRuns, FOG_RUNS];
+    [s appendFormat:@"CTX %d PX %dx%d WIN %.0f SCL %.2f EXP %dx%d\n",
             g_ctxOff, g_camPxW, g_camPxH, winW, scl, g_expW, g_expH];
     }
     int pages = (g_checkN + HUD_LINES - 1) / HUD_LINES;
@@ -1872,6 +2427,10 @@ static void updateHud(void) {
     // v25：还没读到单位，就每 5 秒把 ActorManager 的字典字段重扫一遍（会自动换 g_offDict / g_arrBase）
     // v29：探测最多跑 3 轮 —— 之前每 5 秒一轮把 HUD 顶到 38 页，翻都翻不完
     if (t % 150 == 0 && g_mgr && g_unitCount == 0 && g_hopTried < 3) { probeActorLists(); probeViewHop(); }
+    // v34：进对局、读到单位之后，跑 3 次计数自证（计数会随兵线变化，多跑几次更稳）
+    if (t % 90 == 0 && g_mgr && g_unitCount > 0 && g_verifyN < 3) { g_verifyN++; verifyIdentity(); }
+    // v36：FOG 探针每 5 秒一次，最多 12 次（1 分钟），够看清机制就停，不刷页
+    if (t % 150 == 0 && g_unitCount >= 40 && g_fogRuns < FOG_RUNS) { g_fogRuns++; fogProbe(); }
     if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
 }
 @end
@@ -1953,7 +2512,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v31 booting";
+    l.text = @"ESP v40 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -1992,7 +2551,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v31 esp (typed-probe)");
+    ImGui::Text("build         : v40 esp (fog-enemy-bucket)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
