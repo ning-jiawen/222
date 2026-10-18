@@ -166,7 +166,7 @@ static void pushLog(const char *fmt, ...) {
 // v11-S（截图版）：缓冲 160 → 760 行，每页 20 行 → 十几页拍完；6 秒翻页并循环
 #define MAXCHECK   760
 #define CHECKLEN   112
-#define HUD_LINES   20
+#define HUD_LINES   16          // v28：20 → 16，把省下的 4 行给首屏固定诊断块
 #define HUD_DWELL  180          // CADisplayLink 30fps → 180 tick = 6 秒/页
 static char g_check[MAXCHECK][CHECKLEN];
 static int  g_checkN = 0;
@@ -793,7 +793,30 @@ static void  *g_uCamClass   = NULL;   // v23：UnityEngine.Camera —— 必须�
                                       // 永远查不到（截图里 api get_main 1 但 camcall no get_main 就是这么来的）
 static int    g_posOk       = 0;      // v23：坐标非零的单位数（大厅 vs 对局一看就知道）
 static int    g_camPxLogged = 0;      // v23：像素尺寸只打一次
+static int    g_ctxOff      = -1;     // v30：Context 在 DictionaryView 里的偏移（类=8 / 内联结构体=0）
+static int    g_camPxW      = 0;      // v30：相机的 pixelWidth
+static int    g_camPxH      = 0;      // v30：相机的 pixelHeight
+static int    g_expW        = 0;      // v30：UIKit 期望的像素宽（点×scale）
+static int    g_expH        = 0;      // v30：UIKit 期望的像素高
+static int    g_pxWarn      = 0;      // v30：像素不匹配告警只打一次
+static int    camIntProp(void *cam, const char *name);
+static void  *camObjProp(void *cam, const char *name);
+static void   adoptFromAllCameras(void);
 static int    g_cntRaw      = 0;      // v24：字典 _count 的原始值（夹紧前）
+static int    g_capNow      = -1;     // v28：entries 数组长度（原样）
+static void  *g_dictPtr     = NULL;   // v28：当前当作 Dictionary 的那个对象
+static void  *g_entPtr      = NULL;   // v28：当前当作 entries 的那个数组
+static unsigned int g_dw[8] = {0};    // v28：dict+0x00..0x1F 的原始 dword（klass/buckets/entries/count 全在里面）
+static unsigned int g_mw[8] = {0};    // v28：mgr +0x00..0x1F 的原始 dword
+static float  g_w0[3]       = {0};    // v28：WorldToScreenPoint(0,0,0) 的结果
+static void  *g_camMain     = NULL;   // v28：get_main 最近一次返回
+static void  *g_camCur      = NULL;   // v28：get_current 最近一次返回
+static int    g_pageFreeze  = 0;      // v28：1 = 停止自动翻页（2 指下滑切换）
+static int    g_viewHop     = 0;      // v29：0 = *(mgr+offDict) 就是 Dictionary；
+                                      //      >0 = 它其实是 DictionaryView，还要再 *(view+hop) 才是 Context
+static int    g_hopTried    = 0;      // v29：已经跑过几次 hop 探测
+static void   probeW2S0(void);
+
 static int    g_arrBase     = 0x18;   // v27：固定 0x18，不自动翻。
                                       // 依据：_entries@0x10 / _count@0x18 两条运行期实测已经把 8 字节头钉死，
                                       // 所以「cap==0 → 16 字节头」「m20==1 → 基址 0x20」这两个推断都不成立。
@@ -857,7 +880,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v27 ====");
+    CHECK("==== dump v31 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -868,7 +891,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v27 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v31 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1131,6 +1154,11 @@ static void resolveDict(void *mgrClass) {
     g_offDict    = (int)I2.field_get_offset(lf);
     g_offCount   = (int)I2.field_get_offset(cntF);
     g_offEntries = (int)I2.field_get_offset(entF);
+    // v30：这一行是 v17→v27 一路 0 单位的真正原因 —— Context 的偏移算出来了却从来没用在读取路径上。
+    // 期望 8（DictionaryView 是类：klass 8 + Context 8，由两个 view 相差 0x10 反推）；
+    // 若为 0，说明它其实是内联结构体（老假设），读取路径会自动退回「不跳」。
+    g_ctxOff     = (int)I2.field_get_offset(cf);
+    CHECK("CTX off %d viewCls %p", g_ctxOff, viewCls);
 }
 
 // v18：扫所有「类名里含 Camera」的类，看它们有没有指向
@@ -1264,9 +1292,15 @@ static void resolveCam(void) {
         void *cur = NULL;
         void *mc = I2.class_get_method_from_name(g_uCamClass, "get_current", 0);
         if (mc) { void *f2 = *(void **)mc; if (f2) cur = ((void *(*)(void *))f2)(mc); }
+        g_camMain = cam; g_camCur = cur;
         CHECK("Dcam main %p cur %p", cam, cur);
     }
-    if (!cam) return;                             // 还没有相机，下一轮再试
+    if (!cam) {
+        // v30：局内 main 为 null —— 这时才用 allCameras 兜底（每 5 秒最多一次）
+        static int s_allN = 0;
+        if (s_allN++ % 5 == 0) adoptFromAllCameras();
+        return;
+    }
     // v23：没换人就直接返回。换人（大厅相机 → 战斗相机）必须重新采纳，
     // 否则会一直拿大厅那台去投影。
     if (cam == g_camObj && g_miW2S) return;
@@ -1291,6 +1325,9 @@ static void resolveCam(void) {
     if (prev != cam || g_camCallState != 1)
         CHECK("camcall ok %p (was %p) w2s %d", cam, prev, g_miW2S ? 1 : 0);
     g_camKlass = k;
+    // v30：记下相机像素尺寸，用来识别「大厅相机残留」
+    g_camPxW = camIntProp(cam, "get_pixelWidth");
+    g_camPxH = camIntProp(cam, "get_pixelHeight");
     g_camCallState = 1;
 
     // v23：采纳相机后打一次像素尺寸。WorldToScreenPoint 返回的是「像素」，
@@ -1305,6 +1342,17 @@ static void resolveCam(void) {
         if (mph) { void *f2 = *(void **)mph; if (f2) ph = ((int (*)(void *, void *))f2)(cam, mph); }
         CHECK("cam px %d x %d uiscale %.1f", pw, ph, g_uiScale);
     }
+}
+
+// v28：把世界原点投影一次。它与「读不到单位」完全无关，所以能在 u=0 的情况下
+// 单独验证「相机是不是主相机 + W2S 的 ABI 对不对 + 换算比例」—— 这是本轮唯一新增的硬信号。
+static void probeW2S0(void) {
+    if (!g_camObj || !g_miW2S) return;
+    void *fn = *(void **)g_miW2S;
+    if (!fn) return;
+    Vec3 wp = {0.0f, 0.0f, 0.0f};
+    Vec3 sp = ((Vec3 (*)(void *, Vec3, void *))fn)(g_camObj, wp, g_miW2S);
+    g_w0[0] = sp.x; g_w0[1] = sp.y; g_w0[2] = sp.z;
 }
 
 // v22：相机验活。托管对象头第一个 8 字节就是 klass 指针，这里只做两件事：
@@ -1331,6 +1379,127 @@ static void dumpWords(const char *tag, const void *p, int n) {
     CHECK("%s%s", tag, buf);
 }
 
+// v30：entries 会留空槽（删除后 value=NULL），首元素恰好可能是空的。
+// 所以判定用「前 8 项里命中 ActorLinker 的个数」：优先 >=2；只有 cnt<=1 时才接受单命中。
+static int linkerHits(void *entries, int cnt) {
+    if (!entries) return 0;
+    int hits = 0, lim = (cnt < 8) ? cnt : 8;
+    for (int i = 0; i < lim; i++) {
+        void *v = NULL, *k = NULL;
+        if (!rd((char *)entries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        if (rd(v, &k, sizeof(k)) && k == g_linkerClass) hits++;
+    }
+    return hits;
+}
+
+// v29：判断「这个对象像不像我们要找的 Dictionary」。
+// 只认元数据给的 _count/_entries 偏移（16/24），再要求 entries 前几项能解出 ActorLinker。
+// v30：实例属性读取（int / 对象）。K 版显式传 klass，供 allCameras 循环里逐台判断；
+// 非 K 版用当前采纳的相机 klass（g_camKlass），供 resolveCam / 采纳后读尺寸用。
+static int camIntPropK(void *cam, void *klass, const char *name) {
+    if (!cam || !klass || !I2.class_get_method_from_name) return 0;
+    void *m = I2.class_get_method_from_name(klass, name, 0);
+    if (!m) return 0;
+    void *fn = *(void **)m;
+    if (!fn) return 0;
+    return ((int (*)(void *, void *))fn)(cam, m);
+}
+
+static void *camObjPropK(void *cam, void *klass, const char *name) {
+    if (!cam || !klass || !I2.class_get_method_from_name) return NULL;
+    void *m = I2.class_get_method_from_name(klass, name, 0);
+    if (!m) return NULL;
+    void *fn = *(void **)m;
+    if (!fn) return NULL;
+    return ((void *(*)(void *, void *))fn)(cam, m);
+}
+
+static int camIntProp(void *cam, const char *name) {
+    return camIntPropK(cam, g_camKlass, name);
+}
+
+static void *camObjProp(void *cam, const char *name) {
+    return camObjPropK(cam, g_camKlass, name);
+}
+
+// v30：局内 Camera.main 被证实是 null，所以补一条 allCameras 兜底：
+// 只挑 targetTexture 为空、像素面积最大的那台。
+static void adoptFromAllCameras(void) {
+    if (!g_uCamClass || !I2.class_get_method_from_name) return;
+    void *mc = I2.class_get_method_from_name(g_uCamClass, "get_allCamerasCount", 0);
+    void *ma = I2.class_get_method_from_name(g_uCamClass, "get_allCameras", 0);
+    if (!mc || !ma) { CHECK("CAM no allCameras api"); return; }
+    void *fc = *(void **)mc, *fa = *(void **)ma;
+    if (!fc || !fa) { CHECK("CAM allCameras fn null"); return; }
+    int n = ((int (*)(void *))fc)(mc);
+    void *arr = ((void *(*)(void *))fa)(ma);
+    CHECK("CAM all n %d arr %p", n, arr);
+    if (n <= 0 || n > 32 || !arr) return;
+    void *best = NULL; int bestArea = -1;
+    for (int i = 0; i < n; i++) {
+        void *c = NULL;
+        if (!rd((char *)arr + g_arrBase + (size_t)i * 8, &c, sizeof(c)) || !c) continue;
+            void *ck = NULL;
+        if (!rd(c, &ck, sizeof(ck)) || !ck) continue;
+        if (camObjPropK(c, ck, "get_targetTexture")) continue;   // 渲染到 RT 的相机不要
+        int w = camIntPropK(c, ck, "get_pixelWidth"), h = camIntPropK(c, ck, "get_pixelHeight");
+        int area = w * h;
+        if (area > bestArea) { bestArea = area; best = c; }
+    }
+    if (best) {
+        void *kk = NULL;
+        if (rd(best, &kk, sizeof(kk)) && kk) {
+            g_camObj = best; g_camKlass = kk; g_camCallState = 1;
+            // v30：从 allCameras 采纳时也要把 W2S 的 MethodInfo 补上 —— 否则 useW2S 永远 false，又白跑一版
+            if (!g_miW2S) g_miW2S = I2.class_get_method_from_name(kk, "WorldToScreenPoint", 1);
+            g_camPxW = camIntProp(best, "get_pixelWidth");
+            g_camPxH = camIntProp(best, "get_pixelHeight");
+            CHECK("CAM pick all %p %dx%d", best, g_camPxW, g_camPxH);
+        }
+    }
+}
+
+static int dictLooks(void *d, int *oCnt, void **oEnt, int *oCap, int *oMatch) {
+    if (!d || g_offCount < 0 || g_offEntries < 0) return 0;
+    int cnt = -1, cap = -1;
+    void *ent = NULL, *v0 = NULL, *k0 = NULL;
+    if (!rd((char *)d + g_offCount, &cnt, sizeof(cnt))) return 0;
+    if (!rd((char *)d + g_offEntries, &ent, sizeof(ent)) || !ent) return 0;
+    if (!rd((char *)ent + 0x10, &cap, sizeof(cap))) return 0;
+    if (oCnt) *oCnt = cnt;
+    if (oEnt) *oEnt = ent;
+    if (oCap) *oCap = cap;
+    if (rd((char *)ent + g_arrBase + 16, &v0, sizeof(v0)) && v0) rd(v0, &k0, sizeof(k0));
+    if (oMatch) {
+        int hits = linkerHits(ent, cnt);
+        *oMatch = (hits >= 2 || (cnt <= 1 && hits == 1)) ? 1 : 0;   // v30：按命中数，不按首元素
+    }
+    return (cnt >= 0 && cnt <= 512 && cap > 0 && cap <= 65536) ? 1 : 0;
+}
+
+// v29：现场已证明 *(mgr+offDict) 拿到的是 DictionaryView（4 个指针字段），不是 Dictionary。
+// 这里把它每个指针字段都试一遍，谁通过 Dictionary 测试，谁就是 Context。
+static void probeViewHop(void) {
+    if (!g_mgr || g_offDict < 0) return;
+    void *view = NULL;
+    if (!rd((char *)g_mgr + g_offDict, &view, sizeof(view)) || !view) return;
+    g_hopTried++;
+    int picked = 0, soft = -1;
+    for (int hop = 0; hop <= 0x28; hop += 8) {
+        void *t = view;
+        if (hop > 0 && (!rd((char *)view + hop, &t, sizeof(t)) || !t)) continue;
+        int cnt = -1, cap = -1, m = 0;
+        void *ent = NULL;
+        int ok = dictLooks(t, &cnt, &ent, &cap, &m);
+        CHECK("H hop %02x p %p ok %d cnt %d cap %d m %d", hop, t, ok, cnt, cap, m);
+        if (ok && !picked && soft < 0) soft = hop;      // 形状像 Dictionary 的，先记下来当备选
+        if (ok && m && !picked) { g_viewHop = hop; picked = 1; }
+    }
+    if (picked) CHECK("H pick hop %02x", g_viewHop);
+    else if (soft >= 0 && !g_viewHop) { g_viewHop = soft; CHECK("H soft hop %02x", soft); }
+    else if (!g_viewHop) CHECK("H none (no Dictionary-shaped field)");
+}
+
 // v25：把 ActorManager 上所有 DictionaryView 字段扫一遍，逐个解到 Context，再读
 // ent / cnt / cap，并同时用 0x18 和 0x20 两种基址去解第一个元素，看哪个 klass 等于 ActorLinker。
 // 结论直接采纳：哪个字段能解出 ActorLinker，就把 g_offDict 换成它，基址也一并定下来。
@@ -1339,65 +1508,73 @@ static void probeActorLists(void) {
     if (!g_mgr || !g_mgrClass || !I2.class_get_fields || !I2.field_get_type ||
         !I2.type_get_name || !I2.field_get_name) return;
     void *f = NULL;
-    int total = 0, shown = 0, best = -1, bestBase = 0x18;
-    // v25：class_get_fields 只给「本类自己声明的字段」，所以沿父类链走一遍
-    // —— actorList 这类字段很可能挂在 ActorManager 的基类上（findInstanceByStatic 也是这么走的）。
+    int total = 0, shown = 0, best = -1;
+    int altOff[2] = {-1, -1}, altCnt[2] = {0, 0}, altN = 0;
     for (void *kc = g_mgrClass; kc && total < 300; kc = (I2.class_get_parent ? I2.class_get_parent(kc) : NULL)) {
         void *it = NULL;
         while ((f = I2.class_get_fields(kc, &it)) && total++ < 300) {
-            if (I2.field_get_flags && (I2.field_get_flags(f) & 0x10)) continue;  // 跳过 static
+            if (I2.field_get_flags && (I2.field_get_flags(f) & 0x10)) continue;   // 跳过 static
             void *ft = I2.field_get_type(f);
             const char *tn = ft ? I2.type_get_name(ft) : NULL;
             if (!tn) continue;
-            // v25：除了 DictionaryView，也把「类型名里带 ActorLinker」的字段打出来
-            // —— 万一单位表其实是个 List<ActorLinker>/数组，也能一眼看到它在哪个偏移。
+            // v31：按类型分流，别用同一套判据去测所有容器（否则「L none」是假结论）
             bool isDV = (strstr(tn, "DictionaryView") != NULL);
-            if (!isDV && !strstr(tn, "ActorLinker")) continue;
+            size_t tl = strlen(tn);
+            bool isList = (!isDV && (strstr(tn, "List") != NULL ||
+                                     (tl > 2 && strcmp(tn + tl - 2, "[]") == 0)));
+            if (!isDV && !isList) continue;
+
             int off = (int)I2.field_get_offset(f);
             const char *fn = I2.field_get_name(f);
-            if (!isDV) { if (shown++ < 8) CHECK("L %s @%d %s", fn ? fn : "?", off, tn); continue; }
-            void *ctx = NULL;
-            if (!rd((char *)g_mgr + off, &ctx, sizeof(ctx)) || !ctx) {
-                if (shown++ < 8) CHECK("L %s @%d ctx null", fn ? fn : "?", off);
+            void *holder = NULL;
+            if (!rd((char *)g_mgr + off, &holder, sizeof(holder)) || !holder) {
+                if (shown++ < 8) CHECK("L %s @%d null", fn ? fn : "?", off);
                 continue;
             }
-            void *ent = NULL;
-            int cnt = 0, cap = 0;
-            rd((char *)ctx + 0x10, &ent, sizeof(ent));
-            rd((char *)ctx + 0x18, &cnt, sizeof(cnt));
-            if (ent) rd((char *)ent + 0x10, &cap, sizeof(cap));
 
-            void *v18 = NULL, *k18 = NULL, *v20 = NULL, *k20 = NULL;
-            void *v18b = NULL, *k18b = NULL;
-            if (ent) {
-                if (rd((char *)ent + 0x18 + 16, &v18, sizeof(v18)) && v18) rd(v18, &k18, sizeof(k18));
-                if (rd((char *)ent + 0x20 + 16, &v20, sizeof(v20)) && v20) rd(v20, &k20, sizeof(k20));
-                // v27：只有 cnt >= 2 时第二个元素才存在；否则打 -1 表示「未知」，不要当成 0
-                if (cnt >= 2 && rd((char *)ent + 0x18 + 24 + 16, &v18b, sizeof(v18b)) && v18b)
-                    rd(v18b, &k18b, sizeof(k18b));
+            if (isDV) {
+                // 两跳：*(mgr+off) 是 DictionaryView，Context 在 +g_ctxOff（类=8）
+                void *dict = holder;
+                if (g_ctxOff > 0) {
+                    void *c2 = NULL;
+                    if (rd((char *)holder + g_ctxOff, &c2, sizeof(c2)) && c2) dict = c2;
+                }
+                int cnt = -1, cap = -1;
+                void *ent = NULL;
+                rd((char *)dict + g_offCount, &cnt, sizeof(cnt));
+                if (rd((char *)dict + g_offEntries, &ent, sizeof(ent)) && ent)
+                    rd((char *)ent + 0x10, &cap, sizeof(cap));
+                int hits = linkerHits(ent, cnt);           // 前 8 项命中数
+                if (shown++ < 8)
+                    CHECK("L %s @%d ctx %p cnt %d cap %d hits %d", fn ? fn : "?", off, dict, cnt, cap, hits);
+                if (cnt > 0 && cap > 0 && (hits >= 2 || (cnt <= 1 && hits == 1))) {
+                    if (best < 0) best = off;
+                    if (altN < 2) { altOff[altN] = off; altCnt[altN] = cnt; altN++; }
+                }
+            } else {
+                // List<T> / T[]：_items@0x08、_size@0x10，元素步长 8（对象引用）
+                void *items = NULL;
+                int size = -1;
+                rd((char *)holder + 0x08, &items, sizeof(items));
+                rd((char *)holder + 0x10, &size, sizeof(size));
+                int hits = 0, lim = (size < 8) ? size : 8;
+                for (int i = 0; i < lim; i++) {
+                    void *v = NULL, *kk = NULL;
+                    if (!rd((char *)items + g_arrBase + (size_t)i * 8, &v, sizeof(v)) || !v) continue;
+                    if (rd(v, &kk, sizeof(kk)) && kk == g_linkerClass) hits++;
+                }
+                if (shown++ < 8)
+                    CHECK("LL %s @%d items %p size %d hits %d", fn ? fn : "?", off, items, size, hits);
             }
-            int m18 = (k18 && k18 == g_linkerClass) ? 1 : 0;
-            int m20 = (k20 && k20 == g_linkerClass) ? 1 : 0;
-            int m18b = (cnt < 2) ? -1 : ((k18b && k18b == g_linkerClass) ? 1 : 0);
-            if (shown++ < 8)
-                CHECK("L %s @%d ctx %p ent %p cnt %d cap %d m18 %d m18b %d m20 %d",
-                      fn ? fn : "?", off, ctx, ent, cnt, cap, m18, m18b, m20);
-            // v27：纯观测。只有「count 有值 + 基址 0x18 解得出 ActorLinker」才把这个字段记成候选，
-            // 绝不因为 m20 / cap==0 就改基址 —— 那两条推断在 8 字节头前提下不成立。
-            if (best < 0 && cap > 0 && cnt > 0 && m18) {
-                if (cnt < 2 || m18b == 1) { best = off; bestBase = 0x18; }
-                else CHECK("L %s m18 ok but m18b 0 (cnt %d) —— Entry 布局可疑", fn ? fn : "?", cnt);
-            }
-            if (cap == 0 && shown <= 8) CHECK("L %s cap0 —— entries 不是数组或空数组", fn ? fn : "?");
-            if (m20 && !m18 && shown <= 8) CHECK("L %s m20 only —— 像步长 8 的指针数组", fn ? fn : "?");
         }
     }
     if (best >= 0) {
-        // 只换字段，不动基址（bestBase 恒为 0x18）
         if (best != g_offDict) { g_offDict = best; CHECK("L pick @%d", best); }
         g_arrBase = 0x18;
+        // v31：把并列候选的 cnt 一起打出来，一眼看出该选哪个
+        if (altN >= 2) CHECK("L alt @%d cnt %d | @%d cnt %d", altOff[0], altCnt[0], altOff[1], altCnt[1]);
     } else {
-        CHECK("L none (DictionaryView 字段都没解出 ActorLinker)");
+        CHECK("L none (no DictionaryView field with ActorLinker)");
     }
 }
 
@@ -1420,11 +1597,21 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
 
     // v24：每一步读失败都要留一行。v22/v23 在这里全是裸 return，所以 HUD 只剩 u 0，
     // 根本分不清是空字典、偏移错、还是数组头错 —— 这就是「修了三个版本没框」的根源。
-    void *dict = NULL;
-    if (!rd((char *)g_mgr + g_offDict, &dict, sizeof(dict)) || !dict) {
-        if (g_diagFail < 6) { g_diagFail++; CHECK("Ddict fail mgr %p off %d -> %p", g_mgr, g_offDict, dict); }
-        dumpWords("Dmgr", g_mgr, 8);              // v24：偏移错了也能看出 mgr 里到底放了什么
+    // v29：*(mgr+offDict) 是 DictionaryView；真正的 Context 可能要再跳一层（g_viewHop）
+    void *view = NULL;
+    if (!rd((char *)g_mgr + g_offDict, &view, sizeof(view)) || !view) {
+        if (g_diagFail < 6) { g_diagFail++; CHECK("Ddict fail mgr %p off %d -> %p", g_mgr, g_offDict, view); }
+        dumpWords("Dmgr", g_mgr, 8);
         return;
+    }
+    // v30：先按元数据给的 Context 偏移跳一层（类=8），跳不动再退回 v29 探出来的 hop
+    void *dict = view;
+    if (g_ctxOff > 0) {
+        void *ctx = NULL;
+        if (rd((char *)view + g_ctxOff, &ctx, sizeof(ctx)) && ctx) dict = ctx;
+    } else if (g_viewHop > 0) {
+        void *hop = NULL;
+        if (rd((char *)view + g_viewHop, &hop, sizeof(hop)) && hop) dict = hop;
     }
     int cnt = 0;
     if (!rd((char *)dict + g_offCount, &cnt, sizeof(cnt))) {
@@ -1443,7 +1630,12 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         if (g_diagFail < 6) { g_diagFail++; CHECK("Dcap fail ent %p", entries); }
         return;
     }
-    g_cntRaw = cnt;
+    g_cntRaw  = cnt;
+    // v28：把「当前认定的 dict / entries / cap」和它们前 16 字节原样存下来，供首屏显示。
+    // r 出现 0x56004660 这种堆指针形态时，只有原始 dword 能说明问题。
+    g_dictPtr = dict; g_entPtr = entries; g_capNow = cap;
+    { unsigned int a[8] = {0}; rd(dict, a, sizeof(a)); for (int i = 0; i < 8; i++) g_dw[i] = a[i]; }
+    { unsigned int b[8] = {0}; rd(g_mgr, b, sizeof(b)); for (int i = 0; i < 8; i++) g_mw[i] = b[i]; }
 
     // v24：v22 那条 `cap <= 0 → return` 是设计错误 —— 一个可疑数字就把整条链全丢掉，
     // 于是只剩 u 0。现在改成「记账 + 夹紧」：可疑就不采信，但一定把原始值留在 HUD 上。
@@ -1560,7 +1752,10 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
             if (!(sp3.z > 0.01f)) continue;                       // z<=0 = 在相机背后
             if (!(sp3.x > -100000.0f && sp3.x < 100000.0f)) continue;
             if (!(sp3.y > -100000.0f && sp3.y < 100000.0f)) continue;
-            float sc = (g_uiScale > 0.1f) ? g_uiScale : 3.0f;
+            // v31：换算系数现算 = 相机像素宽 / 窗口点数宽（2622/874≈3.0）。
+            // 写死 UIScreen.scale 的话，降分辨率渲染 / iPad 分屏 / 动态分辨率都会整体偏。
+            float sc = (g_camPxW > 0 && sw > 1.0f) ? ((float)g_camPxW / sw)
+                                                  : ((g_uiScale > 0.1f) ? g_uiScale : 3.0f);
             sx = sp3.x / sc;                                       // Unity 像素 → 点
             sy = sh - sp3.y / sc;                                  // Unity 左下原点 → 屏幕左上
         } else {
@@ -1617,12 +1812,12 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v27  u%d r%d b%d p%d in%d d%d c%d\n3-finger UP = full hud",
+            @"ESP v31  u%d r%d b%d p%d in%d d%d c%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v27\n"];
+    [s appendString:@"ESP v31\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -1632,6 +1827,18 @@ static void updateHud(void) {
         g_il2cppOk ? @"OK" : @"FAIL",
         g_presentOn ? @"OK" : @"FAIL",
         g_vpReady ? @"OK" : @"todo"];
+    // v28：这 4 行永远在第一屏，不用翻页 —— 现场「没法自主翻页」时这是唯一能拿到数据的地方
+    [s appendFormat:@"R %d CAP %d ENT %p\n", g_cntRaw, g_capNow, g_entPtr];
+    [s appendFormat:@"D %08x %08x %08x %08x %08x %08x %08x %08x\n", g_dw[0], g_dw[1], g_dw[2], g_dw[3], g_dw[4], g_dw[5], g_dw[6], g_dw[7]];
+    [s appendFormat:@"M %08x %08x %08x %08x %08x %08x %08x %08x\n", g_mw[0], g_mw[1], g_mw[2], g_mw[3], g_mw[4], g_mw[5], g_mw[6], g_mw[7]];
+    [s appendFormat:@"W0 %.0f %.0f %.0f MAIN %p CUR %p\n",
+        g_w0[0], g_w0[1], g_w0[2], g_camMain, g_camCur];
+    {
+        float winW = (float)g_overlayWin.bounds.size.width;
+        float scl = (winW > 1.0f && g_camPxW > 0) ? ((float)g_camPxW / winW) : 0.0f;
+        [s appendFormat:@"CTX %d PX %dx%d WIN %.0f SCL %.2f EXP %dx%d\n",
+            g_ctxOff, g_camPxW, g_camPxH, winW, scl, g_expW, g_expH];
+    }
     int pages = (g_checkN + HUD_LINES - 1) / HUD_LINES;
     if (pages < 1) pages = 1;
     int page = g_hudPage % pages;
@@ -1656,14 +1863,15 @@ static void updateHud(void) {
     renderOverlay();
     int t = ++g_hudTick;
     if (t % 30 == 0) updateHud();
-    if (t % HUD_DWELL == 0) g_hudPage++;   // 6 秒翻一页，到底自动回第 1 页
+    if (!g_pageFreeze && t % HUD_DWELL == 0) g_hudPage++;   // v28：冻结时不自动翻页
     // v22：相机每秒独立补一次 —— 不再挂在 resolveEsp 的条件里，
     // 否则 g_vpReady 一旦为 true 就永远走不到相机逻辑
     // v23：不再是「没有相机才取」——而是进对局后每秒无条件重取一次 Camera.main，
     // 指针变了（大厅→对局）就换。一次 il2cpp 调用，成本可以忽略。
-    if (t % 30 == 0) { resolveCam(); }            // v24：不再依赖 inMatch
+    if (t % 30 == 0) { resolveCam(); probeW2S0(); }   // v24 取相机 / v28 顺便投一次世界原点
     // v25：还没读到单位，就每 5 秒把 ActorManager 的字典字段重扫一遍（会自动换 g_offDict / g_arrBase）
-    if (t % 150 == 0 && g_mgr && g_unitCount == 0) { probeActorLists(); }
+    // v29：探测最多跑 3 轮 —— 之前每 5 秒一轮把 HUD 顶到 38 页，翻都翻不完
+    if (t % 150 == 0 && g_mgr && g_unitCount == 0 && g_hopTried < 3) { probeActorLists(); probeViewHop(); }
     if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
 }
 @end
@@ -1728,12 +1936,13 @@ static void setupOverlay(void) {
     [vc.view.layer addSublayer:ml];
 
     // v11-S HUD 几何：按屏幕算，不写死 —— 17 Pro 横屏 874×402pt
-    // 4 行状态 + HUD_LINES(20) 行字段，10pt Menlo 行高按 13pt 留余量
+    // 4 行状态 + 4 行固定诊断 + HUD_LINES(16) 行分页字段，10pt Menlo 行高按 13pt 留余量
     UIEdgeInsets si = w.safeAreaInsets;
     CGFloat lh   = 13.0f;                    // 10pt Menlo 行高按 13 留余量，24 行不裁字
     CGFloat hudW = frame.size.width * 0.62f;
     if (hudW > 560) hudW = 560;
-    CGFloat hudH = (4 + HUD_LINES) * lh + 10;
+    // v28：实际打印 = 1(标题)+2(状态)+4(固定诊断)+1(PAGE)+HUD_LINES+1(尾) = HUD_LINES+9 行
+    CGFloat hudH = (HUD_LINES + 12) * lh + 12;
     if (hudH > frame.size.height - 16) hudH = frame.size.height - 16;
     CGFloat ox = si.left + 4;  if (ox < 8) ox = 8;
     CGFloat oy = si.top  + 4;  if (oy < 6) oy = 6;
@@ -1744,12 +1953,14 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v27 booting";
+    l.text = @"ESP v31 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
     if (g_uiScale < 1.0f) g_uiScale = 3.0f;
 
+    g_expW = (int)(MAX(frame.size.width, frame.size.height) * [UIScreen mainScreen].scale);
+    g_expH = (int)(MIN(frame.size.width, frame.size.height) * [UIScreen mainScreen].scale);
     g_overlayWin   = w;
     g_overlayLayer = ml;
     g_hudLabel     = l;
@@ -1781,7 +1992,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v27 esp (observe-only)");
+    ImGui::Text("build         : v31 esp (typed-probe)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
@@ -2000,7 +2211,34 @@ static void attachMenuGesture(void) {
     g4.numberOfTouchesRequired = 4;
     g4.direction = UISwipeGestureRecognizerDirectionDown;
     [win addGestureRecognizer:g4];
-    LOG("3-finger up = hud, 4-finger down = esp");
+    // v28：现场反馈「没法自主翻页」，而关键数字原来只出现在后面几页。
+    // 现在首屏就有固定块；再加两个手势，想看哪页看哪页：
+    //   2 指左滑 = 下一页，2 指右滑 = 上一页，2 指下滑 = 冻结/恢复自动翻页
+    UISwipeGestureRecognizer *g5 = [[UISwipeGestureRecognizer alloc]
+        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+            g_hudPage++; updateHud(); LOG("page %d", g_hudPage);
+        }] action:@selector(main)];
+    g5.numberOfTouchesRequired = 2;
+    g5.direction = UISwipeGestureRecognizerDirectionLeft;
+    [win addGestureRecognizer:g5];
+
+    UISwipeGestureRecognizer *g6 = [[UISwipeGestureRecognizer alloc]
+        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+            if (g_hudPage > 0) g_hudPage--; updateHud(); LOG("page %d", g_hudPage);
+        }] action:@selector(main)];
+    g6.numberOfTouchesRequired = 2;
+    g6.direction = UISwipeGestureRecognizerDirectionRight;
+    [win addGestureRecognizer:g6];
+
+    UISwipeGestureRecognizer *g7 = [[UISwipeGestureRecognizer alloc]
+        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+            g_pageFreeze = g_pageFreeze ? 0 : 1; updateHud(); LOG("freeze %d", g_pageFreeze);
+        }] action:@selector(main)];
+    g7.numberOfTouchesRequired = 2;
+    g7.direction = UISwipeGestureRecognizerDirectionDown;
+    [win addGestureRecognizer:g7];
+
+    LOG("2-finger L/R = page, 2-finger down = freeze");
 }
 
 static bool g_initDone = false;
