@@ -776,6 +776,25 @@ static int    g_camCallState = 0;      // 0 待试 / 1 成功 / -1 放弃
 static float  g_uiScale      = 3.0f;   // UIScreen.scale（pixels → points）
 static void   resolveCam(void);
 
+// v22：实战修正。v21 在真机上会踩的三个坑，都在这一段解决：
+//  ① g_camObj 一旦拿到就不再更新 —— 但一局结束 Unity 会销毁战斗相机，第二局拿旧指针
+//     调 WorldToScreenPoint 就是踩已释放对象（闪退/黑屏的直接来源）。
+//  ② 判「进对局」用的是 cnt>0，但 cnt 是裸读内存；它一旦是垃圾值，g_inMatch 会在大厅里也变 1。
+//  ③ W2S 一旦能用，矩阵那两条扫描链（findInstanceByStatic*，会跑 field_static_get_value）
+//     还会每 2 秒跑一遍，实战里就是周期性卡顿。
+static int    g_camBadN     = 0;      // camcall bad 次数：有限重试，不再一次就永久放弃
+static int    g_boxDrawn    = 0;      // 本帧真正画出的框数（0 = W2S 没产出可用坐标）
+static int    g_hudForce    = 0;      // 1 = 强制展开大 HUD（3 指上滑）
+static int    g_hudWasGood  = 0;      // 本局曾经真的画出过框（关掉 ESP 后 HUD 仍然保持收起）
+static int    g_prevInMatch = 0;      // 进/出对局边沿
+static void  *g_camKlass    = NULL;   // 被采纳的相机实例真实 klass（验活就比它）
+static void  *g_uCamClass   = NULL;   // v23：UnityEngine.Camera —— 必须和 g_camClass(GuishiCamera) 分开！
+                                      // v21 把两者塞进同一个变量，结果拿 GuishiCamera 去查 Camera.get_main，
+                                      // 永远查不到（截图里 api get_main 1 但 camcall no get_main 就是这么来的）
+static int    g_posOk       = 0;      // v23：坐标非零的单位数（大厅 vs 对局一看就知道）
+static int    g_camPxLogged = 0;      // v23：像素尺寸只打一次
+static bool   camStillValid(void);
+
 // 泛型类没有固定命名空间，挨个试（空命名空间排第一）
 static const char *kNsGuess[] = {"", "UnityService.Collections", "Assets.Scripts.Common",
                                  "System.Collections.Generic", "Assets.Scripts.GameLogic"};
@@ -830,7 +849,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v21 ====");
+    CHECK("==== dump v23 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -841,7 +860,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v21 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v23 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1113,13 +1132,15 @@ static void probeCameraApi(void) {
     g_camApiProbed = 1;
     if (!I2.class_get_method_from_name) return;
 
-    void *cam = findCls("UnityEngine", "Camera");
-    CHECK("api cam %p", cam);
-    if (cam) {
-        CHECK("api get_main %d", I2.class_get_method_from_name(cam, "get_main", 0) ? 1 : 0);
-        CHECK("api w2sp %d", I2.class_get_method_from_name(cam, "WorldToScreenPoint", 1) ? 1 : 0);
-        CHECK("api w2cm %d", I2.class_get_method_from_name(cam, "get_worldToCameraMatrix", 0) ? 1 : 0);
-        CHECK("api projm %d", I2.class_get_method_from_name(cam, "get_projectionMatrix", 0) ? 1 : 0);
+    // v23：这两个类必须分别打出来。v21 只打了一个，才让「同一个变量装两个类」的 bug 藏了整整一版。
+    void *ucam = findCls("UnityEngine", "Camera");
+    if (ucam) g_uCamClass = ucam;
+    CHECK("api ucam %p", ucam);
+    if (ucam) {
+        CHECK("api get_main %d", I2.class_get_method_from_name(ucam, "get_main", 0) ? 1 : 0);
+        CHECK("api w2sp %d", I2.class_get_method_from_name(ucam, "WorldToScreenPoint", 1) ? 1 : 0);
+        CHECK("api w2cm %d", I2.class_get_method_from_name(ucam, "get_worldToCameraMatrix", 0) ? 1 : 0);
+        CHECK("api projm %d", I2.class_get_method_from_name(ucam, "get_projectionMatrix", 0) ? 1 : 0);
     }
     void *gc = g_camClass;
     CHECK("api guishi %p", gc);
@@ -1141,7 +1162,10 @@ static void resolveEsp(void) {
         g_vpIsStruct = I2.class_is_valuetype(g_vpClass) ? 1 : 0;
 
     // ---- 视矩阵：只有进对局后才碰（大厅里这些对象不存在，提前碰等于唤醒）----
-    if (g_inMatch && !g_vpReady) {
+    // v22：W2S 一旦可用，矩阵这两条链就整体停掉。它们每轮都对 GuishiCamera /
+    // CameraVPFrameCache 的父类链跑 field_static_get_value（贵），实战里每 2 秒一次 = 卡顿。
+    bool w2sLive = (g_camObj != NULL && g_miW2S != NULL && g_camCallState == 1);
+    if (!w2sLive && g_inMatch && !g_vpReady) {
         // A) CameraVPFrameCache 自己是托管类，静态字段里有实例（v16 走的就是这条，实测没命中）
         if (!g_vpInst && g_vpClass) {
             g_vpInst = findInstanceByStatic(g_vpClass);
@@ -1158,11 +1182,11 @@ static void resolveEsp(void) {
             }
         }
     }
-    if (g_inMatch && !g_vpReady && g_camClass && !g_camInst) {
+    if (!w2sLive && g_inMatch && !g_vpReady && g_camClass && !g_camInst) {
         g_camInst = findInstanceByStatic(g_camClass);
         if (!g_camInst) g_camInst = findInstanceByStaticTyped(g_camClass);
     }
-    if (g_inMatch && !g_vpReady && g_camInst && g_camClass) {
+    if (!w2sLive && g_inMatch && !g_vpReady && g_camInst && g_camClass) {
         // B) GuishiCamera 上直接有 Matrix4x4 字段
         int off = fieldOffsetByType(g_camClass, "Matrix4x4");
         if (off > 0) {
@@ -1201,16 +1225,21 @@ static void resolveEsp(void) {
     if (g_inMatch) resolveCam();
 }
 
-// v21：拿到 Camera.main，并缓存 WorldToScreenPoint 的 MethodInfo。
-// 只在「进对局」后调用；get_main 返回空就下次再试（大厅/加载中没有相机是正常的）。
+// v22：拿到 Camera.main，并缓存 WorldToScreenPoint 的 MethodInfo。
+// 和 v21 的差别（每条都是实战会踩到的）：
+//  * 不再「有 g_camObj 就直接 return」—— 换局/换场景相机会换人，必须能重新取；
+//  * MethodInfo 用「对象自己的 klass」去找：findCls 拿到的 Camera 和实例的 Camera 就算不是
+//    同一个指针，也照样能取到方法（v21 会当场 -1 永久放弃）；
+//  * 只有「get_main 这个方法本身不存在」才永久放弃，其它失败一律下一轮再试。
 static void resolveCam(void) {
-    if (g_camObj || g_camCallState < 0) return;
+    if (g_camCallState < 0) return;
     if (!g_inMatch) return;
     if (!I2.class_get_method_from_name) return;
-    if (!g_camClass) g_camClass = findCls("UnityEngine", "Camera");
-    if (!g_camClass) return;
+    // v23：用 g_uCamClass，绝不能用 g_camClass（那是 GuishiCamera）
+    if (!g_uCamClass) g_uCamClass = findCls("UnityEngine", "Camera");
+    if (!g_uCamClass) return;
 
-    if (!g_miGetMain) g_miGetMain = I2.class_get_method_from_name(g_camClass, "get_main", 0);
+    if (!g_miGetMain) g_miGetMain = I2.class_get_method_from_name(g_uCamClass, "get_main", 0);
     if (!g_miGetMain) { g_camCallState = -1; CHECK("camcall no get_main"); return; }
 
     void *fn = *(void **)g_miGetMain;            // MethodInfo 第一个字段就是 methodPointer
@@ -1218,25 +1247,74 @@ static void resolveCam(void) {
 
     void *cam = ((void *(*)(void *))fn)(g_miGetMain);
     if (!cam) return;                             // 还没有相机，下一轮再试
+    // v23：没换人就直接返回。换人（大厅相机 → 战斗相机）必须重新采纳，
+    // 否则会一直拿大厅那台去投影。
+    if (cam == g_camObj && g_miW2S) return;
 
     void *k = NULL;
-    if (!rd(cam, &k, sizeof(k)) || k != g_camClass) {
-        g_camCallState = -1;
-        CHECK("camcall bad %p", cam);
+    if (!rd(cam, &k, sizeof(k)) || !k) {
+        if (++g_camBadN <= 3) CHECK("camcall bad %p", cam);
+        return;                                   // 不永久放弃：下一轮再取
+    }
+    if (g_uCamClass && k != g_uCamClass && g_camBadN < 3)
+        CHECK("camcall klass %p != %p", k, g_uCamClass);
+
+    // 用对象真实 klass 取方法（两个 Camera 指针不一致时这一步就是救命的那一步）
+    if (!g_miW2S) g_miW2S = I2.class_get_method_from_name(k, "WorldToScreenPoint", 1);
+    void *prev = g_camObj;                        // 先存旧值，日志里才看得出「换人了」
+    g_camObj = cam;                               // 相机先记住，矩阵路径也能用
+    if (!g_miW2S) {
+        if (++g_camBadN <= 3) CHECK("camcall no w2s");
         return;
     }
-
-    g_camObj = cam;
+    g_camBadN = 0;
+    if (prev != cam || g_camCallState != 1)
+        CHECK("camcall ok %p (was %p) w2s %d", cam, prev, g_miW2S ? 1 : 0);
+    g_camKlass = k;
     g_camCallState = 1;
-    if (!g_miW2S) g_miW2S = I2.class_get_method_from_name(g_camClass, "WorldToScreenPoint", 1);
-    CHECK("camcall ok %p w2s %d", cam, g_miW2S ? 1 : 0);
+
+    // v23：采纳相机后打一次像素尺寸。WorldToScreenPoint 返回的是「像素」，
+    // 我们要除以 UIScreen.scale 才是点。如果游戏是降分辨率渲染，这两个数对不上，
+    // 框就会整体缩小/偏移 —— 这个日志就是用来判定这件事的。
+    if (!g_camPxLogged) {
+        g_camPxLogged = 1;
+        int pw = 0, ph = 0;
+        void *mpw = I2.class_get_method_from_name ? I2.class_get_method_from_name(k, "get_pixelWidth", 0) : NULL;
+        void *mph = I2.class_get_method_from_name ? I2.class_get_method_from_name(k, "get_pixelHeight", 0) : NULL;
+        if (mpw) { void *f1 = *(void **)mpw; if (f1) pw = ((int (*)(void *, void *))f1)(cam, mpw); }
+        if (mph) { void *f2 = *(void **)mph; if (f2) ph = ((int (*)(void *, void *))f2)(cam, mph); }
+        CHECK("cam px %d x %d uiscale %.1f", pw, ph, g_uiScale);
+    }
+}
+
+// v22：相机验活。托管对象头第一个 8 字节就是 klass 指针，这里只做两件事：
+//  * 读不到（页已 unmap）→ 对象没了；
+//  * klass 不再是 Camera → 这块内存被别的对象复用了。
+// 两种都当作「相机已失效」，下一轮重新 get_main，绝不再拿旧指针调方法。
+static bool camStillValid(void) {
+    if (!g_camObj) return false;
+    void *k = NULL;
+    if (!rd(g_camObj, &k, sizeof(k)) || !k) return false;
+    void *want = g_camKlass ? g_camKlass : g_uCamClass;
+    if (want && k != want) return false;
+    return true;
 }
 
 // Dictionary<UInt32,Object> 的 Entry：hashCode(4) next(4) key(4) pad(4) value(8) = 24B
 // 数组头 0x20（klass 8 + monitor 8 + bounds 8 + length 4 + pad 4）。
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
+    g_boxDrawn = 0;                               // 每帧先归零：HUD 靠它判断「框到底画出来没有」
     if (!I2.domain || !g_mgr || !g_linkerClass) return;
     if (g_offDict < 0 || g_offCount < 0 || g_offEntries < 0) return;
+
+    // v22：ActorManager 也可能被换掉（重登/断线重连），先验 klass；不对就丢掉重新找
+    {
+        void *mk = NULL;
+        if (!rd(g_mgr, &mk, sizeof(mk)) || !mk || (g_mgrClass && mk != g_mgrClass)) {
+            g_mgr = NULL; g_unitCount = 0; g_inMatch = 0; g_prevInMatch = 0;
+            return;
+        }
+    }
 
     void *dict = NULL;
     if (!rd((char *)g_mgr + g_offDict, &dict, sizeof(dict)) || !dict) return;
@@ -1250,11 +1328,24 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     int cap = 0;
     if (!rd((char *)entries + 0x10, &cap, sizeof(cap))) return;
 
-    if (cnt < 0) cnt = 0;
+    // v22：cnt/cap 是裸读出来的，垃圾值会让「in 1」在大厅里也成立，然后相机路径全跑起来。
+    // v20 截图里打出过 u 64（正好压在旧上限上），先挡掉不可能的量级。
+    if (cnt < 0 || cnt > 512 || cap <= 0 || cap > 65536) return;
     if (cnt > cap) cnt = cap;
-    if (cnt > 64) cnt = 64;
+    if (cnt > 160) cnt = 160;                     // v22：原来 64 太小，实战里敌人可能排在后面
+
+    // v22：进/出对局边沿。离开对局（载入中/回大厅）必须把相机和视矩阵整体作废，
+    // 否则第二局就是拿着上一局已销毁的 Camera 在调 WorldToScreenPoint。
+    int nowIn = (cnt > 0) ? 1 : 0;
+    if (g_prevInMatch == 1 && nowIn == 0) {
+        g_camObj = NULL; g_camCallState = 0; g_camBadN = 0; g_camKlass = NULL;
+        g_vpReady = false; g_vpInst = NULL; g_vpSrc = -100;
+        g_hudWasGood = 0;
+        CHECK("leave match: cam/vp reset");
+    }
+    g_prevInMatch = nowIn;
     // v20：读到单位 = 已经在对局里；只有这时才去碰相机/视矩阵（大厅里没有这些对象）
-    g_inMatch = (cnt > 0) ? 1 : 0;
+    g_inMatch = nowIn;
     // v17：第一个单位的坐标打一次，用来确认世界尺度（决定后面框的高度/距离怎么算）
     static bool s_posLogged = false;
     if (cnt > 0 && !s_posLogged) {
@@ -1268,9 +1359,28 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         }
     }
     g_unitCount = cnt;
-    // v21：优先用 Camera.WorldToScreenPoint（不需要矩阵）；没有相机才退回旧矩阵路径
-    bool useW2S = (!g_vpReady && g_camObj != NULL && g_miW2S != NULL);
-    if (!g_vpReady && !useW2S) return;
+    // v23：先小范围扫一遍坐标，统计「真的有坐标」的单位数。
+    // 大厅里 u 可能也是 64（实测如此），但坐标多半是 0；p 才是判断「进没进对局」的硬指标。
+    // 注意：这一段必须放在「没有相机就 return」之前 —— 相机挂了的时候，p 正是唯一能用的诊断。
+    {
+        int pOk = 0, lim = (cnt < 24) ? cnt : 24;
+        for (int i = 0; i < lim; i++) {
+            void *o = NULL;
+            if (!rd((char *)entries + 0x18 + (size_t)i * 24 + 16, &o, sizeof(o)) || !o) continue;
+            float pp[3] = {0, 0, 0};
+            if (!rd((char *)o + 0x4C4, pp, sizeof(pp))) continue;
+            if (pp[0] != 0.0f || pp[1] != 0.0f || pp[2] != 0.0f) pOk++;
+        }
+        g_posOk = pOk;
+    }
+    // v22：相机每帧验活 —— 这是换局/第二局闪退的唯一有效防线
+    if (g_camObj && !camStillValid()) {
+        if (++g_camBadN <= 3) CHECK("cam gone, re-acquire");
+        g_camObj = NULL; g_camCallState = 0;
+    }
+    // v22：W2S 优先（不需要矩阵）；只有相机不在时才退回矩阵路径
+    bool useW2S = (g_camObj != NULL && g_miW2S != NULL);
+    if (!useW2S && !g_vpReady) return;
 
     int drawn = 0;
     for (int i = 0; i < cnt && drawn < 32; i++) {
@@ -1282,6 +1392,8 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
 
         float pos[3] = {0, 0, 0};
         if (!rd((char *)obj + 0x4C4, pos, sizeof(pos))) continue;
+        // v22：还没生成/雾里的单位坐标就是 (0,0,0)，投影出来是屏幕左下角的假框
+        if (pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f) continue;
         unsigned char camp = 0;
         rd((char *)obj + 0x504, &camp, 1);
         unsigned int objId = 0;
@@ -1324,6 +1436,13 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         dl->AddText(ImVec2(sx + 6, sy - h - 12), col, buf);
         drawn++;
     }
+    g_boxDrawn = drawn;
+    if (drawn > 0) g_hudWasGood = 1;
+    static bool s_w2sLogged = false;
+    if (useW2S && !s_w2sLogged && drawn > 0) {
+        s_w2sLogged = true;
+        CHECK("w2s usable %d/%d", drawn, cnt);
+    }
 }
 
 // ============================================================================
@@ -1344,13 +1463,21 @@ static void renderOverlay(void);
 
 static void updateHud(void) {
     if (!g_hudLabel) return;
+    // v22：真的画出框以后自动收成 1 行 —— 实战里 24 行绿字把左半屏挡住是没法打的。
+    // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
+    if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
+        g_hudLabel.text = [NSString stringWithFormat:
+            @"ESP v23  u%d p%d in%d d%d c%d\n3-finger UP = full hud",
+            g_unitCount, g_posOk, g_inMatch, g_boxDrawn, g_camCallState];
+        return;
+    }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v21\n"];
+    [s appendString:@"ESP v23\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
-    // v16：再补单位数和 VP 状态
-    [s appendFormat:@"imgs %d cls %zu hits %d u %d in %d c %d%s\n",
-        g_imgCount, g_clsScanned, g_found, g_unitCount, g_inMatch, g_camCallState,
-        g_il2cppOk ? "" : " WAIT"];
+    // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
+    [s appendFormat:@"imgs %d cls %zu hits %d u %d p %d in %d c %d d %d%s\n",
+        g_imgCount, g_clsScanned, g_found, g_unitCount, g_posOk, g_inMatch, g_camCallState,
+        g_boxDrawn, g_il2cppOk ? "" : " WAIT"];
     [s appendFormat:@"il2cpp %@ present %@ mx %@\n",
         g_il2cppOk ? @"OK" : @"FAIL",
         g_presentOn ? @"OK" : @"FAIL",
@@ -1380,6 +1507,11 @@ static void updateHud(void) {
     int t = ++g_hudTick;
     if (t % 30 == 0) updateHud();
     if (t % HUD_DWELL == 0) g_hudPage++;   // 6 秒翻一页，到底自动回第 1 页
+    // v22：相机每秒独立补一次 —— 不再挂在 resolveEsp 的条件里，
+    // 否则 g_vpReady 一旦为 true 就永远走不到相机逻辑
+    // v23：不再是「没有相机才取」——而是进对局后每秒无条件重取一次 Camera.main，
+    // 指针变了（大厅→对局）就换。一次 il2cpp 调用，成本可以忽略。
+    if (t % 30 == 0 && g_inMatch) { resolveCam(); }
     if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
 }
 @end
@@ -1460,7 +1592,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v21 booting";
+    l.text = @"ESP v23 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -1497,7 +1629,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v21 esp (w2s)");
+    ImGui::Text("build         : v23 esp (w2s+ucam)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
@@ -1568,6 +1700,15 @@ static void drawMenu(void) {
 
 static void renderOverlay(void) {
     if (!g_booted || !g_overlayLayer) return;
+    // v22：ESP 关掉、菜单也关掉的时候，没必要 30 次/秒 clear+present 一张全透明的图 ——
+    // 真机上这是实打实的发热和降频。清两帧把旧画面擦掉，然后彻底停下。
+    static int s_idle = 0;
+    if (!g_espOn && !g_menuOpen) {
+        if (s_idle >= 2) { g_boxDrawn = 0; return; }   // d 要显示真实的 0，不能留上一帧的残值
+        s_idle++;
+    } else {
+        s_idle = 0;
+    }
     @autoreleasepool {
         id<CAMetalDrawable> dr = [g_overlayLayer nextDrawable];
         if (!dr) return;
@@ -1615,12 +1756,21 @@ static void hook_present(void *self, id<MTLCommandBuffer> cb) {
 static void installPresentHook(void) {
     // 只做符号探测，不 inline hook。Unity 的 Present 不在关键路径上，
     // 渲染由 overlay 的 CADisplayLink 驱动，探测到符号只用于 HUD 诊断。
-    void *h = dlopen("@rpath/UnityFramework.framework/UnityFramework", RTLD_NOW);
-    if (!h) { LOG("present: dlopen fail"); return; }
     const char *cands[] = {
         "_ZN19UnityGraphicsMetal7PresentEP19MTLCommandBuffer",
         "_ZN19UnityGraphicsMetal7PresentEv",
     };
+    // v23：之前一直打 present FAIL —— 因为只从 dlopen 的句柄里找符号。
+    // 我们本来就是被 UnityFramework 加载的，符号在全局作用域里，先用 RTLD_DEFAULT 找。
+    for (int i = 0; i < 2; i++) {
+        if (dlsym(RTLD_DEFAULT, cands[i])) {
+            g_presentOn = true;
+            LOG("present symbol(global): %s", cands[i]);
+            return;
+        }
+    }
+    void *h = dlopen("@rpath/UnityFramework.framework/UnityFramework", RTLD_NOW);
+    if (!h) { LOG("present: dlopen fail"); return; }
     for (int i = 0; i < 2; i++) {
         if (dlsym(h, cands[i])) {
             g_presentOn = true;
@@ -1674,6 +1824,31 @@ static void attachMenuGesture(void) {
     g2.direction = UISwipeGestureRecognizerDirectionUp;
     [win addGestureRecognizer:g2];
     LOG("4-finger swipe up = re-dump");
+
+    // v22：overlay 的 window 是 userInteractionEnabled=NO（必须，否则吃触摸没法玩），
+    // 所以 ImGui 里的复选框真机上一个都按不到。实战要用的开关只能走手势：
+    //   3 指上滑 = 展开/收起完整 HUD（默认出框后自动收起）
+    //   4 指下滑 = ESP 开/关
+    UISwipeGestureRecognizer *g3 = [[UISwipeGestureRecognizer alloc]
+        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+            g_hudForce = g_hudForce ? 0 : 1;
+            updateHud();
+            LOG("hud force %d", g_hudForce);
+        }] action:@selector(main)];
+    g3.numberOfTouchesRequired = 3;
+    g3.direction = UISwipeGestureRecognizerDirectionUp;
+    [win addGestureRecognizer:g3];
+
+    UISwipeGestureRecognizer *g4 = [[UISwipeGestureRecognizer alloc]
+        initWithTarget:[NSBlockOperation blockOperationWithBlock:^{
+            g_espOn = g_espOn ? false : true;
+            updateHud();
+            LOG("esp %d", g_espOn ? 1 : 0);
+        }] action:@selector(main)];
+    g4.numberOfTouchesRequired = 4;
+    g4.direction = UISwipeGestureRecognizerDirectionDown;
+    [win addGestureRecognizer:g4];
+    LOG("3-finger up = hud, 4-finger down = esp");
 }
 
 static bool g_initDone = false;
