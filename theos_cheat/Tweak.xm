@@ -1794,8 +1794,11 @@ static float vintScaleOf(void *vcls) {
         if (asF > 0.001f && asF < 1e6f) cand = asF;
         else if (asI > 0 && asI < 1000000) cand = (float)asI;
         if (cand > 0.0f) {
+            // v48：语义可能反 —— Precision 有存 1000（整数→float 要除）也有存 0.001（要乘）。
+            // 统一成「除数」：0.001 → 1000。
+            if (cand < 1.0f) cand = 1.0f / cand;
             g_vintScale = cand;
-            CHECK("MVSCALE %s = %.3f", names[i], cand);
+            CHECK("MVSCALE %s = %.3f (as divisor)", names[i], cand);
             return cand;
         }
     }
@@ -1805,6 +1808,51 @@ static float vintScaleOf(void *vcls) {
 }
 
 // v48：读一个「位置类」字段 —— 可能是 Vector3(float×3)，也可能是 VInt3(int×3 定点)
+// v48：把「位置类字段」的原始整数也打出来，量级对不对一眼可见（判 MVSCALE 方向用）
+static int readPosFieldRaw(void *obj, void *fld, float *out, int *raw, const char **kindOut) {
+    void *ft = I2.field_get_type(fld);
+    const char *tn = (ft && I2.type_get_name) ? I2.type_get_name(ft) : NULL;
+    if (!tn) return 0;
+    int off = (int)I2.field_get_offset(fld);
+    if (strstr(tn, "Vector3")) {
+        rd((char *)obj + off, out, sizeof(float) * 3);
+        *kindOut = "V3";
+        if (raw) { raw[0] = raw[1] = raw[2] = 0; }
+        return 1;
+    }
+    if (strstr(tn, "VInt3") || strstr(tn, "Int3")) {
+        int iv[3] = {0, 0, 0};
+        rd((char *)obj + off, iv, sizeof(iv));
+        void *vcls = (ft && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(ft) : NULL;
+        float sc = vintScaleOf(vcls);
+        out[0] = (float)iv[0] / sc;
+        out[1] = (float)iv[1] / sc;
+        out[2] = (float)iv[2] / sc;
+        if (raw) { raw[0] = iv[0]; raw[1] = iv[1]; raw[2] = iv[2]; }
+        *kindOut = "VI3";
+        return 1;
+    }
+    return 0;
+}
+
+// v48：MoveControl 可能是 PoolObjHandle<T> 包装（值类型或装箱对象），
+// 这时要先从 _handleObj 解出真正的组件指针，否则会对着一层壳枚举字段，误判「没有位置字段」。
+static void *resolvePoolHandle(void *holder, void *holderCls) {
+    if (!holder || !holderCls) return NULL;
+    const char *cn = I2.class_get_name ? I2.class_get_name(holderCls) : NULL;
+    if (cn && !strstr(cn, "PoolObjHandle") && !strstr(cn, "Handle")) return holder;   // 不是包装
+    void *hf = fieldByNameish(holderCls, "_handleObj");
+    if (!hf) return holder;
+    int hoff = (int)I2.field_get_offset(hf);
+    void *inner = NULL;
+    if (rd((char *)holder + hoff, &inner, sizeof(inner)) && inner) {
+        static int s_log = 0;
+        if (!s_log) { s_log = 1; CHECK("MVH unwrap %s _handleObj @%d -> %p", cn ? cn : "?", hoff, inner); }
+        return inner;
+    }
+    return NULL;
+}
+
 static int readPosField(void *obj, void *fld, float *out, const char **kindOut) {
     void *ft = I2.field_get_type(fld);
     const char *tn = (ft && I2.type_get_name) ? I2.type_get_name(ft) : NULL;
@@ -1887,11 +1935,28 @@ static void probeMove(void) {
         void *v = NULL, *k = NULL;
         if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
         if (rd(v, &k, sizeof(k)) && k != g_linkerClass) continue;
+        unsigned int id = 0; rd((char *)v + 0x4AC, &id, 4);
         void *mc = NULL;
-        if (!rd((char *)v + off, &mc, sizeof(mc)) || !mc) continue;
+        void *mft = I2.field_get_type(f);
+        void *mcls = (mft && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(mft) : NULL;
+        int mval = (mcls && I2.class_is_valuetype) ? (I2.class_is_valuetype(mcls) ? 1 : 0) : 0;
+        if (mval) {
+            // 值类型：组件内联在 ActorLinker 里，先按结构体首地址取，再尝试解 _handleObj
+            mc = (char *)v + off;
+            mc = resolvePoolHandle(mc, mcls);
+        } else {
+            rd((char *)v + off, &mc, sizeof(mc));
+            if (mc) mc = resolvePoolHandle(mc, mcls);
+        }
+        if (!mc) {
+            // ② 「读不到」和「读到不动的值」是两件事：把指针打出来
+            CHECK("MV id %u mc 0x0 pos %.0f,%.0f (component not created)",
+                  id, 0.0f, 0.0f);
+            shown++;
+            continue;
+        }
         void *mccls = NULL;
         if (!rd(mc, &mccls, sizeof(mccls)) || !mccls) continue;
-        unsigned int id = 0; rd((char *)v + 0x4AC, &id, 4);
         float pos[3] = {0, 0, 0};
         rd((char *)v + 0x4C4, pos, sizeof(pos));
 
@@ -1910,11 +1975,11 @@ static void probeMove(void) {
                     const char *tn = (ft && I2.type_get_name) ? I2.type_get_name(ft) : NULL;
                     if (!tn) continue;
                     if (!strstr(tn, "Vector3") && !strstr(tn, "VInt3") && !strstr(tn, "Int3")) continue;
-                    float p3[3] = {0, 0, 0}; const char *kk = "?";
-                    if (!readPosField(mc, fields[j], p3, &kk)) continue;
+                    float p3[3] = {0, 0, 0}; int raw3[3] = {0, 0, 0}; const char *kk = "?";
+                    if (!readPosFieldRaw(mc, fields[j], p3, raw3, &kk)) continue;
                     const char *fn = I2.field_get_name ? I2.field_get_name(fields[j]) : "?";
-                    CHECK("MVF %s @%d %s %.0f,%.0f,%.0f", fn ? fn : "?", (int)I2.field_get_offset(fields[j]),
-                          kk, p3[0], p3[1], p3[2]);
+                    CHECK("MVF %s @%d %s raw %d,%d -> %.0f,%.0f", fn ? fn : "?", (int)I2.field_get_offset(fields[j]),
+                          kk, raw3[0], raw3[2], p3[0], p3[2]);
                     dumped++;
                 }
             }
@@ -1930,11 +1995,12 @@ static void probeMove(void) {
         if (fc) hasCur = readPosField(mc, fc, cur, &kk);
         if (fr) hasRem = readPosField(mc, fr, rem, &kk);
         if (hasCur || hasRem) {
-            CHECK("MV id %u pos %.0f,%.0f | cur %.0f,%.0f | rem %.0f,%.0f",
-                  id, pos[0], pos[2], hasCur ? cur[0] : -99999.0f, hasCur ? cur[2] : -99999.0f,
+            CHECK("MV id %u mc %p pos %.0f,%.0f | cur %.0f,%.0f | rem %.0f,%.0f",
+                  id, mc, pos[0], pos[2],
+                  hasCur ? cur[0] : -99999.0f, hasCur ? cur[2] : -99999.0f,
                   hasRem ? rem[0] : -99999.0f, hasRem ? rem[2] : -99999.0f);
         } else {
-            CHECK("MV id %u pos %.0f,%.0f | (no cur/rem)", id, pos[0], pos[2]);
+            CHECK("MV id %u mc %p pos %.0f,%.0f | (no cur/rem)", id, mc, pos[0], pos[2]);
         }
         shown++;
     }
@@ -2236,16 +2302,19 @@ static void verifyIdentity(void) {
         if (bestT >= 0 && bestD <= 2 && !bestTie) {
             g_heroType = bestT;
             CHECK("WHITELIST T=%d (cnt %d) 2nd: T%d (cnt %d)", bestT, bestCnt, sT, sCnt);
-        } else {
-            CHECK("WHITELIST none 1st T%d (cnt %d) 2nd T%d (cnt %d)", bestT, bestCnt, sT, sCnt);
-        }
-        else if (hero > 0) {
+        } else if (hero > 0) {
             int hit = 0, cand = -1;
             for (int i = 0; i < n; i++) if (tc[i] == hero) { hit++; cand = tv[i]; }
-            if (hit == 1) { g_heroType = cand; CHECK("WHITELIST T=%d (hero %d)", cand, hero); }
-            else CHECK("WHITELIST none (hit %d, hero %d, h10n %d)", hit, hero, h10n);
+            if (hit == 1) {
+                g_heroType = cand;
+                CHECK("WHITELIST T=%d (hero %d)", cand, hero);
+            } else {
+                CHECK("WHITELIST none (hit %d, hero %d) 1st T%d(%d) 2nd T%d(%d)",
+                      hit, hero, bestT, bestCnt, sT, sCnt);
+            }
         } else {
-            CHECK("WHITELIST none (h10n %d h5n %d hero %d)", h10n, h5n, hero);
+            CHECK("WHITELIST none 1st T%d (cnt %d) 2nd T%d (cnt %d) hero %d",
+                  bestT, bestCnt, sT, sCnt, hero);
         }
     }
 }
