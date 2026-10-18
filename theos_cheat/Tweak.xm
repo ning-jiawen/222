@@ -753,12 +753,18 @@ static void  *g_camClass   = NULL;
 static void  *g_camInst    = NULL;
 static int    g_vpSrc      = -100;   // -100 未试 / -1 失败 / >=0 命中偏移
 static int    g_vpIsStruct = -1;
-// v18：相机对象在谁的静态字段里都不在 GuishiCamera 自己的继承链上（v17 的 cam 0x0 证明了），
-// 所以改成「按名字扫所有 *Camera* 类的静态字段」，命中结果放这里
-static void  *g_unityCamClass = NULL;
-static void  *g_unityCam      = NULL;
-static int    g_huntTries     = 0;
-static void   huntCameraStatics(void);
+// v19：v18 的「扫所有 Camera 类静态字段」拆掉了。
+// 原因：il2cpp_field_static_get_value 内部会做 class init（跑静态构造函数），
+// 在加载期对一堆 Camera 相关类触发 cctor 就是崩溃源（v17 只碰已初始化的两条链，所以没事）。
+// 现在只做「方法存在性探测」：class_get_method_from_name 纯查元数据，不执行任何代码。
+static int    g_camApiProbed = 0;
+static void   probeCameraApi(void);
+
+// v20：这是场对局游戏 —— 大厅里根本没有“敌方单位/战斗相机”这些对象。
+// 没开局时去碰相机相关的静态字段/实例，等于在游戏还没准备好的时候把它唤醒（cctor/场景依赖），
+// 既没有意义又容易崩。所以：只有在「读到单位」之后（= 已经进对局）才做相机/视矩阵的解析。
+static int    g_inMatch     = 0;
+static int    g_resolveTick = 0;
 
 // 泛型类没有固定命名空间，挨个试（空命名空间排第一）
 static const char *kNsGuess[] = {"", "UnityService.Collections", "Assets.Scripts.Common",
@@ -814,7 +820,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v18 ====");
+    CHECK("==== dump v20 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -825,7 +831,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v18 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v20 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -884,8 +890,7 @@ static void selfCheck(void) {
     CHECK("-- esp chain --");
     CHECK("mgr %p vp %p ok %d", g_mgr, g_vpInst, g_vpOk);
     CHECK("cam %p src %d struct %d", g_camInst, g_vpSrc, g_vpIsStruct);
-    huntCameraStatics();
-    CHECK("hunt vp %p cam %p unity %p", g_vpInst, g_camInst, g_unityCam);
+    probeCameraApi();
     CHECK("off dict %d cnt %d ent %d", g_offDict, g_offCount, g_offEntries);
     CHECK("units %d", g_unitCount);
 
@@ -1092,51 +1097,26 @@ static void resolveDict(void *mgrClass) {
 }
 
 // v18：扫所有「类名里含 Camera」的类，看它们有没有指向
-// CameraVPFrameCache / GuishiCamera / UnityEngine.Camera 的静态引用。
-// v17 只查了 GuishiCamera 自己的继承链（cam 0x0 证明实例被别的管理器拿着）。
-static void huntCameraStatics(void) {
-    if (g_vpReady || g_huntTries >= 3) return;
-    if (!I2.domain || !I2.domain_get_assemblies || !I2.image_get_class) return;
-    g_huntTries++;
-    if (!g_unityCamClass) g_unityCamClass = findCls("UnityEngine", "Camera");
+// v19：只查「方法存不存在」，不调用、不读静态字段 —— 零副作用，不会再触发 cctor。
+static void probeCameraApi(void) {
+    if (g_camApiProbed) return;
+    g_camApiProbed = 1;
+    if (!I2.class_get_method_from_name) return;
 
-    size_t n = 0;
-    void **asms = I2.domain_get_assemblies(I2.domain, &n);
-    int hits = 0;
-    for (size_t a = 0; a < n && hits < 8; a++) {
-        void *img = I2.assembly_get_image(asms[a]);
-        if (!img) continue;
-        size_t cc = I2.image_get_class_count ? I2.image_get_class_count(img) : 0;
-        for (size_t i = 0; i < cc && hits < 8; i++) {
-            void *k = I2.image_get_class(img, i);
-            if (!k) continue;
-            const char *cn = I2.class_get_name ? I2.class_get_name(k) : NULL;
-            if (!cn || !strstr(cn, "Camera")) continue;
-
-            void *it = NULL, *f;
-            int guard = 0;
-            while ((f = I2.class_get_fields(k, &it)) && guard++ < 200 && hits < 8) {
-                if (!(I2.field_get_flags(f) & 0x10)) continue;      // 只看 static
-                void *ft = I2.field_get_type(f);
-                const char *tn = ft ? I2.type_get_name(ft) : NULL;
-                if (!tn || !strstr(tn, "Camera")) continue;
-
-                void *val = NULL;
-                I2.field_static_get_value(f, &val);
-                if (!val) continue;
-                void *vk = NULL;
-                if (!rd(val, &vk, sizeof(vk))) continue;
-
-                const char *fn = I2.field_get_name ? I2.field_get_name(f) : "?";
-                CHECK("HUNT %s.%s -> %p", cn, fn ? fn : "?", val);
-                hits++;
-                if (g_vpClass && vk == g_vpClass) g_vpInst = val;
-                else if (g_camClass && vk == g_camClass) g_camInst = val;
-                else if (g_unityCamClass && vk == g_unityCamClass) g_unityCam = val;
-            }
-        }
+    void *cam = findCls("UnityEngine", "Camera");
+    CHECK("api cam %p", cam);
+    if (cam) {
+        CHECK("api get_main %d", I2.class_get_method_from_name(cam, "get_main", 0) ? 1 : 0);
+        CHECK("api w2sp %d", I2.class_get_method_from_name(cam, "WorldToScreenPoint", 1) ? 1 : 0);
+        CHECK("api w2cm %d", I2.class_get_method_from_name(cam, "get_worldToCameraMatrix", 0) ? 1 : 0);
+        CHECK("api projm %d", I2.class_get_method_from_name(cam, "get_projectionMatrix", 0) ? 1 : 0);
     }
-    if (hits == 0) CHECK("HUNT none (%d)", g_huntTries);
+    void *gc = g_camClass;
+    CHECK("api guishi %p", gc);
+    if (gc) {
+        CHECK("api ginst %d", I2.class_get_method_from_name(gc, "get_Instance", 0) ? 1 : 0);
+        CHECK("api ginst2 %d", I2.class_get_method_from_name(gc, "GetInstance", 0) ? 1 : 0);
+    }
 }
 
 static void resolveEsp(void) {
@@ -1150,8 +1130,8 @@ static void resolveEsp(void) {
     if (g_vpClass && g_vpIsStruct < 0 && I2.class_is_valuetype)
         g_vpIsStruct = I2.class_is_valuetype(g_vpClass) ? 1 : 0;
 
-    // ---- 视矩阵：三条路，按稳到险 ----
-    if (!g_vpReady) {
+    // ---- 视矩阵：只有进对局后才碰（大厅里这些对象不存在，提前碰等于唤醒）----
+    if (g_inMatch && !g_vpReady) {
         // A) CameraVPFrameCache 自己是托管类，静态字段里有实例（v16 走的就是这条，实测没命中）
         if (!g_vpInst && g_vpClass) {
             g_vpInst = findInstanceByStatic(g_vpClass);
@@ -1168,11 +1148,11 @@ static void resolveEsp(void) {
             }
         }
     }
-    if (!g_vpReady && g_camClass && !g_camInst) {
+    if (g_inMatch && !g_vpReady && g_camClass && !g_camInst) {
         g_camInst = findInstanceByStatic(g_camClass);
         if (!g_camInst) g_camInst = findInstanceByStaticTyped(g_camClass);
     }
-    if (!g_vpReady && g_camInst && g_camClass) {
+    if (g_inMatch && !g_vpReady && g_camInst && g_camClass) {
         // B) GuishiCamera 上直接有 Matrix4x4 字段
         int off = fieldOffsetByType(g_camClass, "Matrix4x4");
         if (off > 0) {
@@ -1229,6 +1209,8 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     if (cnt < 0) cnt = 0;
     if (cnt > cap) cnt = cap;
     if (cnt > 64) cnt = 64;
+    // v20：读到单位 = 已经在对局里；只有这时才去碰相机/视矩阵（大厅里没有这些对象）
+    g_inMatch = (cnt > 0) ? 1 : 0;
     // v17：第一个单位的坐标打一次，用来确认世界尺度（决定后面框的高度/距离怎么算）
     static bool s_posLogged = false;
     if (cnt > 0 && !s_posLogged) {
@@ -1299,11 +1281,11 @@ static void renderOverlay(void);
 static void updateHud(void) {
     if (!g_hudLabel) return;
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v18\n"];
+    [s appendString:@"ESP v20\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态
-    [s appendFormat:@"imgs %d cls %zu hits %d u %d%s\n",
-        g_imgCount, g_clsScanned, g_found, g_unitCount, g_il2cppOk ? "" : " WAIT"];
+    [s appendFormat:@"imgs %d cls %zu hits %d u %d in %d%s\n",
+        g_imgCount, g_clsScanned, g_found, g_unitCount, g_inMatch, g_il2cppOk ? "" : " WAIT"];
     [s appendFormat:@"il2cpp %@ present %@ mx %@\n",
         g_il2cppOk ? @"OK" : @"FAIL",
         g_presentOn ? @"OK" : @"FAIL",
@@ -1333,7 +1315,7 @@ static void updateHud(void) {
     int t = ++g_hudTick;
     if (t % 30 == 0) updateHud();
     if (t % HUD_DWELL == 0) g_hudPage++;   // 6 秒翻一页，到底自动回第 1 页
-    if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); huntCameraStatics(); }
+    if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
 }
 @end
 
@@ -1413,7 +1395,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v18 booting";
+    l.text = @"ESP v20 booting";
     [vc.view addSubview:l];
 
     g_overlayWin   = w;
@@ -1447,7 +1429,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v18 esp (cam hunt)");
+    ImGui::Text("build         : v20 esp (in-match gate)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
