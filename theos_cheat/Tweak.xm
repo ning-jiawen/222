@@ -590,10 +590,6 @@ static void bindIl2cpp(void) {
     if (!I2.domain) { LOG("domain not ready"); return; }        // il2cpp 还没起来，下一档再试
     if (!I2.domain_get_assemblies) { LOG("no domain_get_assemblies"); return; }
 
-    size_t n = 0;
-    void **asms = I2.domain_get_assemblies(I2.domain, &n);
-    LOG("assemblies: %zu", n);
-
     // v13：这里不再“选主程序集”。原作者反汇编里用的是
     //   il2cpp_class_from_name / il2cpp_class_get_field_from_name —— 按名字直接取，
     //   全程没有“先挑一本 DLL 再枚举”这一步。我们之前为了枚举类硬加了这一步，
