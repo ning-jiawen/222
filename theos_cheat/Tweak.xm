@@ -702,27 +702,76 @@ static void dumpClass(void *klass, const char *label, int cap, int all) {
     if (shown < total) CHECK(".. %d/%d ..", shown, total);
 }
 
-// v14：改用原作者的做法 —— il2cpp_class_from_name(image, ns, name) 精确取类。
-// 好处：接口（IActorManager）、编译器生成类（<astBloodBagInfo_bytes>e__FixedBuffer）、
-// 别处同名类，全都不会误命中；也不用枚举 6 万个类。
+// v15：这批 dump 已经把单位数据的落点确认了：
+//   ActorLinker.position @4C4 (Vector3) / rotation @4D0 (Quaternion) / monsterCamp @504 (Byte)
+//   CameraVPFrameCache._worldToClip @08 (Matrix4x4)
+// 还差三块：① ActorManager 单例怎么拿 ② 单位容器的内存布局 ③ 血量/阵营在 134 个字段里的位置
+// 这一版只补数据、不画框：ActorLinker 放到 50 行，ActorManager 连方法名和静态字段一起打出来，
+// 再按名字试出三个泛型容器类（DictionaryView`2 / TinyValueList`1 / PoolObjHandle`1）的布局。
 static const struct { const char *ns; const char *name; int cap; } g_targets[] = {
-    {"Assets.Scripts.GameLogic",  "ActorManager",        36},
-    {"Assets.Scripts.GameLogic",  "ActorComponent",      30},
-    {"Assets.Scripts.GameSystem", "CBattleHeroInfo",     30},
-    {"Assets.Scripts.GameLogic",  "Blood",               22},
-    {"Assets.Scripts.GameLogic",  "ActorLinker",         22},
-    {"Assets.Scripts.GameSystem", "CActorDisplayHelper", 22},
+    {"Assets.Scripts.GameLogic",  "ActorManager",        40},
+    {"Assets.Scripts.GameLogic",  "ActorLinker",         50},
+    {"Assets.Scripts.GameSystem", "CActorDisplaySystem", 14},
     {"Assets.Scripts.GameLogic",  "CameraVPFrameCache",   4},
     {"Assets.Scripts.GameLogic",  "GuishiCamera",         8},
 };
 #define NTARGET ((int)(sizeof(g_targets) / sizeof(g_targets[0])))
+
+// 泛型类没有固定命名空间，挨个试（空命名空间排第一）
+static const char *kNsGuess[] = {"", "UnityService.Collections", "Assets.Scripts.Common",
+                                 "System.Collections.Generic", "Assets.Scripts.GameLogic"};
+#define NNSGUESS ((int)(sizeof(kNsGuess) / sizeof(kNsGuess[0])))
+
+static void *findClassByNames(size_t n, void **asms, const char *name) {
+    for (size_t a = 0; a < n; a++) {
+        void *img = I2.assembly_get_image(asms[a]);
+        if (!img) continue;
+        for (int i = 0; i < NNSGUESS; i++) {
+            void *k = I2.class_from_name(img, kNsGuess[i], name);
+            if (k) return k;
+        }
+    }
+    return NULL;
+}
+
+// 只列方法名，绝不调用 —— 先看清楚签名，下一版再按名字调（原作者的 methodPointer 手法）
+static void dumpMethodNames(void *klass, int maxN) {
+    if (!I2.class_get_methods || !I2.method_get_name) return;
+    void *it = NULL, *m;
+    int cnt = 0;
+    while ((m = I2.class_get_methods(klass, &it)) && cnt < 400) {
+        const char *mn = I2.method_get_name(m);
+        if (mn && cnt < maxN) CHECK("  m %s", mn);
+        cnt++;
+    }
+    CHECK("  (%d methods)", cnt);
+}
+
+// 静态字段：只打印「类型名含 wantType」的，避免把 int 常量当指针解引用
+static void dumpStaticsOf(void *klass, const char *wantType) {
+    if (!I2.class_get_fields || !I2.field_static_get_value ||
+        !I2.field_get_type || !I2.type_get_name) return;
+    void *it = NULL, *f;
+    int cnt = 0;
+    while ((f = I2.class_get_fields(klass, &it)) && cnt < 200) {
+        cnt++;
+        void *ft = I2.field_get_type(f);
+        const char *tn = ft ? I2.type_get_name(ft) : NULL;
+        if (!tn || !strstr(tn, wantType)) continue;
+        unsigned char buf[16] = {0};
+        I2.field_static_get_value(f, buf);
+        void *v = *(void **)buf;
+        const char *fn = I2.field_get_name ? I2.field_get_name(f) : "?";
+        CHECK("  S %s = %p", fn ? fn : "?", v);
+    }
+}
 
 static void selfCheck(void) {
     g_checkN = 0;                 // 重跑时清空，否则页码翻倍
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v14 ====");
+    CHECK("==== dump v15 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -733,7 +782,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v14 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v15 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -762,9 +811,30 @@ static void selfCheck(void) {
         dumpClass(klass, g_targets[t].name, g_targets[t].cap, 1);
         foundN++;
         g_found++;
+
+        // ActorManager 是入口类：顺手把方法名和「指向自己的静态字段」打出来
+        if (strcmp(g_targets[t].name, "ActorManager") == 0) {
+            CHECK("-- ActorManager methods --");
+            dumpMethodNames(klass, 16);
+            CHECK("-- ActorManager statics --");
+            dumpStaticsOf(klass, "ActorManager");
+        }
     }
 
-    CHECK("==== %d/%d cls / %zu scanned ====", foundN, NTARGET, g_clsScanned);
+    // 泛型容器布局：名字试不出来就显示 none，不影响其它段
+    {
+        const char *gnames[3] = {"DictionaryView`2", "TinyValueList`1", "PoolObjHandle`1"};
+        int gcaps[3] = {10, 10, 6};
+        for (int g = 0; g < 3; g++) {
+            void *gk = findClassByNames(n, asms, gnames[g]);
+            if (!gk) { CHECK("%s: none", gnames[g]); continue; }
+            CHECK("EXTRA %s", gnames[g]);
+            dumpClass(gk, gnames[g], gcaps[g], 1);
+            g_found++;
+        }
+    }
+
+    CHECK("==== %d cls / %zu scanned ====", foundN, g_clsScanned);
 
     // 全量写文件，HUD 只显示筛过的
     if (g_dumpFile) {
@@ -863,7 +933,7 @@ static void renderOverlay(void);
 static void updateHud(void) {
     if (!g_hudLabel) return;
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v14\n"];
+    [s appendString:@"ESP v15\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     [s appendFormat:@"imgs %d cls %zu hits %d%s\n",
         g_imgCount, g_clsScanned, g_found, g_il2cppOk ? "" : " WAIT"];
@@ -975,7 +1045,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v14 booting";
+    l.text = @"ESP v15 booting";
     [vc.view addSubview:l];
 
     g_overlayWin   = w;
@@ -1009,7 +1079,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v14 dump (class_from_name)");
+    ImGui::Text("build         : v15 dump (data+layout)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
