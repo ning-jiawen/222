@@ -766,6 +766,16 @@ static void   probeCameraApi(void);
 static int    g_inMatch     = 0;
 static int    g_resolveTick = 0;
 
+// v21：按「不找矩阵」的路子走 —— 直接 Camera.get_main() + WorldToScreenPoint(pos)。
+// 依据：v20 的探测结果 get_main=1 / w2sp=1 / w2cm=1 / projm=1，而 GuishiCamera.get_Instance=0。
+// 调用方式是原文档里写的：MethodInfo 第一个字段就是 methodPointer，自己 blr 过去。
+static void  *g_camObj       = NULL;   // Camera.main 拿到的对象
+static void  *g_miGetMain    = NULL;   // Camera.get_main 的 MethodInfo*
+static void  *g_miW2S        = NULL;   // Camera.WorldToScreenPoint 的 MethodInfo*
+static int    g_camCallState = 0;      // 0 待试 / 1 成功 / -1 放弃
+static float  g_uiScale      = 3.0f;   // UIScreen.scale（pixels → points）
+static void   resolveCam(void);
+
 // 泛型类没有固定命名空间，挨个试（空命名空间排第一）
 static const char *kNsGuess[] = {"", "UnityService.Collections", "Assets.Scripts.Common",
                                  "System.Collections.Generic", "Assets.Scripts.GameLogic"};
@@ -820,7 +830,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v20 ====");
+    CHECK("==== dump v21 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -831,7 +841,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v20 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v21 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1186,6 +1196,40 @@ static void resolveEsp(void) {
         g_mgr = findInstanceByStatic(g_mgrClass);
         if (g_mgr) resolveDict(g_mgrClass);
     }
+
+    // v21：进对局后拿 Camera.main（拿不到就下一轮再试）
+    if (g_inMatch) resolveCam();
+}
+
+// v21：拿到 Camera.main，并缓存 WorldToScreenPoint 的 MethodInfo。
+// 只在「进对局」后调用；get_main 返回空就下次再试（大厅/加载中没有相机是正常的）。
+static void resolveCam(void) {
+    if (g_camObj || g_camCallState < 0) return;
+    if (!g_inMatch) return;
+    if (!I2.class_get_method_from_name) return;
+    if (!g_camClass) g_camClass = findCls("UnityEngine", "Camera");
+    if (!g_camClass) return;
+
+    if (!g_miGetMain) g_miGetMain = I2.class_get_method_from_name(g_camClass, "get_main", 0);
+    if (!g_miGetMain) { g_camCallState = -1; CHECK("camcall no get_main"); return; }
+
+    void *fn = *(void **)g_miGetMain;            // MethodInfo 第一个字段就是 methodPointer
+    if (!fn) { g_camCallState = -1; CHECK("camcall no fn"); return; }
+
+    void *cam = ((void *(*)(void *))fn)(g_miGetMain);
+    if (!cam) return;                             // 还没有相机，下一轮再试
+
+    void *k = NULL;
+    if (!rd(cam, &k, sizeof(k)) || k != g_camClass) {
+        g_camCallState = -1;
+        CHECK("camcall bad %p", cam);
+        return;
+    }
+
+    g_camObj = cam;
+    g_camCallState = 1;
+    if (!g_miW2S) g_miW2S = I2.class_get_method_from_name(g_camClass, "WorldToScreenPoint", 1);
+    CHECK("camcall ok %p w2s %d", cam, g_miW2S ? 1 : 0);
 }
 
 // Dictionary<UInt32,Object> 的 Entry：hashCode(4) next(4) key(4) pad(4) value(8) = 24B
@@ -1224,7 +1268,9 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         }
     }
     g_unitCount = cnt;
-    if (!g_vpReady) return;         // 没有视矩阵就只统计不画（HUD 的 u 仍然有意义）
+    // v21：优先用 Camera.WorldToScreenPoint（不需要矩阵）；没有相机才退回旧矩阵路径
+    bool useW2S = (!g_vpReady && g_camObj != NULL && g_miW2S != NULL);
+    if (!g_vpReady && !useW2S) return;
 
     int drawn = 0;
     for (int i = 0; i < cnt && drawn < 32; i++) {
@@ -1241,23 +1287,41 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         unsigned int objId = 0;
         rd((char *)obj + 0x4AC, &objId, 4);
 
-        Vec3 w = { pos[0], pos[1], pos[2] };
-        ImVec2 sp;
-        if (!worldToScreen(w, g_vp, sw, sh, sp)) continue;
-        if (sp.x < -200 || sp.x > sw + 200 || sp.y < -200 || sp.y > sh + 200) continue;
+        float sx = 0, sy = 0;
+        if (useW2S) {
+            // 实例方法 Vector3 WorldToScreenPoint(Vector3)：HFA 在 s0-s2 传参/返回，
+            // methodPointer 的签名是 (self, args..., MethodInfo*)。
+            void *fn2 = *(void **)g_miW2S;
+            if (!fn2) break;
+            Vec3 wp = { pos[0], pos[1], pos[2] };
+            Vec3 sp3 = ((Vec3 (*)(void *, Vec3, void *))fn2)(g_camObj, wp, g_miW2S);
+            if (!(sp3.z > 0.01f)) continue;                       // z<=0 = 在相机背后
+            if (!(sp3.x > -100000.0f && sp3.x < 100000.0f)) continue;
+            if (!(sp3.y > -100000.0f && sp3.y < 100000.0f)) continue;
+            float sc = (g_uiScale > 0.1f) ? g_uiScale : 3.0f;
+            sx = sp3.x / sc;                                       // Unity 像素 → 点
+            sy = sh - sp3.y / sc;                                  // Unity 左下原点 → 屏幕左上
+        } else {
+            Vec3 w = { pos[0], pos[1], pos[2] };
+            ImVec2 sp;
+            if (!worldToScreen(w, g_vp, sw, sh, sp)) continue;
+            sx = sp.x;
+            sy = sp.y;
+        }
+        if (sx < -200 || sx > sw + 200 || sy < -200 || sy > sh + 200) continue;
 
-        // 单位真实高度还没拿到（世界单位不是米），v16 先画固定尺寸框 + 圆点 + ID
+        // 单位真实高度还没拿到（世界单位不是米），先用固定尺寸框 + 圆点 + ID
         float h  = 90.0f, wd = 45.0f;
         ImU32 col = (camp == 0) ? IM_COL32(90, 190, 255, 230)
                                 : IM_COL32(255, 70, 70, 230);
         if (g_showBox) {
-            dl->AddRect(ImVec2(sp.x - wd * 0.5f, sp.y - h),
-                        ImVec2(sp.x + wd * 0.5f, sp.y), col, 0, 0, 1.6f);
+            dl->AddRect(ImVec2(sx - wd * 0.5f, sy - h),
+                        ImVec2(sx + wd * 0.5f, sy), col, 0, 0, 1.6f);
         }
-        dl->AddCircleFilled(sp, 3.0f, col);
+        dl->AddCircleFilled(ImVec2(sx, sy), 3.0f, col);
         char buf[40];
         snprintf(buf, sizeof(buf), "%u c%d", objId, (int)camp);
-        dl->AddText(ImVec2(sp.x + 6, sp.y - h - 12), col, buf);
+        dl->AddText(ImVec2(sx + 6, sy - h - 12), col, buf);
         drawn++;
     }
 }
@@ -1281,11 +1345,12 @@ static void renderOverlay(void);
 static void updateHud(void) {
     if (!g_hudLabel) return;
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v20\n"];
+    [s appendString:@"ESP v21\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态
-    [s appendFormat:@"imgs %d cls %zu hits %d u %d in %d%s\n",
-        g_imgCount, g_clsScanned, g_found, g_unitCount, g_inMatch, g_il2cppOk ? "" : " WAIT"];
+    [s appendFormat:@"imgs %d cls %zu hits %d u %d in %d c %d%s\n",
+        g_imgCount, g_clsScanned, g_found, g_unitCount, g_inMatch, g_camCallState,
+        g_il2cppOk ? "" : " WAIT"];
     [s appendFormat:@"il2cpp %@ present %@ mx %@\n",
         g_il2cppOk ? @"OK" : @"FAIL",
         g_presentOn ? @"OK" : @"FAIL",
@@ -1395,8 +1460,11 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v20 booting";
+    l.text = @"ESP v21 booting";
     [vc.view addSubview:l];
+
+    g_uiScale = (float)[UIScreen mainScreen].scale;
+    if (g_uiScale < 1.0f) g_uiScale = 3.0f;
 
     g_overlayWin   = w;
     g_overlayLayer = ml;
@@ -1429,7 +1497,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v20 esp (in-match gate)");
+    ImGui::Text("build         : v21 esp (w2s)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
