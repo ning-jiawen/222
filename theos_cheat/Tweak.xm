@@ -547,6 +547,7 @@ typedef void **(*t_class_get_fields)(void *, void **);
 typedef const char *(*t_field_get_name)(void *);
 typedef size_t (*t_field_get_offset)(void *);
 typedef int (*t_field_get_flags)(void *);                    // v16：区分 static / instance，避免误读崩溃
+typedef bool (*t_class_is_valuetype)(void *);                // v17：判断 CameraVPFrameCache 是类还是结构体
 typedef void *(*t_field_get_type)(void *);          // v14：字段类型，判断是不是 Vector3/Matrix4x4
 typedef const char *(*t_type_get_name)(void *);      // v14：类型名（原作者 27 个 API 里也有这个）
 typedef void (*t_field_get_value)(void *, void *, void *);
@@ -573,6 +574,7 @@ struct I2C {
     t_field_get_name              field_get_name;
     t_field_get_offset            field_get_offset;
     t_field_get_flags             field_get_flags;
+    t_class_is_valuetype          class_is_valuetype;
     t_field_get_type              field_get_type;
     t_type_get_name               type_get_name;
     t_field_get_value             field_get_value;
@@ -610,6 +612,7 @@ static void bindIl2cpp(void) {
     BINDF(field_get_name,             "il2cpp_field_get_name");
     BINDF(field_get_offset,           "il2cpp_field_get_offset");
     BINDF(field_get_flags,            "il2cpp_field_get_flags");
+    BINDF(class_is_valuetype,         "il2cpp_class_is_valuetype");
     BINDF(field_get_type,             "il2cpp_field_get_type");
     BINDF(type_get_name,              "il2cpp_type_get_name");
     BINDF(field_get_value,            "il2cpp_field_get_value");
@@ -729,11 +732,10 @@ static void dumpClass(void *klass, const char *label, int cap, int all) {
 // 这一版只补数据、不画框：ActorLinker 放到 50 行，ActorManager 连方法名和静态字段一起打出来，
 // 再按名字试出三个泛型容器类（DictionaryView`2 / TinyValueList`1 / PoolObjHandle`1）的布局。
 static const struct { const char *ns; const char *name; int cap; } g_targets[] = {
-    {"Assets.Scripts.GameLogic",  "ActorManager",        40},
-    {"Assets.Scripts.GameLogic",  "ActorLinker",         50},
-    {"Assets.Scripts.GameSystem", "CActorDisplaySystem", 14},
+    {"Assets.Scripts.GameLogic",  "ActorManager",         6},
+    {"Assets.Scripts.GameLogic",  "GuishiCamera",        36},
+    {"Assets.Scripts.GameLogic",  "ActorLinker",         24},
     {"Assets.Scripts.GameLogic",  "CameraVPFrameCache",   4},
-    {"Assets.Scripts.GameLogic",  "GuishiCamera",         8},
 };
 #define NTARGET ((int)(sizeof(g_targets) / sizeof(g_targets[0])))
 
@@ -803,7 +805,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v16 ====");
+    CHECK("==== dump v17 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -814,7 +816,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v15 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v17 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -872,6 +874,7 @@ static void selfCheck(void) {
     resolveEsp();
     CHECK("-- esp chain --");
     CHECK("mgr %p vp %p ok %d", g_mgr, g_vpInst, g_vpOk);
+    CHECK("cam %p src %d struct %d", g_camInst, g_vpSrc, g_vpIsStruct);
     CHECK("off dict %d cnt %d ent %d", g_offDict, g_offCount, g_offEntries);
     CHECK("units %d", g_unitCount);
 
@@ -974,6 +977,61 @@ static void *findCls(const char *ns, const char *name) {
 }
 
 static void *g_mgrClass = NULL, *g_linkerClass = NULL, *g_vpClass = NULL;
+static void *g_camClass = NULL, *g_camInst = NULL;
+static int   g_vpSrc = -100;      // -100 未试 / -1 失败 / >=0 命中偏移
+static int   g_vpIsStruct = -1;
+
+// v17：按「字段类型名」找静态，处理 v16 漏掉的两种情况：
+//   ① 静态字段是 T[]（数组里放着目标对象）
+//   ② 静态字段声明在泛型基类、但类型名写全了（如 CameraVPFrameCache）
+// 只对「类型名里含目标类名」的静态取值，避免把 int 常量当指针解引用。
+static void *findInstanceByStaticTyped(void *klass) {
+    if (!klass || !I2.class_get_fields || !I2.field_get_flags ||
+        !I2.field_static_get_value || !I2.field_get_type ||
+        !I2.type_get_name || !I2.class_get_name) return NULL;
+    const char *kn = I2.class_get_name(klass);
+    if (!kn || !kn[0]) return NULL;
+
+    void *k = klass;
+    for (int depth = 0; k && depth < 6; depth++) {
+        void *it = NULL, *f;
+        int guard = 0;
+        while ((f = I2.class_get_fields(k, &it)) && guard++ < 400) {
+            if (!(I2.field_get_flags(f) & 0x10)) continue;
+            void *ft = I2.field_get_type(f);
+            const char *tn = ft ? I2.type_get_name(ft) : NULL;
+            if (!tn || !strstr(tn, kn)) continue;
+
+            void *val = NULL;
+            I2.field_static_get_value(f, &val);
+            if (!val) continue;
+            if (strstr(tn, "[]")) {                 // 数组：取第 0 个元素
+                void *e0 = NULL;
+                if (!rd((char *)val + 0x18, &e0, sizeof(e0)) || !e0) continue;
+                val = e0;
+            }
+            void *vk = NULL;
+            if (!rd(val, &vk, sizeof(vk))) continue;
+            if (vk == klass) return val;
+        }
+        k = I2.class_get_parent ? I2.class_get_parent(k) : NULL;
+    }
+    return NULL;
+}
+
+// 在类里按「类型名包含某关键字」找字段，返回偏移（-1 = 没有）
+static int fieldOffsetByType(void *klass, const char *typeSub) {
+    if (!klass || !I2.class_get_fields || !I2.field_get_type || !I2.type_get_name) return -1;
+    void *it = NULL, *f;
+    int n = 0;
+    while ((f = I2.class_get_fields(klass, &it)) && n++ < 400) {
+        void *ft = I2.field_get_type(f);
+        const char *tn = ft ? I2.type_get_name(ft) : NULL;
+        if (!tn || !strstr(tn, typeSub)) continue;
+        return (int)I2.field_get_offset(f);
+    }
+    return -1;
+}
 
 // 单例：沿父类链找 static 字段，把值当指针安全读第一字（klass 指针），等于目标类就是它。
 // v15 的 dump 证明 ActorManager 自己没有 ActorManager 类型的静态字段 —— 单例在泛型基类上。
@@ -1031,16 +1089,59 @@ static void resolveEsp(void) {
     if (!g_linkerClass) g_linkerClass = findCls("Assets.Scripts.GameLogic", "ActorLinker");
     if (!g_vpClass)     g_vpClass     = findCls("Assets.Scripts.GameLogic", "CameraVPFrameCache");
     if (!g_mgrClass)    g_mgrClass    = findCls("Assets.Scripts.GameLogic", "ActorManager");
+    if (!g_camClass)    g_camClass    = findCls("Assets.Scripts.GameLogic", "GuishiCamera");
 
-    if (!g_vpInst && g_vpClass) g_vpInst = findInstanceByStatic(g_vpClass);
-    if (g_vpInst && !g_vpReady) {
-        unsigned char buf[64];
-        if (rd((char *)g_vpInst + 0x08, buf, 64)) {
-            memcpy(g_vp, buf, 64);
-            unsigned char valid = 0;
-            if (rd((char *)g_vpInst + 0x50, &valid, 1) && valid) {
-                g_vpOk = 1;
-                g_vpReady = true;
+    if (g_vpClass && g_vpIsStruct < 0 && I2.class_is_valuetype)
+        g_vpIsStruct = I2.class_is_valuetype(g_vpClass) ? 1 : 0;
+
+    // ---- 视矩阵：三条路，按稳到险 ----
+    if (!g_vpReady) {
+        // A) CameraVPFrameCache 自己是托管类，静态字段里有实例（v16 走的就是这条，实测没命中）
+        if (!g_vpInst && g_vpClass) {
+            g_vpInst = findInstanceByStatic(g_vpClass);
+            if (!g_vpInst) g_vpInst = findInstanceByStaticTyped(g_vpClass);
+        }
+        if (g_vpInst) {
+            unsigned char buf[64];
+            if (rd((char *)g_vpInst + 0x08, buf, 64)) {
+                memcpy(g_vp, buf, 64);
+                unsigned char valid = 0;
+                if (rd((char *)g_vpInst + 0x50, &valid, 1) && valid) {
+                    g_vpOk = 1; g_vpReady = true; g_vpSrc = 8;
+                }
+            }
+        }
+    }
+    if (!g_vpReady && g_camClass && !g_camInst) {
+        g_camInst = findInstanceByStatic(g_camClass);
+        if (!g_camInst) g_camInst = findInstanceByStaticTyped(g_camClass);
+    }
+    if (!g_vpReady && g_camInst && g_camClass) {
+        // B) GuishiCamera 上直接有 Matrix4x4 字段
+        int off = fieldOffsetByType(g_camClass, "Matrix4x4");
+        if (off > 0) {
+            unsigned char buf[64];
+            if (rd((char *)g_camInst + off, buf, 64)) {
+                memcpy(g_vp, buf, 64);
+                g_vpOk = 1; g_vpReady = true; g_vpSrc = off;
+            }
+        }
+        // C) GuishiCamera 上有 CameraVPFrameCache 字段：先按「引用」取一次，再按「内嵌结构体」取一次
+        if (!g_vpReady) {
+            int voff = fieldOffsetByType(g_camClass, "CameraVPFrameCache");
+            if (voff > 0) {
+                unsigned char buf[64];
+                void *p = NULL;
+                if (rd((char *)g_camInst + voff, &p, sizeof(p)) && p &&
+                    rd((char *)p + 0x08, buf, 64)) {
+                    memcpy(g_vp, buf, 64);
+                    g_vpOk = 1; g_vpReady = true; g_vpSrc = voff;
+                } else if (rd((char *)g_camInst + voff + 0x08, buf, 64)) {
+                    memcpy(g_vp, buf, 64);
+                    g_vpOk = 1; g_vpReady = true; g_vpSrc = voff + 8;
+                }
+            } else {
+                g_vpSrc = -1;
             }
         }
     }
@@ -1054,7 +1155,7 @@ static void resolveEsp(void) {
 // Dictionary<UInt32,Object> 的 Entry：hashCode(4) next(4) key(4) pad(4) value(8) = 24B
 // 数组头 0x20（klass 8 + monitor 8 + bounds 8 + length 4 + pad 4）。
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
-    if (!I2.domain || !g_vpReady || !g_mgr || !g_linkerClass) return;
+    if (!I2.domain || !g_mgr || !g_linkerClass) return;
     if (g_offDict < 0 || g_offCount < 0 || g_offEntries < 0) return;
 
     void *dict = NULL;
@@ -1064,18 +1165,33 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     if (!rd((char *)dict + g_offCount, &cnt, sizeof(cnt))) return;
     void *entries = NULL;
     if (!rd((char *)dict + g_offEntries, &entries, sizeof(entries)) || !entries) return;
+    // v17：这个 il2cpp 的对象头是 8 字节（ActorManager 第一个字段在 @08 就是证据），
+    // 数组布局 = klass(8) + bounds(8) + length(4) + pad(4) → 长度在 0x10，元素从 0x18 起。
     int cap = 0;
-    if (!rd((char *)entries + 0x18, &cap, sizeof(cap))) return;
+    if (!rd((char *)entries + 0x10, &cap, sizeof(cap))) return;
 
     if (cnt < 0) cnt = 0;
     if (cnt > cap) cnt = cap;
     if (cnt > 64) cnt = 64;
+    // v17：第一个单位的坐标打一次，用来确认世界尺度（决定后面框的高度/距离怎么算）
+    static bool s_posLogged = false;
+    if (cnt > 0 && !s_posLogged) {
+        void *o0 = NULL;
+        if (rd((char *)entries + 0x18 + 16, &o0, sizeof(o0)) && o0) {
+            float p0[3] = {0, 0, 0};
+            if (rd((char *)o0 + 0x4C4, p0, sizeof(p0))) {
+                CHECK("u0 %.1f %.1f %.1f", p0[0], p0[1], p0[2]);
+                s_posLogged = true;
+            }
+        }
+    }
     g_unitCount = cnt;
+    if (!g_vpReady) return;         // 没有视矩阵就只统计不画（HUD 的 u 仍然有意义）
 
     int drawn = 0;
     for (int i = 0; i < cnt && drawn < 32; i++) {
         void *obj = NULL;
-        if (!rd((char *)entries + 0x20 + (size_t)i * 24 + 16, &obj, sizeof(obj))) continue;
+        if (!rd((char *)entries + 0x18 + (size_t)i * 24 + 16, &obj, sizeof(obj))) continue;
         if (!obj) continue;
         void *ok = NULL;
         if (!rd(obj, &ok, sizeof(ok)) || ok != g_linkerClass) continue;
@@ -1127,7 +1243,7 @@ static void renderOverlay(void);
 static void updateHud(void) {
     if (!g_hudLabel) return;
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v16\n"];
+    [s appendString:@"ESP v17\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态
     [s appendFormat:@"imgs %d cls %zu hits %d u %d%s\n",
@@ -1241,7 +1357,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v16 booting";
+    l.text = @"ESP v17 booting";
     [vc.view addSubview:l];
 
     g_overlayWin   = w;
@@ -1275,7 +1391,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v16 esp (safe read)");
+    ImGui::Text("build         : v17 esp (vp fallback)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
