@@ -175,6 +175,7 @@ static int  g_pinN   = -1;      // v46：前 N 行固定（类 dump / 绑定日�
 // v47：一次性「事实行」按前缀钉住，永远显示在大 HUD 第一页，不随环形缓冲滚动
 #define PIN_N 10
 static char g_pinBuf[PIN_N][CHECKLEN];
+#define PROBES_DEFAULT 1        // v49：1=探针开；兜底版 v49s 用 0（探针全关）
 static int  g_freeze   = 0;     // v47：⏸ 冻结（不再接收新行 + 停止自动翻页）
 static int  g_hideAll  = 0;     // v48：⊘ 只显示 HUD，不画任何框（截判据页用）
 static int  g_frameStamp = 0;   // v47：帧序号（清陈旧 gone 条目用）
@@ -1059,7 +1060,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v48 ====");
+    CHECK("==== dump v49 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1070,7 +1071,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v48 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v49 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1747,6 +1748,14 @@ static int heroIdxByScreen(float lp[][3], int n) {
 static int camRefPos(float lp[][3], int n, float *ox, float *oz) {
     static int s_tpWarn = 0;
     if (!g_camObj || !g_uCamClass || !I2.class_get_method_from_name) return 0;
+    // v49：只有相机对象的 klass 与 g_uCamClass 一致时才调它的方法
+    {
+        void *ck = NULL;
+        if (!rd(g_camObj, &ck, sizeof(ck)) || !ck || ck != g_uCamClass) {
+            if (!s_tpWarn) { s_tpWarn = 1; CHECK("FOGV camRef skip (klass != uCamClass)"); }
+            return 0;
+        }
+    }
     void *mTr = I2.class_get_method_from_name(g_uCamClass, "get_transform", 0);
     if (!mTr || !*(void **)mTr) return 0;
     void *tr = ((void *(*)(void *, void *))(*(void **)mTr))(g_camObj, mTr);
@@ -1786,6 +1795,12 @@ static float vintScaleOf(void *vcls) {
     for (int i = 0; i < 2; i++) {
         void *f = fieldByNameish(vcls, names[i]);
         if (!f) continue;
+        // v49：非静态字段调 field_static_get_value 会从无效静态区取值 → 闪退。
+        // il2cpp 的 FIELD_ATTRIBUTE_STATIC = 0x10。
+        if (I2.field_get_flags && !(I2.field_get_flags(f) & 0x10)) {
+            CHECK("MVSCALE %s not static, skip", names[i]);
+            continue;
+        }
         unsigned char raw[16] = {0};
         I2.field_static_get_value(f, raw);
         float asF = 0; int asI = 0;
@@ -1940,23 +1955,38 @@ static void probeMove(void) {
         void *mft = I2.field_get_type(f);
         void *mcls = (mft && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(mft) : NULL;
         int mval = (mcls && I2.class_is_valuetype) ? (I2.class_is_valuetype(mcls) ? 1 : 0) : 0;
+        void *mccls = NULL;
         if (mval) {
-            // 值类型：组件内联在 ActorLinker 里，先按结构体首地址取，再尝试解 _handleObj
+            // v49：值类型内联 —— **不能**把结构体首地址当对象头读 klass（那是野指针，
+            // 拿它去 class_get_fields 会闪退）。直接用声明类型的字段偏移。
             mc = (char *)v + off;
-            mc = resolvePoolHandle(mc, mcls);
+            mccls = mcls;
         } else {
             rd((char *)v + off, &mc, sizeof(mc));
-            if (mc) mc = resolvePoolHandle(mc, mcls);
+            if (!mc) {
+                CHECK("MV id %u mc 0x0 pos %.0f,%.0f (component not created)", id, 0.0f, 0.0f);
+                shown++;
+                continue;
+            }
+            void *k2 = NULL;
+            if (!rd(mc, &k2, sizeof(k2)) || !k2) { shown++; continue; }
+            // PoolObjHandle 包装：解出真正的组件指针
+            const char *cn0 = (mcls && I2.class_get_name) ? I2.class_get_name(mcls) : NULL;
+            if (cn0 && (strstr(cn0, "PoolObjHandle") || strstr(cn0, "Handle"))) {
+                void *inner = resolvePoolHandle(mc, mcls);
+                if (!inner) { CHECK("MV id %u handle empty", id); shown++; continue; }
+                mc = inner;
+                if (!rd(mc, &k2, sizeof(k2)) || !k2) { shown++; continue; }
+            }
+            // v49：klass 必须等于字段声明类型，否则就是野指针/读偏了 —— 直接放弃
+            if (mcls && k2 != mcls) {
+                CHECK("MV id %u klass mismatch (%p != %p), skip", id, k2, mcls);
+                shown++;
+                continue;
+            }
+            mccls = k2;
         }
-        if (!mc) {
-            // ② 「读不到」和「读到不动的值」是两件事：把指针打出来
-            CHECK("MV id %u mc 0x0 pos %.0f,%.0f (component not created)",
-                  id, 0.0f, 0.0f);
-            shown++;
-            continue;
-        }
-        void *mccls = NULL;
-        if (!rd(mc, &mccls, sizeof(mccls)) || !mccls) continue;
+        if (!mc || !mccls) { shown++; continue; }
         float pos[3] = {0, 0, 0};
         rd((char *)v + 0x4C4, pos, sizeof(pos));
 
@@ -2103,6 +2133,19 @@ static void fogProbe(void) {
     if (g_heroType < 0) {
         if (g_fogRuns == 0) CHECK("FOGV skip (heroType unknown)");
         return;
+    }
+    // v49：白名单自证成功后，fog 的参考点计算会第一次真正执行。
+    // 先用「对象头 klass」确认相机没换类型，再往下走，避免跨类型调方法。
+    {
+        void *ck = NULL;
+        if (!g_camObj || !rd(g_camObj, &ck, sizeof(ck)) || !ck) {
+            if (g_fogRuns == 1) CHECK("FOGV skip (no camera)");
+            return;
+        }
+        if (g_camKlass && ck != g_camKlass) {
+            if (g_fogRuns <= 2) CHECK("FOGV skip (cam klass changed)");
+            return;
+        }
     }
     float now = (float)CACurrentMediaTime();
     int lim = (g_lastCnt < 64) ? g_lastCnt : 64;
@@ -3051,13 +3094,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v48  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v49  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v48\n"];
+    [s appendString:@"ESP v49\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -3117,14 +3160,14 @@ static void updateHud(void) {
     // v29：探测最多跑 3 轮 —— 之前每 5 秒一轮把 HUD 顶到 38 页，翻都翻不完
     if (t % 150 == 0 && g_mgr && g_unitCount == 0 && g_hopTried < 3) { probeActorLists(); probeViewHop(); }
     // v34：进对局、读到单位之后，跑 3 次计数自证（计数会随兵线变化，多跑几次更稳）
-    if (t % 90 == 0 && g_mgr && g_unitCount > 0 && g_verifyN < 3) { g_verifyN++; verifyIdentity(); }
+    if (PROBES_DEFAULT && t % 90 == 0 && g_mgr && g_unitCount > 0 && g_verifyN < 3) { g_verifyN++; verifyIdentity(); }
     // v36：FOG 探针每 5 秒一次，最多 12 次（1 分钟），够看清机制就停，不刷页
-    if (t % 150 == 0 && g_unitCount >= 40 && g_fogRuns < FOG_RUNS) { g_fogRuns++; fogProbe(); }
+    if (PROBES_DEFAULT && t % 150 == 0 && g_unitCount >= 40 && g_fogRuns < FOG_RUNS) { g_fogRuns++; fogProbe(); }
     // v42：PositionRecords / PlayerId 分组，各跑 3 次就够
-    if (t % 150 == 0 && g_unitCount > 0 && (g_pstRuns < 3 || g_pidRuns < 3)) probeExtras();
+    if (PROBES_DEFAULT && t % 150 == 0 && g_unitCount > 0 && (g_pstRuns < 3 || g_pidRuns < 3)) probeExtras();
     // v48：阵营容器 + 运动组件，各跑 2 次就够
-    if (t % 150 == 30 && g_unitCount > 0 && g_campRuns < 2) { g_campRuns++; probeCamps(); }
-    if (t % 150 == 60 && g_unitCount > 0 && g_mvRuns   < 2) { g_mvRuns++;   probeMove();  }
+    if (PROBES_DEFAULT && t % 150 == 30 && g_unitCount > 0 && g_campRuns < 1) { g_campRuns++; probeCamps(); }
+    if (PROBES_DEFAULT && t % 150 == 60 && g_unitCount > 0 && g_mvRuns   < 1) { g_mvRuns++;   probeMove();  }
     if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
 }
 @end
@@ -3206,7 +3249,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v48 booting";
+    l.text = @"ESP v49 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -3245,7 +3288,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v48 esp (clean-ui)");
+    ImGui::Text("build         : v49 esp (safe-probes)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
