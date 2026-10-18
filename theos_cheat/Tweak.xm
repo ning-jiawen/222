@@ -2410,6 +2410,10 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         if (g_offHostActor >= 0) { void *p = NULL; rd((char *)obj + g_offHostActor, &p, sizeof(p)); host = p ? 1 : 0; }
         if (g_offCallActor >= 0) { void *p = NULL; rd((char *)obj + g_offCallActor, &p, sizeof(p)); call = p ? 1 : 0; }
 
+        // v45 修正：nowT 原来声明在下面那一段（v35 规则3），但死亡边沿逻辑在它之前就要用 →
+        // CI 报 “use of undeclared identifier 'nowT'”。这里提到最前面，声明一次就够了。
+        float nowT = (float)CACurrentMediaTime();
+
         // v36（对面改口，我认同）：分身/傀儡 **不清除**，改成细框 + 另一种颜色。
         // 元歌傀儡贴脸的时候，正是最需要看见的东西；过滤掉等于自断信息。
         // v42：死亡用 lastDeadKiller（!=0 = 已被击杀）为主判据；IsEmptyActor 作为池回收补充。
@@ -2466,7 +2470,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         if (isSummon) g_mirrorSafe = 1;
 
         // ---- v35 规则3：死亡 / 失联 = 停滞 + 灰框 + 超时
-        float nowT = (float)CACurrentMediaTime();
+        // （nowT 已在上面统一声明，这里不再重复声明 —— 重复会报 redeclaration）
         int gi = -1;
         for (int k = 0; k < 64; k++) if (g_gone[k].id == objId && g_gone[k].id != 0) { gi = k; break; }
         float goneAge = -1.0f;
