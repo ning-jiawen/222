@@ -173,9 +173,10 @@ static char g_check[MAXCHECK][CHECKLEN];
 static int  g_checkN = 0;
 static int  g_pinN   = -1;      // v46：前 N 行固定（类 dump / 绑定日志），永不覆盖；-1=未定
 // v47：一次性「事实行」按前缀钉住，永远显示在大 HUD 第一页，不随环形缓冲滚动
-#define PIN_N 6
+#define PIN_N 10
 static char g_pinBuf[PIN_N][CHECKLEN];
 static int  g_freeze   = 0;     // v47：⏸ 冻结（不再接收新行 + 停止自动翻页）
+static int  g_hideAll  = 0;     // v48：⊘ 只显示 HUD，不画任何框（截判据页用）
 static int  g_frameStamp = 0;   // v47：帧序号（清陈旧 gone 条目用）
 static int  g_thT[16] = {0};    // v47：T 直方图（供不依赖 ActorManager 的白名单自证）
 static int  g_thN[16] = {0};
@@ -186,7 +187,10 @@ static size_t g_clsScanned = 0; // 扫过的类数
 static int    g_found      = 0; // 本轮命中的类数
 static int    g_rescan     = 0; // 自动重扫轮次（手势回调要重置，所以放最前）
 
-static const char *g_pinTag[PIN_N] = { "DK ", "PSTR ", "CTX ", "WHITELIST", "CNT ", "TH " };
+static const char *g_pinTag[PIN_N] = {
+    "DK ", "PSTR off", "PSTR gap", "CTX ", "WHITELIST",
+    "CNT ", "TH ", "PST ", "FOGV", "BUCKET"
+};
 
 static void checkLine(const char *fmt, ...) {
     char buf[CHECKLEN];
@@ -194,14 +198,14 @@ static void checkLine(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (g_freeze) return;                     // v47：冻结后不再接收新行
-    for (int i = 0; i < PIN_N; i++) {          // v47：按前缀钉住「一次性事实」
+    for (int i = 0; i < PIN_N; i++) {          // v48：钉住捕获必须在冻结判断之前
         size_t tl = strlen(g_pinTag[i]);
         if (strncmp(buf, g_pinTag[i], tl) == 0) {
             snprintf(g_pinBuf[i], CHECKLEN, "%s", buf);
             break;
         }
     }
+    if (g_freeze) return;                     // 冻结只影响 ring，不影响钉位
     if (g_checkN >= MAXCHECK) {
         // v46：满了丢最旧的一行（但保留固定头），保住最新输出 —— 否则探针行永远进不来
         int pin = (g_pinN < 0) ? 0 : g_pinN;
@@ -892,11 +896,48 @@ typedef struct {
 static int    g_offDeadKiller = -1;   // lastDeadKiller
 static int    g_dkIsPtr       = -1;   // v43：1=对象指针 0=int id（由字段类型自证，不再猜）
 static int    g_offFrameNum   = -1;   // v43：lastPositionXZChangedFrameNum（位置更新的帧号）
+// v48：忽略大小写比较（不引 strings.h，避免头文件差异）
+static int pinCount(void) {
+    int c = 0;
+    for (int i = 0; i < PIN_N; i++) if (g_pinBuf[i][0]) c++;
+    return c;
+}
+
+static int ciEq(const char *a, const char *b) {
+    while (*a && *b) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
+        if (x != y) return 0;
+        a++; b++;
+    }
+    return (*a == 0 && *b == 0) ? 1 : 0;
+}
+
+// v48：字段查找三级回退 —— 精确名 → 忽略大小写 → <Name>k__BackingField（自动属性）
+// 之前 mirror / empty 取不到就是名字对不上（IsMirrorActor 大写 I；IsEmptyActor 是自动属性）
+static void *findField(void *cls, const char *name) {
+    if (!cls || !I2.class_get_field_from_name) return NULL;
+    void *f = I2.class_get_field_from_name(cls, name);
+    if (f) return f;
+    char alt[96];
+    snprintf(alt, sizeof(alt), "<%s>k__BackingField", name);
+    void *iter = NULL;
+    void **fields = I2.class_get_fields ? I2.class_get_fields(cls, &iter) : NULL;
+    if (!fields) return NULL;
+    for (int i = 0; fields[i]; i++) {
+        const char *fn = I2.field_get_name ? I2.field_get_name(fields[i]) : NULL;
+        if (!fn) continue;
+        if (ciEq(fn, name) || ciEq(fn, alt)) return fields[i];
+    }
+    return NULL;
+}
+
 // v43：死亡计时（灰虚线 1.5s 淡出后不再画）
 typedef struct { unsigned int id; float t; } DeadEnt;
 static DeadEnt g_deadTbl[64];
 // v45：每个 id 记住「上一次采样到的记录末位」，用来算跨采样变化 dl（这才是判据）
-typedef struct { unsigned int id; float lx, lz; int n; } PstEnt;
+typedef struct { unsigned int id; float lx, lz; int n; int cn; } PstEnt;
 static PstEnt g_pst[16];
 static int    g_offEmptyActor = -1;   // IsEmptyActor：池回收标记
 static int    g_offPosRec     = -1;   // PositionRecords：定时记录位置的那个容器
@@ -904,6 +945,15 @@ static int    g_posRecKind    = 0;    // 0=未知 1=List<Vector3> 2=Vector3[]
 static float  g_posRecGap     = 0;    // K_PositionRecordsTimeGap（静态常量，能读到就用它算时间轴）
 static int    g_pstRuns       = 0;    // PositionRecords 探针跑过几次（最多 3）
 static int    g_pidRuns       = 0;    // PlayerId 分组打印次数（最多 3）
+static void  *findField(void *cls, const char *name);
+static int    ciEq(const char *a, const char *b);
+static int    pinCount(void);
+static int    g_btnN    = 0;    // v48：已创建并加进窗口的按钮数（自证用）
+static int    g_campRuns = 0;   // CampsActors 探针次数
+static int    g_mvRuns   = 0;   // MoveControl 探针次数
+static void   probeCamps(void);
+static void   probeMove(void);
+static void  *fieldByNameish(void *cls, const char *name);
 static void   bindExtraFlags(void);
 static void   probeExtras(void);
 static TkEnt g_tk[64];
@@ -1009,7 +1059,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v47 ====");
+    CHECK("==== dump v48 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1020,7 +1070,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v47 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v48 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1577,7 +1627,7 @@ static void bindLinkerFlags(void) {
     void *f2;
     // v42/v43：lastDeadKiller 到底是「对象指针」还是「int id」，问字段类型 —— 不猜。
     // 猜错的两种后果都很隐蔽：当 id 猜成指针 → 永远不判死；当指针猜成 id → 满屏灰虚线。
-    if ((f2 = I2.class_get_field_from_name(g_linkerClass, "lastDeadKiller"))) {
+    if ((f2 = findField(g_linkerClass, "lastDeadKiller"))) {
         g_offDeadKiller = (int)I2.field_get_offset(f2);
         void *dt = I2.field_get_type(f2);
         const char *tn = (dt && I2.type_get_name) ? I2.type_get_name(dt) : "?";
@@ -1591,10 +1641,10 @@ static void bindLinkerFlags(void) {
         CHECK("DK no field");
         g_dkIsPtr = 0;
     }
-    if ((f2 = I2.class_get_field_from_name(g_linkerClass, "lastPositionXZChangedFrameNum")))
+    if ((f2 = findField(g_linkerClass, "lastPositionXZChangedFrameNum")))
         g_offFrameNum = (int)I2.field_get_offset(f2);
-    if ((f2 = I2.class_get_field_from_name(g_linkerClass, "IsEmptyActor")))    g_offEmptyActor = (int)I2.field_get_offset(f2);
-    if ((f2 = I2.class_get_field_from_name(g_linkerClass, "PositionRecords"))) {
+    if ((f2 = findField(g_linkerClass, "IsEmptyActor")))    g_offEmptyActor = (int)I2.field_get_offset(f2);
+    if ((f2 = findField(g_linkerClass, "PositionRecords"))) {
         g_offPosRec = (int)I2.field_get_offset(f2);
         void *pt = I2.field_get_type(f2);
         const char *pn = pt ? I2.type_get_name(pt) : NULL;
@@ -1607,7 +1657,7 @@ static void bindLinkerFlags(void) {
     } else {
         CHECK("PSTR no PositionRecords");
     }
-    if ((f2 = I2.class_get_field_from_name(g_linkerClass, "K_PositionRecordsTimeGap")) && I2.field_static_get_value) {
+    if ((f2 = findField(g_linkerClass, "K_PositionRecordsTimeGap")) && I2.field_static_get_value) {
         float gap = 0;
         I2.field_static_get_value(f2, &gap);
         if (gap > 0.0f && gap < 10.0f) g_posRecGap = gap;
@@ -1722,6 +1772,174 @@ static int camRefPos(float lp[][3], int n, float *ox, float *oz) {
     return 1;
 }
 
+// v48：按「名字/忽略大小写」找字段（给探针用，找不到返回 NULL）
+static void *fieldByNameish(void *cls, const char *name) { return findField(cls, name); }
+
+// v48：定点数换算系数（VInt3.Precision 之类）。0 = 还没读到
+static float g_vintScale = 0.0f;
+
+// 在 VInt3 类里找 Precision / PrecisionFactor 静态字段，读出换算系数
+static float vintScaleOf(void *vcls) {
+    if (g_vintScale > 0.0f) return g_vintScale;
+    if (!vcls || !I2.field_static_get_value) return 1000.0f;
+    const char *names[2] = { "Precision", "PrecisionFactor" };
+    for (int i = 0; i < 2; i++) {
+        void *f = fieldByNameish(vcls, names[i]);
+        if (!f) continue;
+        unsigned char raw[16] = {0};
+        I2.field_static_get_value(f, raw);
+        float asF = 0; int asI = 0;
+        memcpy(&asF, raw, 4); memcpy(&asI, raw, 4);
+        float cand = 0;
+        if (asF > 0.001f && asF < 1e6f) cand = asF;
+        else if (asI > 0 && asI < 1000000) cand = (float)asI;
+        if (cand > 0.0f) {
+            g_vintScale = cand;
+            CHECK("MVSCALE %s = %.3f", names[i], cand);
+            return cand;
+        }
+    }
+    g_vintScale = 1000.0f;      // 兜底：MOBA 定点常见 1000
+    CHECK("MVSCALE default 1000");
+    return g_vintScale;
+}
+
+// v48：读一个「位置类」字段 —— 可能是 Vector3(float×3)，也可能是 VInt3(int×3 定点)
+static int readPosField(void *obj, void *fld, float *out, const char **kindOut) {
+    void *ft = I2.field_get_type(fld);
+    const char *tn = (ft && I2.type_get_name) ? I2.type_get_name(ft) : NULL;
+    if (!tn) return 0;
+    int off = (int)I2.field_get_offset(fld);
+    if (strstr(tn, "Vector3")) {
+        rd((char *)obj + off, out, sizeof(float) * 3);
+        *kindOut = "V3";
+        return 1;
+    }
+    if (strstr(tn, "VInt3") || strstr(tn, "Int3")) {
+        int iv[3] = {0, 0, 0};
+        rd((char *)obj + off, iv, sizeof(iv));
+        void *vcls = (ft && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(ft) : NULL;
+        float sc = vintScaleOf(vcls);
+        out[0] = (float)iv[0] / sc;
+        out[1] = (float)iv[1] / sc;
+        out[2] = (float)iv[2] / sc;
+        *kindOut = "VI3";
+        return 1;
+    }
+    return 0;
+}
+
+// v48：CampsActors 探针 —— ActorManager 上按阵营分组的容器。
+// 注意：actorList / updatableActorList 都是 DictionaryView（结构体包装，Context@8），
+// CampsActors 极可能也是 → 类型名含 DictionaryView 就先跳 Context 再读。
+static void probeCamps(void) {
+    if (!g_mgr) return;
+    void *mcls = NULL;
+    if (!rd(g_mgr, &mcls, sizeof(mcls)) || !mcls) { CHECK("CAMP no mcls"); return; }
+    void *f = fieldByNameish(mcls, "CampsActors");
+    if (!f) { CHECK("CAMP no field"); return; }
+    int off = (int)I2.field_get_offset(f);
+    void *ft = I2.field_get_type(f);
+    const char *tn = (ft && I2.type_get_name) ? I2.type_get_name(ft) : "?";
+    void *cv = NULL;
+    rd((char *)g_mgr + off, &cv, sizeof(cv));
+    CHECK("CAMP off %d type %s obj %p", off, tn ? tn : "?", cv);
+    if (!cv) return;
+    void *dict = cv;
+    if (tn && strstr(tn, "DictionaryView")) {
+        void *ctx = NULL;
+        if (g_ctxOff > 0 && rd((char *)cv + g_ctxOff, &ctx, sizeof(ctx)) && ctx) {
+            dict = ctx;
+            CHECK("CAMP view -> ctx %p", dict);
+        } else {
+            CHECK("CAMP view but no ctx (ctxOff %d)", g_ctxOff);
+        }
+    }
+    int cnt = 0; void *ent = NULL;
+    rd((char *)dict + 0x18, &cnt, sizeof(cnt));
+    rd((char *)dict + 0x10, &ent, sizeof(ent));
+    CHECK("CAMP cnt %d ent %p", cnt, ent);
+    if (!ent || cnt <= 0 || cnt > 4096) return;
+    for (int i = 0; i < cnt && i < 3; i++) {
+        int key = 0;
+        rd((char *)ent + g_arrBase + (size_t)i * 24 + 8, &key, sizeof(key));
+        void *val = NULL;
+        rd((char *)ent + g_arrBase + (size_t)i * 24 + 16, &val, sizeof(val));
+        CHECK("CAMP key %d val %p", key, val);
+    }
+}
+
+// v48：MoveComponent 探针 —— 位置真值很可能不在 ActorLinker.position（渲染副本），
+// 而在 curPosition（平滑后的显示值）/ remotePosition（服务器下发的权威值）里。
+static void probeMove(void) {
+    if (!g_lastEntries || g_lastCnt <= 0 || !g_linkerClass) return;
+    void *f = fieldByNameish(g_linkerClass, "MoveComponent");
+    if (!f) f = fieldByNameish(g_linkerClass, "MoveControl");
+    if (!f) {
+        // 退一步：按名字枚举含 Move 的字段，把候选打出来
+        CHECK("MV no MoveComponent/MoveControl field");
+        return;
+    }
+    int off = (int)I2.field_get_offset(f);
+    int lim = (g_lastCnt < 8) ? g_lastCnt : 8;
+    int shown = 0;
+    for (int i = 0; i < lim && shown < 3; i++) {
+        void *v = NULL, *k = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        if (rd(v, &k, sizeof(k)) && k != g_linkerClass) continue;
+        void *mc = NULL;
+        if (!rd((char *)v + off, &mc, sizeof(mc)) || !mc) continue;
+        void *mccls = NULL;
+        if (!rd(mc, &mccls, sizeof(mccls)) || !mccls) continue;
+        unsigned int id = 0; rd((char *)v + 0x4AC, &id, 4);
+        float pos[3] = {0, 0, 0};
+        rd((char *)v + 0x4C4, pos, sizeof(pos));
+
+        // 只打第一次：这个类里所有「位置类」字段（含定点数）
+        static int s_dumped = 0;
+        if (!s_dumped) {
+            s_dumped = 1;
+            const char *cn = I2.class_get_name ? I2.class_get_name(mccls) : "?";
+            CHECK("MVF cls %s", cn ? cn : "?");
+            void *iter = NULL;
+            void **fields = I2.class_get_fields ? I2.class_get_fields(mccls, &iter) : NULL;
+            int dumped = 0;
+            if (fields) {
+                for (int j = 0; fields[j] && dumped < 6; j++) {
+                    void *ft = I2.field_get_type(fields[j]);
+                    const char *tn = (ft && I2.type_get_name) ? I2.type_get_name(ft) : NULL;
+                    if (!tn) continue;
+                    if (!strstr(tn, "Vector3") && !strstr(tn, "VInt3") && !strstr(tn, "Int3")) continue;
+                    float p3[3] = {0, 0, 0}; const char *kk = "?";
+                    if (!readPosField(mc, fields[j], p3, &kk)) continue;
+                    const char *fn = I2.field_get_name ? I2.field_get_name(fields[j]) : "?";
+                    CHECK("MVF %s @%d %s %.0f,%.0f,%.0f", fn ? fn : "?", (int)I2.field_get_offset(fields[j]),
+                          kk, p3[0], p3[1], p3[2]);
+                    dumped++;
+                }
+            }
+            if (!dumped) CHECK("MVF none (no Vector3/VInt3 field)");
+        }
+
+        // 每帧都打的对照行：pos vs curPosition vs remotePosition
+        float cur[3] = {0, 0, 0}, rem[3] = {0, 0, 0};
+        int hasCur = 0, hasRem = 0;
+        void *fc = fieldByNameish(mccls, "curPosition");
+        void *fr = fieldByNameish(mccls, "remotePosition");
+        const char *kk = "?";
+        if (fc) hasCur = readPosField(mc, fc, cur, &kk);
+        if (fr) hasRem = readPosField(mc, fr, rem, &kk);
+        if (hasCur || hasRem) {
+            CHECK("MV id %u pos %.0f,%.0f | cur %.0f,%.0f | rem %.0f,%.0f",
+                  id, pos[0], pos[2], hasCur ? cur[0] : -99999.0f, hasCur ? cur[2] : -99999.0f,
+                  hasRem ? rem[0] : -99999.0f, hasRem ? rem[2] : -99999.0f);
+        } else {
+            CHECK("MV id %u pos %.0f,%.0f | (no cur/rem)", id, pos[0], pos[2]);
+        }
+        shown++;
+    }
+}
+
 // v42：探 PositionRecords 是否在「敌人不可见时仍然滚动」，并打印英雄的 PlayerId 分组。
 // 这两条决定「掌握动向」是真数据还是只能外推：
 //   PositionRecords 的 cnt/首尾在动 → 有真轨迹；全静止 → 客户端只有渲染层那一份副本。
@@ -1751,7 +1969,7 @@ static void probeExtras(void) {
         if (mir || host || call) continue;
 
         // ---- PlayerId 分组（按可靠性，这是 camp 恒 0 之后最省事的替代）
-        if (pidN < 5 && isHero) {
+        if (pidN < 10 && isHero) {
             CHECK("HP id %u T %d pid %d raw %d cfg %d st %d", id, aT, pid, rpid, cfg, aC);
             pidN++;
         }
@@ -1773,6 +1991,7 @@ static void probeExtras(void) {
                 }
                 int fn = -1;
                 if (g_offFrameNum >= 0) rd((char *)v + g_offFrameNum, &fn, sizeof(fn));
+                int dn = -1;
                 // ---- v45：跨采样变化量 dl = |l - l_上次采样|
                 float dl = -1.0f;
                 int ps = -1;
@@ -1784,7 +2003,9 @@ static void probeExtras(void) {
                     if (g_pst[ps].n > 0) {
                         float ddx = last[0] - g_pst[ps].lx, ddz = last[2] - g_pst[ps].lz;
                         dl = sqrtf(ddx * ddx + ddz * ddz);
+                        dn = cnt - g_pst[ps].cn;          // v48：n 的增量，核对「1 秒/点」
                     }
+                    g_pst[ps].cn = cnt;
                     g_pst[ps].lx = last[0]; g_pst[ps].lz = last[2]; g_pst[ps].n++;
                 }
                 int lv = 1, mv = 1;
@@ -1794,8 +2015,8 @@ static void probeExtras(void) {
                 // 说明：|l - p| 不再是判据 —— 活着可见时记录末位本来就等于当前位置，
                 // 冻结时记录器写的也是那个冻结值，两种情况的 |l-p| 都≈0，区分不了。
                 // 判据是上面的 dl（跨采样变化）。
-                CHECK("PST id %u n %d p %.0f,%.0f l %.0f,%.0f dl %.0f lv%d mv%d fn %d gap %.2f",
-                      id, cnt, cur[0], cur[2], last[0], last[2], dl, lv, mv, fn, g_posRecGap);
+                CHECK("PST id %u n %d dn %d p %.0f,%.0f l %.0f,%.0f dl %.0f lv%d mv%d fn %d gap %.2f",
+                      id, cnt, dn, cur[0], cur[2], last[0], last[2], dl, lv, mv, fn, g_posRecGap);
                 pstN++;
             } else {
                 CHECK("PST id %u rec null", id);
@@ -1997,13 +2218,27 @@ static void verifyIdentity(void) {
     if (g_heroType < 0) {
         // v47：先按「数量」自证 —— 5v5 里主身英雄恒为 10，单边 5。
         // 这一条不依赖任何 ActorManager 方法，比 GetHeroActorCount 稳。
-        int h10 = -1, h10n = 0, h5 = -1, h5n = 0;
+        // v48：放宽 —— 元歌傀儡/盾山的盾也会算进英雄类型，计数可能是 11 而不是 10。
+        // 取「最接近 10、且 ≥5、且唯一」的那一档。
+        int bestT = -1, bestD = 99, bestCnt = 0, bestTie = 0;
         for (int i = 0; i < n; i++) {
-            if (tc[i] == 10) { h10 = tv[i]; h10n++; }
-            if (tc[i] == 5)  { h5  = tv[i]; h5n++; }
+            if (tc[i] < 5) continue;
+            int d = (tc[i] > 10) ? (tc[i] - 10) : (10 - tc[i]);
+            if (d < bestD) { bestD = d; bestT = tv[i]; bestCnt = tc[i]; bestTie = 0; }
+            else if (d == bestD) bestTie = 1;
         }
-        if (h10n == 1)      { g_heroType = h10; CHECK("WHITELIST T=%d (cnt 10)", h10); }
-        else if (h5n == 1)  { g_heroType = h5;  CHECK("WHITELIST T=%d (cnt 5)",  h5); }
+        // v48：把第二名一起打出来，机器选错也能当场发现
+        int sT = -1, sCnt = 0;
+        for (int i = 0; i < n; i++) {
+            if (tv[i] == bestT) continue;
+            if (tc[i] > sCnt) { sCnt = tc[i]; sT = tv[i]; }
+        }
+        if (bestT >= 0 && bestD <= 2 && !bestTie) {
+            g_heroType = bestT;
+            CHECK("WHITELIST T=%d (cnt %d) 2nd: T%d (cnt %d)", bestT, bestCnt, sT, sCnt);
+        } else {
+            CHECK("WHITELIST none 1st T%d (cnt %d) 2nd T%d (cnt %d)", bestT, bestCnt, sT, sCnt);
+        }
         else if (hero > 0) {
             int hit = 0, cand = -1;
             for (int i = 0; i < n; i++) if (tc[i] == hero) { hit++; cand = tv[i]; }
@@ -2345,6 +2580,14 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v20：读到单位 = 已经在对局里；只有这时才去碰相机/视矩阵（大厅里没有这些对象）
     g_inMatch = nowIn;
     if (nowIn && g_pinN < 0) g_pinN = g_checkN;   // v46：把「类 dump + 绑定日志」固定住
+    if (edgeIn) {                                 // v48：每次进对局重置探针额度 ——
+        g_verifyN = 0;                            // 载入界面那点零星 actor 会把 3 次额度吃光，
+        g_pstRuns = 0;                            // 正式对局里就再也不打印 CNT/TH/PST 了
+        g_pidRuns = 0;
+        g_fogRuns = 0;
+        g_diagFail = 0;
+        for (int k = 0; k < 16; k++) { g_pst[k].id = 0; g_pst[k].n = 0; }
+    }
 
     // v24：一次性内存转储。第一帧 + 每次进对局各打一份，一共最多 3 份。
     // D1/D2/D3 是原始字，D4/D5 同时试「数组数据在 0x18」和「在 0x20」两种可能，
@@ -2426,6 +2669,10 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         for (int k = 0; k < 64; k++) { g_deadTbl[k].id = 0; g_deadTbl[k].t = 0; }             // v43：换局清死亡表
         for (int k = 0; k < 16; k++) { g_pst[k].id = 0; g_pst[k].n = 0; }                       // v45：换局清 PST 记忆
         g_myCamp = 0; g_enemyN = -1;
+    }
+    if (g_hideAll) {                               // v48：⊘ 只显示 HUD，不画任何框
+        g_boxDrawn = 0;
+        return;
     }
     for (int i = 0; i < cnt && drawn < 32; i++) {
         void *obj = NULL;
@@ -2624,9 +2871,13 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
                 g_tk[ti].p[0] = pos[0]; g_tk[ti].p[1] = pos[1]; g_tk[ti].p[2] = pos[2];
                 predAge = nowT - g_tk[ti].tMove;
                 float sp = sqrtf(g_tk[ti].v[0] * g_tk[ti].v[0] + g_tk[ti].v[2] * g_tk[ti].v[2]);
-                if (predAge > 0.8f && sp > 20.0f) {       // 停了 0.8 秒以上、且此前真的在动
+                // v48：三道 gate —— 速度要像人走出来的、预测位移有上限、阵营未知一律不画。
+                // 之前只判 sp>20，晃动一点就出一条乱飞的线，而且队友也照画。
+                if (g_myCamp != 0 && predAge > 0.8f && sp >= 20.0f && sp <= 1500.0f) {
                     float a = (predAge > 5.0f) ? 5.0f : predAge;
-                    if (projPred(g_tk[ti].p[0] + g_tk[ti].v[0] * a, g_tk[ti].p[1],
+                    float pd = sp * a;
+                    if (pd <= 3000.0f &&
+                        projPred(g_tk[ti].p[0] + g_tk[ti].v[0] * a, g_tk[ti].p[1],
                                  g_tk[ti].p[2] + g_tk[ti].v[2] * a, sw, sh, &predX, &predY))
                         havePred = 1;
                 }
@@ -2650,14 +2901,10 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
             int ai = (int)(210 * (1.0f - dAge / 1.5f));
             col = IM_COL32(190, 190, 190, ai < 40 ? 40 : ai);
             deadStyle = 2;
-        } else if (mesh == 0 && logic != 0) {
-            // 态④：隐身（兰陵王/鬼谷子）—— 灰闪，这是透视的价值点，不当死亡
-            float blink = 0.5f + 0.5f * sinf(nowT * 6.0f);
-            col = IM_COL32(220, 220, 220, (int)(90 + 120 * blink));
-            deadStyle = 3;
-        } else if (mesh == 0 && logic == 0) {
-            // v43 态②：存活但失联（雾里）—— 半透明灰**实框** + 年龄，永不丢弃
-            // 和死亡必须视觉可分：这里是实框，死亡是虚线 + 十字
+        } else if (!isDead && mesh == 0 && logic == 0) {
+            // v48：这里只用「两个旗标都为 0」= 这一帧完全没被渲染（雾里/裁剪），作为**纯外观**提示；
+            // 死亡判定只认 lastDeadKiller / IsEmptyActor，隐身判定已删除。
+            // 用「位置停滞」代替会有副作用：塔、站着不动的英雄也会被判成失联，所以不用它。
             col = IM_COL32(175, 175, 175, 130);
             deadStyle = 1;
         }
@@ -2689,7 +2936,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         }
         dl->AddCircleFilled(ImVec2(sx, sy), 3.0f, col);
         char buf[72];
-        if (deadStyle == 1 && goneAge >= 0)
+        if (deadStyle == 1 && goneAge >= 0.5f)
             snprintf(buf, sizeof(buf), "%u T%d C%d ?%.0fs", objId, aT, aC, goneAge);
         else if (deadStyle == 2)
             snprintf(buf, sizeof(buf), "%u dead", objId);
@@ -2735,13 +2982,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v47  u%d r%d b%d p%d in%d d%d c%d  pg%d  full%d  fz%d\n3-finger UP = full hud",
+            @"ESP v48  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
-            g_hudPage % 100, g_hudForce, g_freeze];
+            g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v47\n"];
+    [s appendString:@"ESP v48\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -2806,6 +3053,9 @@ static void updateHud(void) {
     if (t % 150 == 0 && g_unitCount >= 40 && g_fogRuns < FOG_RUNS) { g_fogRuns++; fogProbe(); }
     // v42：PositionRecords / PlayerId 分组，各跑 3 次就够
     if (t % 150 == 0 && g_unitCount > 0 && (g_pstRuns < 3 || g_pidRuns < 3)) probeExtras();
+    // v48：阵营容器 + 运动组件，各跑 2 次就够
+    if (t % 150 == 30 && g_unitCount > 0 && g_campRuns < 2) { g_campRuns++; probeCamps(); }
+    if (t % 150 == 60 && g_unitCount > 0 && g_mvRuns   < 2) { g_mvRuns++;   probeMove();  }
     if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
 }
 @end
@@ -2887,7 +3137,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v47 booting";
+    l.text = @"ESP v48 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -2926,7 +3176,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v47 esp (pinned+freeze)");
+    ImGui::Text("build         : v48 esp (clean-ui)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
@@ -3190,7 +3440,7 @@ static void attachMenuGesture(void) {
         [bp addAction:[UIAction actionWithHandler:^(UIAction *a) {
             g_hudPage++; updateHud();
         }] forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:bp];
+        [win addSubview:bp]; g_btnN++;
 
         UIButton *bf = [UIButton buttonWithType:UIButtonTypeSystem];
         bf.frame = CGRectMake(bx, 60 + bw + 8, bw, bw);
@@ -3203,7 +3453,7 @@ static void attachMenuGesture(void) {
         [bf addAction:[UIAction actionWithHandler:^(UIAction *a) {
             g_hudForce = g_hudForce ? 0 : 1; updateHud();
         }] forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:bf];
+        [win addSubview:bf]; g_btnN++;
         // v47：⏸ 冻结 —— 不再接收新行、停止自动翻页，页内容不再移动，可以慢慢翻慢慢截
         UIButton *bz = [UIButton buttonWithType:UIButtonTypeSystem];
         bz.frame = CGRectMake(bx, 60 + (bw + 8) * 2, bw, bw);
@@ -3218,8 +3468,21 @@ static void attachMenuGesture(void) {
             g_pageFreeze = g_freeze;
             updateHud();
         }] forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:bz];
-        LOG("buttons added ≡ / ▤ / ⏸");
+        [win addSubview:bz]; g_btnN++;
+        // v48：⊘ 只显示 HUD，不画框 —— 翻页截图时按一下，世界立刻干净
+        UIButton *bx2 = [UIButton buttonWithType:UIButtonTypeSystem];
+        bx2.frame = CGRectMake(bx, 60 + (bw + 8) * 3, bw, bw);
+        bx2.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
+        bx2.layer.cornerRadius = 10;
+        bx2.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+        [bx2 setTitle:@"⊘" forState:UIControlStateNormal];
+        [bx2 setTitleColor:[UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:0.95]
+                  forState:UIControlStateNormal];
+        [bx2 addAction:[UIAction actionWithHandler:^(UIAction *a) {
+            g_hideAll = g_hideAll ? 0 : 1;
+        }] forControlEvents:UIControlEventTouchUpInside];
+        [win addSubview:bx2]; g_btnN++;
+        LOG("buttons added ≡ / ▤ / ⏸ / ⊘");
     }
 }
 
