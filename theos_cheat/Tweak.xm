@@ -92,7 +92,12 @@
 #import <signal.h>
 #import <stdarg.h>
 #import <pthread.h>
-#import <math.h>              // v35：sinf 用于隐身灰闪，显式引入避免依赖传递包含
+#import <math.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <errno.h>              // v35：sinf 用于隐身灰闪，显式引入避免依赖传递包含
 
 // 不依赖 CydiaSubstrate / ellekit。
 // 依据：原外挂 PxExtFFi（52 MB）里 MSHookFunction / fishhook / substrate 出现次数全是 0，
@@ -194,6 +199,11 @@ static const char *g_pinTag[PIN_N] = {
 };
 
 static void checkLine(const char *fmt, ...);   // 前向声明（bcReplay 在它定义之前）
+static void rtSendLine(const char *line);       // v73 前向声明（checkLine 里要用）
+static const char *khtName(uintptr_t key);      // v74：klass→name 查表
+static void khtAdd(uintptr_t key, const char *name);
+static void khtSeedChain(void *cls, const char *hint);
+static void khtSeed(void);
 
 // ================= v70：面包屑（崩溃前也能落盘） =================
 static FILE *g_bcFp   = NULL;
@@ -278,6 +288,7 @@ static void checkLine(const char *fmt, ...) {
     }
     pushLog("%s", buf);
     bcLine(buf);                    // v70：同时落盘（崩溃也能留下证据）
+    rtSendLine(buf);                // v73：同时发 LAN（PC 端 esp_host.py 收）
 }
 #define CHECK(fmt, ...) checkLine(fmt, ##__VA_ARGS__)
 
@@ -1072,6 +1083,7 @@ static int    g_calRuns = 0;     // v68：CALIB 标定次数
 #define CALIB_ENABLE 0           // v69：CALIB 会枚举 5 层父类的字段（v48 就是崩在这个 API），先关
 static int    g_rvaRuns = 0;     // v68b：RVA 探针次数
 static int    g_ceRuns  = 0;     // v71：CE 对照实验拍数
+static int    g_c2rRuns = 0;     // v73：CAMP2 原始布局 dump 次数
 static double g_ceNext  = 0;     // v72：下一拍的时间点（按时间而不是帧数）
 #define L3_ENABLE 0              // v65：进对局闪退，先关掉全表扫描止血（改 1 可恢复）
 static void   probeCamps(void);
@@ -1083,6 +1095,9 @@ static void   probeUnits20(void);
 static void   probeCalib(void);
 static void   probeRVA(void);
 static void   probeCampExp(void);
+static void   probeCampRaw(void);
+static void   khtSeed(void);
+static void   rtTick(void);
 static void   probeL3scan(void);
 static void  *fieldByNameish(void *cls, const char *name);
 static void   bindExtraLazy(void);
@@ -1191,7 +1206,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v72 ====");
+    CHECK("==== dump v74 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1202,7 +1217,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v72 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v74 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1372,11 +1387,11 @@ static void *safeKlass(void *obj) {
 // v67b：已知类缓存（全部来自 findCls / class_from_il2cpp_type，可信）
 static void *g_moveCls = NULL, *g_valueCls = NULL, *g_skillCls = NULL, *g_charInfoCls = NULL;
 
+// v74：只查表 —— 表外一律 unknown，绝不把未知指针交给 il2cpp
 static const char *safeClassName(void *k) {
-    if (!k || !I2.class_get_name) { g_safeRej++; return NULL; }
-    if (!okptr((uintptr_t)k)) { g_safeRej++; return NULL; }
-    const char *n = I2.class_get_name(k);      // 只有 ovptr 过了才调
-    if (n && !okptr((uintptr_t)n)) { g_safeRej++; return NULL; }
+    if (!k) { g_safeRej++; return NULL; }
+    const char *n = khtName((uintptr_t)k);
+    if (!n) { g_safeRej++; return NULL; }
     return n;
 }
 // ================= v67 safe layer end =================
@@ -1825,6 +1840,7 @@ static void bindExtraLazy(void) {
         if (g_offName < 0) g_offName = 0x4B0;
         CHECK("NAME off %d (resolved %d)", g_offName, nf ? 1 : 0);
     }
+    khtSeed();                                  // v74：第 1 项 —— 建表（只种已知类与父链）
     CHECK("KNOWN move %d value %d skill %d char %d | linker %d cam %d",
           g_moveCls ? 1 : 0, g_valueCls ? 1 : 0, g_skillCls ? 1 : 0, g_charInfoCls ? 1 : 0,
           g_linkerClass ? 1 : 0, g_uCamClass ? 1 : 0);
@@ -2508,6 +2524,207 @@ static void probeCampMem(void) {
 }
 // ================= v60 end =================
 
+
+// ================= v74：KHT —— klass → name 哈希表 =================
+// 规矩落地：任何 klass 指针先查表；表内安全命名，表外一律 unknown，不调 class_get_name。
+#define KHT_SLOTS 4096
+#define KHT_FULL  0                 // 1 = 启动时遍历全部 64k 类（留给 P0；现在关）
+typedef struct { uintptr_t key; const char *name; } KhtEnt;
+static KhtEnt g_kht[KHT_SLOTS];
+static int    g_khtN = 0;
+static int    g_khtMiss = 0;
+
+static unsigned int khtHash(uintptr_t k) {
+    unsigned long long x = (unsigned long long)k;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+    return (unsigned int)(x & (KHT_SLOTS - 1));
+}
+
+static void khtAdd(uintptr_t key, const char *name) {
+    if (!key || !name || !name[0]) return;
+    unsigned int h = khtHash(key);
+    for (int i = 0; i < 16; i++) {                 // 线性探测，最多 16 步
+        unsigned int idx = (h + i) & (KHT_SLOTS - 1);
+        if (g_kht[idx].key == key) return;          // 已存在
+        if (g_kht[idx].key == 0) {
+            g_kht[idx].key = key;
+            g_kht[idx].name = name;
+            g_khtN++;
+            return;
+        }
+    }
+}
+
+static const char *khtName(uintptr_t key) {
+    if (!key) return NULL;
+    unsigned int h = khtHash(key);
+    for (int i = 0; i < 16; i++) {
+        unsigned int idx = (h + i) & (KHT_SLOTS - 1);
+        if (g_kht[idx].key == key) return g_kht[idx].name;
+        if (g_kht[idx].key == 0) break;
+    }
+    g_khtMiss++;
+    return NULL;
+}
+
+// 把一个类及其父链（≤8 层）种进表；名字只对「元数据类指针」取，天然安全
+static void khtSeedChain(void *cls, const char *hint) {
+    for (int lv = 0; lv < 8 && cls; lv++) {
+        const char *nm = I2.class_get_name ? I2.class_get_name(cls) : NULL;
+        khtAdd((uintptr_t)cls, nm ? nm : (lv == 0 ? hint : NULL));
+        cls = (I2.class_get_parent) ? I2.class_get_parent(cls) : NULL;
+    }
+}
+
+static void khtSeed(void) {
+    if (g_khtN) return;
+    khtSeedChain(g_linkerClass,  "ActorLinker");
+    khtSeedChain(g_uCamClass,    "GuishiCamera");
+    khtSeedChain(g_mgrClass,     "ActorManager");
+    khtSeedChain(g_moveCls,      "MoveComponent");
+    khtSeedChain(g_valueCls,     "ValueComponent");
+    khtSeedChain(g_skillCls,     "SkillControl");
+    khtSeedChain(g_charInfoCls,  "CharInfo");
+    khtSeedChain(g_camKlass,     "Camera");
+    khtSeedChain(g_vpClass,      "CameraVPFrameCache");
+#if KHT_FULL
+    // 留给 P0：全量 64k（那时本来就遍历，成本为零）
+#endif
+    CHECK("KHT seed n=%d ActorLinker %s", g_khtN,
+          g_linkerClass ? (khtName((uintptr_t)g_linkerClass) ? "ok" : "?") : "-");
+    CHECK("KHT probe: known %s | unknown 0x15b000000 -> %s",
+          g_linkerClass ? "ok" : "-", khtName(0x15b000000ULL) ? "LEAK" : "unknown");
+}
+// ================= v74 KHT end =================
+
+// ================= v73：CAMP2R —— 把阵营列表的元素布局一次定死 =================
+// 已知：TinyValueList head 正确（items@+8, size@+0x10）；失败点只在「元素布局」。
+// 这里打三样：items 前 32 字节 hex、stride 8/16/24 各试一次、每个候选头 8 字节判等 klass。
+static void probeCampRaw(void) {
+    if (!g_mgr || !g_mgrClass || !I2.class_get_method_from_name) { CHECK("C2R no mgr"); return; }
+    void *mi = I2.class_get_method_from_name(g_mgrClass, "GetCampActors", 1);
+    if (!mi) { CHECK("C2R no GetCampActors"); return; }
+    void *fn = *(void **)mi;
+    if (!fn) { CHECK("C2R mp null"); return; }
+    void *rt = I2.method_get_return_type ? I2.method_get_return_type(mi) : NULL;
+    void *rc = (rt && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(rt) : NULL;
+    int rval = (rc && I2.class_is_valuetype) ? (I2.class_is_valuetype(rc) ? 1 : 0) : -1;
+    if (rval != 0) { CHECK("C2R ret val %d skip", rval); return; }
+
+    CHECK("C2K klass %p", g_linkerClass);
+    for (int camp = 1; camp <= 2; camp++) {
+        void *lst = ((void *(*)(void *, int, void *))fn)(g_mgr, camp, mi);
+        void *items = NULL; int size = 0;
+        if (!lst || !rd((char *)lst + 0x08, &items, sizeof(items)) || !okptr((uintptr_t)items) ||
+            !rd((char *)lst + 0x10, &size, 4) || size <= 0 || size > 64) {
+            CHECK("C2R camp%d head bad", camp);
+            continue;
+        }
+        CHECK("C2RH camp%d items %p size %d", camp, items, size);
+        unsigned char raw[32];
+        if (rd(items, raw, sizeof(raw))) {
+            char hx[8 * 8 + 1]; int q = 0; hx[0] = 0;
+            for (int i = 0; i < 32 && q < (int)sizeof(hx) - 3; i++) q += snprintf(hx + q, sizeof(hx) - q, "%02x", raw[i]);
+            CHECK("C2RB %s", hx);
+        }
+        static const int strides[3] = { 8, 16, 24 };
+        for (int si = 0; si < 3; si++) {
+            int st = strides[si];
+            for (int off = 0; off <= 8; off += 8) {
+                void *p = NULL;
+                if (!rd((char *)items + off, &p, sizeof(p)) || !okptr((uintptr_t)p)) {
+                    CHECK("C2RS s%-2d o%d p %p bad", st, off, p);
+                    continue;
+                }
+                void *k = NULL; rd(p, &k, sizeof(k));
+                unsigned int id = 0; rd((char *)p + 0x4AC, &id, 4);
+                int ok = (k == g_linkerClass) ? 1 : 0;
+                CHECK("C2RS s%-2d o%d p %p k %p id %u ok%d", st, off, p, k, id, ok);
+            }
+        }
+    }
+}
+
+// ================= v73：A0 —— LAN 日志 + 配置（UDP 发现 / TCP 单向发） =================
+// 设计约束（作业书 A0）：纯 BSD socket、不阻塞游戏线程、失败直接丢、双写落盘。
+static int    g_rtSock    = -1;
+static unsigned int g_rtSeq = 0;
+static char   g_rtIP[64]  = "";
+static int    g_rtPort    = 8765;
+static double g_rtNextDisc = 0, g_rtNextConn = 0;
+static int    g_rtDiscN   = 0;
+static unsigned int g_probeMask = 0x09;   // bit0=CE  bit3=CAMP2raw（默认只开这两条）
+static int    g_rtLevel   = 0;
+static int    g_rtFlush   = 500;
+
+static void rtDiscover(void) {
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (u < 0) return;
+    int on = 1;
+    setsockopt(u, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+    struct timeval tv = {0, 120000};                 // 120ms 收包超时（UDP，不碰游戏线程）
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in a; memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(8766);
+    a.sin_addr.s_addr = INADDR_BROADCAST;
+    (void)sendto(u, "ESPDISC", 7, 0, (struct sockaddr *)&a, sizeof(a));
+    char buf[128]; memset(buf, 0, sizeof(buf));
+    struct sockaddr_in from; socklen_t fl = sizeof(from);
+    ssize_t n = recvfrom(u, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fl);
+    if (n > 0 && strncmp(buf, "ESPIP", 5) == 0) {
+        int port = 8765, mask = -1, lvl = 0, fl2 = 500;
+        sscanf(buf + 5, "%d %d %d %d", &port, &mask, &lvl, &fl2);
+        snprintf(g_rtIP, sizeof(g_rtIP), "%s", inet_ntoa(from.sin_addr));
+        g_rtPort = port > 0 ? port : 8765;
+        if (mask >= 0) g_probeMask = (unsigned int)mask;
+        g_rtLevel = lvl; g_rtFlush = fl2;
+        if (g_rtDiscN < 3) CHECK("RT disc %s:%d mask 0x%x lvl %d", g_rtIP, g_rtPort, g_probeMask, g_rtLevel);
+        g_rtDiscN++;
+    }
+    close(u);
+}
+
+static void rtConnect(void) {
+    if (g_rtSock >= 0 || !g_rtIP[0]) return;
+    int sk = socket(AF_INET, SOCK_STREAM, 0);
+    if (sk < 0) return;
+    int on = 1;
+    setsockopt(sk, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+    fcntl(sk, F_SETFL, O_NONBLOCK);
+    struct sockaddr_in a; memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)g_rtPort);
+    a.sin_addr.s_addr = inet_addr(g_rtIP);
+    int r = connect(sk, (struct sockaddr *)&a, sizeof(a));
+    if (r < 0 && errno != EINPROGRESS) { close(sk); return; }
+    g_rtSock = sk;
+    CHECK("RT conn %s:%d", g_rtIP, g_rtPort);
+}
+
+static void rtSendLine(const char *line) {
+    if (g_rtSock < 0) return;
+    char payload[600];
+    int n = snprintf(payload, sizeof(payload), "HB %s", line);
+    if (n <= 0) return;
+    if (n > (int)sizeof(payload) - 1) n = (int)sizeof(payload) - 1;
+    char frame[12 + 600];
+    unsigned int seq = ++g_rtSeq;
+    memcpy(frame, &(uint32_t){0x45535031u}, 4);
+    memcpy(frame + 4, &seq, 4);
+    memcpy(frame + 8, &(uint32_t){ (uint32_t)n }, 4);
+    memcpy(frame + 12, payload, (size_t)n);
+    ssize_t w = send(g_rtSock, frame, 12 + (size_t)n, 0);
+    if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { close(g_rtSock); g_rtSock = -1; }
+}
+
+// 每帧调用：按时间片做发现/连接，永不阻塞
+static void rtTick(void) {
+    double now = CACurrentMediaTime();
+    if (now >= g_rtNextDisc) { g_rtNextDisc = now + 3.0; rtDiscover(); }
+    if (now >= g_rtNextConn) { g_rtNextConn = now + 2.0; rtConnect(); }
+}
+// ================= v73 A0 end =================
 
 // ================= v71：CE —— 可见性对照实验（CAMP2 的 34 个真单位） =================
 // 目的：判定「不可见」是客户端过滤还是本来就没数据。
@@ -4440,13 +4657,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v72  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v74  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v72\n"];
+    [s appendString:@"ESP v74\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -4522,10 +4739,14 @@ static void updateHud(void) {
     if (CALIB_ENABLE && PROBES_DEFAULT && t % 150 == 20 && g_unitCount >= 20 && g_calRuns < 2) { g_calRuns++; probeCalib(); }
     else if (!CALIB_ENABLE && t % 150 == 20 && g_calRuns < 1) { g_calRuns++; CHECK("CALIB disabled (v69)"); }
     if (PROBES_DEFAULT && t % 150 == 10 && g_unitCount >= 5 && g_rvaRuns < 1) { g_rvaRuns++; probeRVA(); }
+    rtTick();                                     // v73：A0 —— 发现/连接，永不阻塞
+    if ((g_probeMask & 0x08) && PROBES_DEFAULT && g_unitCount >= 5 && g_c2rRuns < 2 && t % 150 == 5) {
+        g_c2rRuns++; probeCampRaw();               // v73：CAMP2 元素布局定死
+    }
     // v72：按时间采样（3 秒/拍，10 拍 ≈ 30 秒），不受帧率影响
     {
         double nowS = CACurrentMediaTime();
-        if (PROBES_DEFAULT && g_unitCount >= 5 && g_ceRuns < 12 && nowS >= g_ceNext) {
+        if ((g_probeMask & 0x01) && PROBES_DEFAULT && g_unitCount >= 5 && g_ceRuns < 12 && nowS >= g_ceNext) {
             g_ceRuns++;
             g_ceNext = nowS + 3.0;
             probeCampExp();
@@ -4679,7 +4900,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v72 booting";
+    l.text = @"ESP v74 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -4719,7 +4940,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v72 esp (camp-exp+delta)");
+    ImGui::Text("build         : v74 esp (KHT)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
