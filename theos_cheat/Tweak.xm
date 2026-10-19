@@ -654,6 +654,7 @@ typedef void *(*t_field_get_type)(void *);          // v14：字段类型，判�
 typedef const char *(*t_type_get_name)(void *);      // v14：类型名（原作者 27 个 API 里也有这个）
 typedef void (*t_field_get_value)(void *, void *, void *);
 typedef void (*t_field_static_get_value)(void *, void *);
+typedef void (*t_runtime_class_init)(void *);
 typedef void **(*t_class_get_methods)(void *, void **);
 typedef const char *(*t_method_get_name)(void *);
 typedef void *(*t_class_get_method_from_name)(void *, const char *, int);
@@ -684,6 +685,7 @@ struct I2C {
     t_type_get_name               type_get_name;
     t_field_get_value             field_get_value;
     t_field_static_get_value      field_static_get_value;
+    t_runtime_class_init          runtime_class_init;
     t_class_get_methods           class_get_methods;
     t_method_get_name             method_get_name;
     t_class_get_method_from_name  class_get_method_from_name;
@@ -725,6 +727,7 @@ static void bindIl2cpp(void) {
     BINDF(type_get_name,              "il2cpp_type_get_name");
     BINDF(field_get_value,            "il2cpp_field_get_value");
     BINDF(field_static_get_value,     "il2cpp_field_static_get_value");
+    BINDF(runtime_class_init,         "il2cpp_runtime_class_init");
     BINDF(class_get_methods,          "il2cpp_class_get_methods");
     BINDF(method_get_name,            "il2cpp_method_get_name");
     BINDF(class_get_method_from_name, "il2cpp_class_get_method_from_name");
@@ -922,7 +925,7 @@ static void  *g_lastEntries = NULL;
 static int    g_lastCnt     = 0;
 // v35：生命周期字段（全部按名字从元数据取，取不到就是 -1，规则自动降级）
 static int g_offName = -1;      // v67f：name 偏移（按名解析，兜底 0x4B0）
-static unsigned int g_probeMask = 0x100;  // v76：默认只开 bit8（诊断包）；CE/C2R 需显式开（它们反复调 GetCampActors，会崩）
+static unsigned int g_probeMask = 0x01;   // v80：bit0=FT 诊断位（默认开，晚触发保护）；bit8=强制立即跑（默认关）
 // v71：可见性候选（-2 = 未解析，-1 = 没有这个字段）
 static int g_offVB  = -2;       // bGetVisibleComponent
 static int g_offISP = -2;       // invisibleSpecialComponents
@@ -1209,7 +1212,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v77 ====");
+    CHECK("==== dump v81 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1220,7 +1223,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v77 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v81 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -2533,27 +2536,36 @@ static void probeCampMem(void) {
 // ================= v60 end =================
 
 
-// ================= v75：V73SPEC —— 诊断包（阶段 0~4，单线程、纯点查） =================
-// 准则：宁缺毋错。任何不确定 → SKIP + reason，绝不上报猜测值。
-#define V73_FILE_MAX  (64 * 1024 * 1024)
-enum { V73_IDLE = -1, V73_S0 = 0, V73_S1 = 1, V73_S3 = 3, V73_S4 = 4, V73_S5 = 5, V73_DONE = 9 };
+// ================= v79：V73SPEC（阶段 -1 bootstrap + 3→4→0a→0b/0c→1→2） =================
+// 准则：宁缺毋错。任何一级 NULL → BOOT_FAIL/ABORT，后续全部不跑；每个读值都过 sanity。
+enum {
+    V73_IDLE = -1, V73_BOOT = -2,
+    V73_S3 = 3, V73_S4 = 4,
+    V73_S0A = 10, V73_S0B = 11, V73_S0BW = 12, V73_S0C = 13,
+    V73_S1 = 1, V73_DONE = 9
+};
 static int    g_v73State = V73_IDLE;
 static int    g_v73Cursor = -1;
 static int    g_v73Ran = 0;
-static FILE  *g_v73Fp = NULL;
-static int    g_v73FpStage = -1;
-static unsigned long g_v73Bytes = 0;
-static double g_v73T0 = 0, g_v73Next250 = 0, g_v73Next1s = 0;
 static int    g_v73Abort = 0;
+static FILE  *g_v73Fp = NULL;
+static int    g_v73FpStage = -999;
+static unsigned long g_v73Bytes = 0;
+static double g_v73T0 = 0, g_v73Next250 = 0, g_v73Next1s = 0, g_v73WaitT0 = 0;
 static char   g_v73Dir[512];
-
-// 阶段 2 的累计量
-static unsigned int  g_q2Max = 0; static unsigned long long g_q2Sum = 0; static unsigned int g_q2Nz = 0, g_q2N = 0;
-static unsigned int  g_p2Max = 0; static unsigned long long g_p2Sum = 0; static unsigned int g_p2Nz = 0, g_p2N = 0;
-static int g_q2Ok = -1, g_p2Ok = -1;          // -1 未知 0 不可用 1 可用
-
-// 阶段 1 上一拍
+static void  *g_v73Lnk = NULL, *g_v73Fsc = NULL;
+static void  *g_v73FTick = NULL;
+static int    g_v73TickStatic = -1;
+static unsigned long long g_v73V0 = 0, g_v73V1 = 0;
+static int    g_v73S1N = 0;
+static int    g_v73TickOk = 0;   // v81：CTRL1 通道是否可用（0 → S1 跳过，S2 仍跑）
 static unsigned long long g_prevRecv = 0, g_prevExec = 0;
+static unsigned int  g_q2Max = 0, g_q2Nz = 0, g_q2N = 0; static unsigned long long g_q2Sum = 0;
+static unsigned int  g_p2Max = 0, g_p2Nz = 0, g_p2N = 0; static unsigned long long g_p2Sum = 0;
+static int g_q2Ok = -1, g_p2Ok = -1;
+// v80：阶段 2 缓存（对象指针 + _size 偏移只解析一次，之后每秒只读内存）
+static void *g_q2Obj = NULL; static int g_q2Off = -1; static int g_q2Res = 0;
+static void *g_p2Obj = NULL; static int g_p2Off = -1; static int g_p2Res = 0;
 
 static void v73DocInit(void) {
     if (g_v73Dir[0]) return;
@@ -2561,77 +2573,45 @@ static void v73DocInit(void) {
     const char *doc = (dirs && [dirs count]) ? [[dirs objectAtIndex:0] UTF8String] : NULL;
     snprintf(g_v73Dir, sizeof(g_v73Dir), "%s", doc ? doc : "/tmp");
 }
-
 static int v73ReadIntFile(const char *name, int dflt) {
     v73DocInit();
-    char path[600];
-    snprintf(path, sizeof(path), "%s/%s", g_v73Dir, name);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return dflt;
-    int v = dflt;
-    if (read(fd, &v, 4) != 4) v = dflt;
-    close(fd);
-    return v;
+    char path[600]; snprintf(path, sizeof(path), "%s/%s", g_v73Dir, name);
+    int fd = open(path, O_RDONLY); if (fd < 0) return dflt;
+    int v = dflt; if (read(fd, &v, 4) != 4) v = dflt; close(fd); return v;
 }
-
 static void v73WriteIntFile(const char *name, int v) {
     v73DocInit();
-    char path[600];
-    snprintf(path, sizeof(path), "%s/%s", g_v73Dir, name);
-    int fd = open(path, O_WRONLY | O_CREAT, 0644);
-    if (fd < 0) return;
-    (void)pwrite(fd, &v, 4, 0);
-    close(fd);
+    char path[600]; snprintf(path, sizeof(path), "%s/%s", g_v73Dir, name);
+    int fd = open(path, O_WRONLY | O_CREAT, 0644); if (fd < 0) return;
+    (void)pwrite(fd, &v, 4, 0); close(fd);
 }
-
-static int v73SkipHas(int stage) {
-    v73DocInit();
-    char path[600];
-    snprintf(path, sizeof(path), "%s/v73_skip.txt", g_v73Dir);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-    char buf[512]; ssize_t n = read(fd, buf, sizeof(buf) - 1); close(fd);
-    if (n <= 0) return 0;
-    buf[n] = 0;
-    char needle[16]; snprintf(needle, sizeof(needle), "%d", stage);
-    return strstr(buf, needle) ? 1 : 0;
-}
-
 static void v73OpenStage(int stage) {
     if (g_v73Fp && g_v73FpStage == stage) return;
     if (g_v73Fp) { fflush(g_v73Fp); fclose(g_v73Fp); g_v73Fp = NULL; }
     v73DocInit();
-    char path[600];
-    snprintf(path, sizeof(path), "%s/v73_s%d.log", g_v73Dir, stage);
-    g_v73Fp = fopen(path, "a");
-    g_v73FpStage = stage;
-    v73WriteIntFile("v73_heartbeat.bin", stage);     // R8：进阶段先心跳
+    char path[600]; snprintf(path, sizeof(path), "%s/v73_s%d.log", g_v73Dir, stage);
+    g_v73Fp = fopen(path, "a"); g_v73FpStage = stage;
+    v73WriteIntFile("v73_heartbeat.bin", stage);
 }
-
-static void v73CloseStage(void) {
+static void v73CloseStage(int stage) {
     if (!g_v73Fp) return;
-    fflush(g_v73Fp);
-    fclose(g_v73Fp);
-    g_v73Fp = NULL;
-    v73WriteIntFile("v73_cursor.txt", g_v73State);   // R7：阶段完成写 cursor
+    fflush(g_v73Fp); fclose(g_v73Fp); g_v73Fp = NULL; g_v73FpStage = -999;
+    v73WriteIntFile("v73_cursor.txt", stage);
 }
-
-// 统一输出：文件 + LAN（非阻塞，失败即丢）
 static void v73Line(const char *fmt, ...) {
     char buf[256];
     va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    if (g_v73Fp && g_v73Bytes < V73_FILE_MAX) {
+    if (g_v73Fp && g_v73Bytes < (64UL * 1024 * 1024)) {
         size_t n = fprintf(g_v73Fp, "%s\n", buf);
         if (n > 0) g_v73Bytes += (unsigned long)n;
     }
     rtSendLine(buf);
-    checkLine("%s", buf);            // 同时进 HUD，方便截图
+    checkLine("%s", buf);
 }
-
 // R4：STATIC/INSTANCE 三级回退
 static int v73FieldFlags(void *fi, unsigned int *outFlags) {
     if (!fi) return 0;
-    if (I2.field_get_flags) { unsigned int f = (unsigned int)I2.field_get_flags(fi); if (outFlags) *outFlags = f; return 1; }
+    if (I2.field_get_flags) { if (outFlags) *outFlags = (unsigned int)I2.field_get_flags(fi); return 1; }
     void *ty = NULL;
     if (!rd((char *)fi + 0x08, &ty, sizeof(ty)) || !okptr((uintptr_t)ty)) return 0;
     unsigned int attrs = 0;
@@ -2639,32 +2619,106 @@ static int v73FieldFlags(void *fi, unsigned int *outFlags) {
     if (outFlags) *outFlags = attrs;
     return 1;
 }
-
-// 读静态字段（API 缺失 → 0）
-static int v73ReadStatic(void *fi, void *out, int sz) {
+static int v73ReadStaticU64(void *fi, unsigned long long *out) {
     if (!fi || !I2.field_static_get_value) return 0;
-    I2.field_static_get_value(fi, out);
+    unsigned long long v = 0;
+    I2.field_static_get_value(fi, &v);
+    *out = v; return 1;
+}
+static int v73IsStaticField(void *fi, unsigned int *flagsOut) {
+    unsigned int fl = 0;
+    if (!v73FieldFlags(fi, &fl)) return -1;
+    if (flagsOut) *flagsOut = fl;
+    return (fl & 0x10) ? 1 : 0;
+}
+
+// ---------- 阶段 -1：bootstrap（唯一允许在正控之前跑的东西） ----------
+static int v73Boot(void) {
+    v73OpenStage(-1);
+    v73Line("BOOT begin");
+    if (!I2.domain_get)         { v73Line("BOOT_FAIL reason=no_domain_get"); return 0; }
+    if (!I2.domain_get_assemblies) { v73Line("BOOT_FAIL reason=no_get_assemblies"); return 0; }
+    if (!I2.assembly_get_image) { v73Line("BOOT_FAIL reason=no_get_image"); return 0; }
+    void *dom = I2.domain_get();
+    if (!dom) { v73Line("BOOT_FAIL reason=domain_null"); return 0; }
+    size_t n = 0;
+    void **as = I2.domain_get_assemblies(dom, &n);
+    if (!as || n == 0) { v73Line("BOOT_FAIL reason=assemblies_n%zu", n); return 0; }
+    if (n > 512) n = 512;
+    int got = 0, nulls = 0;
+    for (size_t i = 0; i < n; i++) {
+        void *img = I2.assembly_get_image(as[i]);
+        if (!img) { nulls++; continue; }
+        got++;
+    }
+    if (got == 0) { v73Line("BOOT_FAIL reason=no_images nulls=%d", nulls); return 0; }
+    // 链尾自检：用我们**实测能解析**的 ActorLinker；失败再退 System.Object；
+    // 两者都失败也只 WARN —— image 表可用（got>0）已经足够证明链是通的。
+    void *probe = findCls("Assets.Scripts.GameSystem", "ActorLinker");
+    const char *how = "ActorLinker";
+    if (!probe) { probe = findCls("System", "Object"); how = "System.Object"; }
+    if (!probe) { v73Line("BOOT_WARN tail_probe_missing images=%d (continue)", got); return 1; }
+    const char *nm = I2.class_get_name ? I2.class_get_name(probe) : NULL;
+    v73Line("BOOT OK images=%d nulls=%d probe=%s %p name=%s",
+            got, nulls, how, probe, nm ? nm : "?");
     return 1;
 }
 
-// 读一个 uint64（先 static，失败再按实例 + offset，用 rd）
-static int v73ReadU64(void *fi, unsigned long long *out, int *isStatic) {
-    unsigned int flags = 0;
-    if (!v73FieldFlags(fi, &flags)) return 0;
-    int st = (flags & 0x10) ? 1 : 0;
-    if (isStatic) *isStatic = st;
-    if (st) {
-        unsigned long long v = 0;
-        if (!v73ReadStatic(fi, &v, (int)sizeof(v))) return 0;
-        *out = v;
-        return 1;
+// ---------- 阶段 3：协议字段布局（纯 metadata，无 static 读） ----------
+static void v73Stage3(void) {
+    v73OpenStage(3);
+    struct { const char *ns; const char *cls; const char *fld; } T[6] = {
+        {"CSProtocol",        "FRAME_CMD_PKG",           "bCmdType"},
+        {"CSProtocolWrapper", "FRAME_CMD_PKG",           "bCmdType"},
+        {"CSProtocol",        "FRAME_CMD_PKG",           "stCmdInfo"},
+        {"CSProtocolWrapper", "FRAME_CMD_PKG",           "stCmdInfo"},
+        {"CSProtocolWrapper", "FRAMEPKG_CMD_PLAYERMOVE", "stWorldPos"},
+        {"CSProtocolWrapper", "COMDT_INGAME_PLAYERINFO", "bObjCamp"},
+    };
+    for (int i = 0; i < 6; i++) {
+        void *c = findCls(T[i].ns, T[i].cls);
+        if (!c) { v73Line("S3 %s.%s.%s SKIP reason=class_missing", T[i].ns, T[i].cls, T[i].fld); continue; }
+        void *f = findFieldOne(c, T[i].fld);
+        if (!f) { v73Line("S3 %s.%s.%s SKIP reason=field_missing", T[i].ns, T[i].cls, T[i].fld); continue; }
+        int off = (int)I2.field_get_offset(f);
+        unsigned int fl = 0; const char *st = "UNRESOLVED";
+        if (v73FieldFlags(f, &fl)) st = (fl & 0x10) ? "STATIC" : "INSTANCE";
+        void *ty = I2.field_get_type ? I2.field_get_type(f) : NULL;
+        const char *tn = (ty && I2.type_get_name) ? I2.type_get_name(ty) : NULL;
+        v73Line("S3 %s.%s.%s off=0x%x type=%s %s%s", T[i].ns, T[i].cls, T[i].fld, off,
+                tn ? tn : "UNRESOLVED", st, (off <= 0 || off >= 0x400) ? " SUSPECT" : "");
     }
-    return 0;    // 实例字段：本包拿不到实例 → 由调用方 SKIP
+    v73CloseStage(3);
+}
+
+// ---------- 阶段 4 ----------
+static void v73Stage4(void) {
+    v73OpenStage(4);
+    static const struct { int tidx; const char *ns; const char *cls; const char *fld; } M[5] = {
+        { 21249,  "Assets.Scripts.GameSystem", "CBattleBackTrack", "framePkgList" },
+        { 21907,  "Assets.Scripts.GameSystem", "CBattleBackTrack", "cmdPkgInfoList" },
+        { 21707,  "Assets.Scripts.GameSystem", "CBattleBackTrack", "keyFrameList" },
+        { 24279,  "Assets.Scripts.Framework",  "FrameSynchr",      "commandQueue" },
+        { 102322, "Assets.Scripts.Framework",  "FrameSynchr",      "m_receiveMoveCmdtotalCount" },
+    };
+    for (int i = 0; i < 5; i++) {
+        void *c = findCls(M[i].ns, M[i].cls);
+        if (!c) { v73Line("S4 tidx=%d SKIP reason=class_missing %s" , M[i].tidx, M[i].cls); continue; }
+        void *f = findFieldOne(c, M[i].fld);
+        if (!f) { v73Line("S4 tidx=%d SKIP reason=field_missing %s", M[i].tidx, M[i].fld); continue; }
+        void *ty = I2.field_get_type ? I2.field_get_type(f) : NULL;
+        const char *tn = (ty && I2.type_get_name) ? I2.type_get_name(ty) : NULL;
+        unsigned int fl = 0; const char *st = "UNRESOLVED";
+        if (v73FieldFlags(f, &fl)) st = (fl & 0x10) ? "STATIC" : "INSTANCE";
+        v73Line("S4 tidx=%d %s.%s type=%s off=0x%x %s", M[i].tidx, M[i].cls, M[i].fld,
+                tn ? tn : "UNRESOLVED", (int)I2.field_get_offset(f), st);
+    }
+    v73CloseStage(4);
 }
 
 // R1：API 存在性自检 —— 缺哪个就打印 API_MISSING，相关探针整体 SKIP
 static int v73ApiCheck(void) {
-    struct { const char *n; void *p; } T[13] = {
+    struct { const char *n; void *p; } T[20] = {
         { "il2cpp_class_from_name",            (void *)I2.class_from_name },
         { "il2cpp_class_get_field_from_name",  (void *)I2.class_get_field_from_name },
         { "il2cpp_field_get_offset",           (void *)I2.field_get_offset },
@@ -2678,227 +2732,295 @@ static int v73ApiCheck(void) {
         { "il2cpp_class_get_parent",           (void *)I2.class_get_parent },
         { "il2cpp_field_get_name",             (void *)I2.field_get_name },
         { "il2cpp_class_get_method_from_name", (void *)I2.class_get_method_from_name },
+        { "il2cpp_image_get_name",             (void *)I2.image_get_name },
+        { "il2cpp_image_get_class_count",      (void *)I2.image_get_class_count },
+        { "il2cpp_class_get_namespace",        (void *)I2.class_get_namespace },
+        { "il2cpp_method_get_return_type",     (void *)I2.method_get_return_type },
+        { "il2cpp_method_get_param_count",     (void *)I2.method_get_param_count },
+        { "il2cpp_method_get_param",           (void *)I2.method_get_param },
+        { "il2cpp_image_get_class",            (void *)I2.image_get_class },
     };
     int ok = 0;
-    for (int i = 0; i < 13; i++) {
+    for (int i = 0; i < 20; i++) {
         if (!T[i].p) v73Line("API_MISSING %s", T[i].n);
         else ok++;
     }
-    v73Line("API ok %d/13", ok);
+    v73Line("API ok %d/20", ok);
     return ok;
 }
 
-// 阶段 0：三道正控
-static int v73Stage0(void) {
+// ---------- 阶段 0a：偏移断言（纯 metadata） ----------
+static int v73Stage0A(void) {
     v73OpenStage(0);
-    v73Line("V73 begin stage0");
     v73ApiCheck();
-    // 0-a
-    void *linker = (I2.class_from_name) ? I2.class_from_name(NULL, "Assets.Scripts.GameSystem", "ActorLinker") : NULL;
-    if (!linker) linker = g_linkerClass;
-    if (!linker) { v73Line("CTRL0 ABORT reason=linker_class_missing"); return -1; }
-    void *fi = findFieldOne(linker, "ObjID");
-    if (!fi) { v73Line("CTRL0 ABORT reason=linker_field_missing"); return -1; }
+    g_v73Lnk = findCls("Assets.Scripts.GameSystem", "ActorLinker");
+    if (!g_v73Lnk) { v73Line("CTRL0 ABORT reason=linker_class_missing"); return 0; }
+    void *fi = findFieldOne(g_v73Lnk, "ObjID");
+    if (!fi) { v73Line("CTRL0 ABORT reason=linker_field_missing"); return 0; }
     unsigned int fl = 0;
-    if (!v73FieldFlags(fi, &fl)) { v73Line("CTRL0 ABORT reason=no_flags"); return -1; }
-    if (fl & 0x10) { v73Line("CTRL0 ABORT reason=flags_probe_broken flags=0x%x", fl); return -1; }
+    if (!v73FieldFlags(fi, &fl)) { v73Line("CTRL0 ABORT reason=no_flags"); return 0; }
+    if (fl & 0x10) { v73Line("CTRL0 ABORT reason=flags_probe_broken flags=0x%x", fl); return 0; }
     int off = (int)I2.field_get_offset(fi);
-    if (off != 0x4AC) { v73Line("CTRL0 ABORT reason=offset_probe_broken off=0x%x", off); return -1; }
-    v73Line("CTRL0 OK linker.ObjID off=0x%x INSTANCE", off);
-
-    // 0-b：FrameSynchr 的 LogicFrameTick 必须是静态字段，否则拿不到实例 → 直接 ABORT
-    void *fsc = (I2.class_from_name) ? I2.class_from_name(NULL, "Assets.Scripts.Framework", "FrameSynchr") : NULL;
-    if (!fsc) { v73Line("CTRL1 ABORT reason=fsynchr_class_missing"); return -1; }
-    void *ftick = findFieldOne(fsc, "LogicFrameTick");
-    if (!ftick) { v73Line("CTRL1 ABORT reason=logicframe_field_missing"); return -1; }
-    unsigned long long v0 = 0; int st = 0;
-    if (!v73ReadU64(ftick, &v0, &st)) {
-        v73Line("CTRL1 ABORT reason=logicframe_instance_needed static=%d", st);
-        return -1;
-    }
-    if (v0 == 0 || v0 >= 1000000000ULL) { v73Line("CTRL1 ABORT reason=read_channel_dead v0=%llu", v0); return -1; }
-    v73Line("CTRL1 seed LogicFrameTick v0=%llu", v0);
-    g_prevRecv = v0;                      // 借用：0-b 的第二次读数在 250ms 采样里复核
-
-    // 0-c：commandQueue 的可判定性
-    void *fq = findFieldOne(fsc, "commandQueue");
-    if (!fq) { v73Line("CTRL2 commandQueue NOT_FOUND"); }
-    else {
-        unsigned int qf = 0;
-        if (v73FieldFlags(fq, &qf)) {
-            v73Line("CTRL2 commandQueue off=0x%x flags=0x%x %s",
-                    (int)I2.field_get_offset(fq), qf, (qf & 0x10) ? "STATIC" : "INSTANCE");
-        } else {
-            v73Line("CTRL2 commandQueue off=0x%x flags=UNRESOLVED", (int)I2.field_get_offset(fq));
+    if (off != 0x4AC) v73Line("CTRL0 WARN off=0x%x expect=0x4ac (continue)", off);
+    else              v73Line("CTRL0 OK linker.ObjID off=0x%x INSTANCE", off);
+    g_v73Fsc = findCls("Assets.Scripts.Framework", "FrameSynchr");
+    if (!g_v73Fsc) { v73Line("CTRL1 ABORT reason=fsynchr_class_missing"); return 0; }
+    g_v73FTick = findFieldOne(g_v73Fsc, "LogicFrameTick");
+    if (!g_v73FTick) { v73Line("CTRL1 ABORT reason=logicframe_field_missing"); return 0; }
+    // v81：先把三个计数器的 STATIC|INSTANCE 打出来 —— 这三行就是 v81 的全部依据
+    {
+        struct { const char *n; } P3[3] = {
+            { "LogicFrameTick" }, { "m_receiveMoveCmdtotalCount" }, { "m_ExecMoveCmdTotalCount" }
+        };
+        for (int i = 0; i < 3; i++) {
+            void *pf = (i == 0) ? g_v73FTick : findFieldOne(g_v73Fsc, P3[i].n);
+            if (!pf) { v73Line("CTRL1 probe %s NOT_FOUND", P3[i].n); continue; }
+            unsigned int fl = 0; int st = v73IsStaticField(pf, &fl);
+            v73Line("CTRL1 probe %s off=0x%x flags=0x%x %s", P3[i].n,
+                    (int)I2.field_get_offset(pf), fl,
+                    st == 1 ? "STATIC" : (st == 0 ? "INSTANCE" : "UNRESOLVED"));
         }
     }
-    return 0;
+    g_v73TickStatic = v73IsStaticField(g_v73FTick, NULL);
+    if (g_v73TickStatic != 1) {
+        // v81：不再 ABORT —— 字段读不到 ≠ 读取机制坏了，S3/S4 已经拿到了
+        v73Line("CTRL1 SKIP reason=instance_not_reachable static=%d", g_v73TickStatic);
+        g_v73TickOk = 0;
+        return 1;
+    }
+    g_v73TickOk = 1;
+    v73Line("CTRL1 pending first static read (stage 0b)");
+    return 1;
 }
 
-// 阶段 1 采样：FrameSynchr 四个计数器
+// ---------- 阶段 0b：首次 static 读 + 1 秒后复读 ----------
+static int v73Stage0B(void) {
+    // v80：先确保类的 static_fields 已分配，再读静态字段（否则 NULL+offset 写崩）
+    if (!I2.runtime_class_init) {
+        v73Line("WARN class_init_unavailable risk=uninitialized_static");
+    } else if (!g_v73Fsc) {
+        v73Line("CTRL1 class_init SKIP reason=no_class");
+    } else {
+        I2.runtime_class_init(g_v73Fsc);
+        v73Line("CTRL1 class_init ok");
+    }
+    if (!v73ReadStaticU64(g_v73FTick, &g_v73V0)) {
+        v73Line("CTRL1 ABORT reason=static_read_failed"); return 0;
+    }
+    if (g_v73V0 == 0 || g_v73V0 >= 1000000000ULL) {
+        v73Line("CTRL1 ABORT reason=read_channel_dead v0=%llu", g_v73V0); return 0;
+    }
+    v73Line("CTRL1 v0=%llu (wait 1s)", g_v73V0);
+    return 1;
+}
+static int v73Stage0BRecheck(void) {
+    if (!v73ReadStaticU64(g_v73FTick, &g_v73V1)) {
+        v73Line("CTRL1 ABORT reason=static_reread_failed"); return 0;
+    }
+    if (!(g_v73V1 > g_v73V0)) {
+        v73Line("CTRL1 ABORT reason=read_channel_dead v0=%llu v1=%llu", g_v73V0, g_v73V1);
+        return 0;
+    }
+    v73Line("CTRL1 OK LogicFrameTick %llu -> %llu delta=%llu", g_v73V0, g_v73V1, g_v73V1 - g_v73V0);
+    g_prevRecv = g_v73V1;
+    return 1;
+}
+
+// ---------- 阶段 0c：commandQueue 可判定性 ----------
+static void v73Stage0C(void) {
+    void *fq = findFieldOne(g_v73Fsc, "commandQueue");
+    if (!fq) { v73Line("CTRL2 commandQueue NOT_FOUND"); return; }
+    unsigned int fl = 0;
+    int st = v73IsStaticField(fq, &fl);
+    v73Line("CTRL2 commandQueue off=0x%x flags=0x%x %s",
+            (int)I2.field_get_offset(fq), fl,
+            st == 1 ? "STATIC" : (st == 0 ? "INSTANCE" : "UNRESOLVED"));
+}
+
+// ---------- 阶段 1 / 2 ----------
 static void v73S1Sample(void) {
-    void *fsc = (I2.class_from_name) ? I2.class_from_name(NULL, "Assets.Scripts.Framework", "FrameSynchr") : NULL;
-    if (!fsc) { v73Line("S1 SKIP reason=fsynchr_class_missing"); return; }
-    struct { const char *name; } flds[2] = {
-        { "m_receiveMoveCmdtotalCount" }, { "m_ExecMoveCmdTotalCount" }
-    };
-    unsigned long long v[2] = {0, 0}; int ok[2] = {0, 0}; int st = 0;
-    for (int i = 0; i < 2; i++) {
-        void *f = findFieldOne(fsc, flds[i].name);
-        if (!f) continue;
-        ok[i] = v73ReadU64(f, &v[i], &st);
-    }
-    if (!ok[0] && !ok[1]) { v73Line("S1 SKIP reason=no_static_counters"); return; }
-    for (int i = 0; i < 2; i++) {
-        if (!ok[i]) continue;
-        if (v[i] >= 100000000ULL) { v73Line("S1 SUSPECT %s=%llu", flds[i].name, v[i]); ok[i] = 0; }
-    }
-    if (ok[0] && v[0] < g_prevRecv) { v73Line("S1 SUSPECT recv backstep %llu < %llu", v[0], g_prevRecv); }
-    if (ok[0]) g_prevRecv = v[0];
-    if (ok[1]) g_prevExec = v[1];
-    v73Line("S1 t=%u recv=%llu exec=%llu", g_frameStamp,
-            ok[0] ? g_prevRecv : 0ULL, ok[1] ? g_prevExec : 0ULL);
+    unsigned long long v = 0;
+    if (!v73ReadStaticU64(g_v73FTick, &v)) { v73Line("S1 SKIP reason=static_read_failed"); return; }
+    if (v >= 1000000000ULL) { v73Line("S1 SUSPECT tick=%llu", v); return; }
+    if (v < g_prevRecv) { v73Line("S1 SUSPECT backstep %llu < %llu", v, g_prevRecv); g_prevRecv = v; return; }
+    unsigned long long d = v - g_prevRecv;
+    g_prevRecv = v;
+    v73Line("S1 t=%u tick=%llu d=%llu", g_frameStamp, v, d);
+    g_v73S1N++;
 }
-
-// 阶段 2：拿容器 _size（纯 API；失败回退 0x10 并打标）
-static int v73ContainerSize(void *cls, const char *fname, void *clsHint, int *outSize, const char **how) {
-    if (!cls) { *how = "no_class"; return 0; }
-    void *f = findFieldOne(cls, fname);
+static int v73ContainerSize(const char *ns, const char *cls, const char *fname, int *outSize, const char **how) {
+    void *c = findCls(ns, cls);
+    if (!c) { *how = "no_class"; return 0; }
+    void *f = findFieldOne(c, fname);
     if (!f) { *how = "field_missing"; return 0; }
     unsigned int fl = 0;
-    if (!v73FieldFlags(f, &fl)) { *how = "no_flags"; return 0; }
-    if (!(fl & 0x10)) { *how = "instance_field"; return 0; }        // 没实例 → SKIP
+    int st = v73IsStaticField(f, &fl);
+    if (st != 1) { *how = (st == 0) ? "instance_field" : "no_flags"; return 0; }
     void *obj = NULL;
-    if (!v73ReadStatic(f, &obj, (int)sizeof(obj)) || !okptr((uintptr_t)obj)) { *how = "static_value_bad"; return 0; }
+    I2.field_static_get_value(f, &obj);
+    if (!okptr((uintptr_t)obj)) { *how = "static_value_bad"; return 0; }
     void *ty = I2.field_get_type ? I2.field_get_type(f) : NULL;
     void *k2 = (ty && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(ty) : NULL;
     if (!k2) { *how = "no_type_class"; return 0; }
     void *fs = findFieldOne(k2, "_size");
-    int off = -1;
-    if (fs) off = (int)I2.field_get_offset(fs);
-    if (off <= 0 || off >= 0x100) {
-        off = 0x10;
-        *how = "FALLBACK off_size=0x10";
-    } else {
-        *how = "api";
-    }
+    int off = fs ? (int)I2.field_get_offset(fs) : -1;
+    if (off <= 0 || off >= 0x100) { off = 0x10; *how = "FALLBACK off_size=0x10"; }
+    else *how = "api";
     int sz = 0;
     if (!rd((char *)obj + off, &sz, 4)) { *how = "read_fail"; return 0; }
     if (sz < 0 || sz >= 10000) { *how = "sanity"; return 0; }
-    *outSize = sz;
+    *outSize = sz; return 1;
+}
+// 只解析一次：对象指针 + _size 偏移
+static int v73ResolveContainer(const char *ns, const char *cls, const char *fname,
+                               void **objOut, int *offOut, const char **how) {
+    void *c = findCls(ns, cls);
+    if (!c) { *how = "no_class"; return 0; }
+    void *f = findFieldOne(c, fname);
+    if (!f) { *how = "field_missing"; return 0; }
+    unsigned int fl = 0;
+    int st = v73IsStaticField(f, &fl);
+    if (st != 1) { *how = (st == 0) ? "instance_field" : "no_flags"; return 0; }
+    void *obj = NULL;
+    if (!I2.field_static_get_value) { *how = "no_static_get"; return 0; }
+    I2.field_static_get_value(f, &obj);
+    if (!okptr((uintptr_t)obj)) { *how = "static_value_bad"; return 0; }
+    void *ty = I2.field_get_type ? I2.field_get_type(f) : NULL;
+    void *k2 = (ty && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(ty) : NULL;
+    if (!k2) { *how = "no_type_class"; return 0; }
+    void *fs = findFieldOne(k2, "_size");
+    int off = fs ? (int)I2.field_get_offset(fs) : -1;
+    if (off <= 0 || off >= 0x100) { off = 0x10; *how = "FALLBACK off_size=0x10"; }
+    else *how = "api";
+    *objOut = obj; *offOut = off;
     return 1;
 }
 
 static void v73S2Second(void) {
     int sz = 0; const char *how = "?";
     if (g_q2Ok != 0) {
-        void *fsc = (I2.class_from_name) ? I2.class_from_name(NULL, "Assets.Scripts.Framework", "FrameSynchr") : NULL;
-        if (v73ContainerSize(fsc, "commandQueue", NULL, &sz, &how)) {
-            g_q2Ok = 1; g_q2N++; g_q2Sum += (unsigned)sz;
-            if ((unsigned)sz > g_q2Max) g_q2Max = (unsigned)sz;
-            if (sz) g_q2Nz++;
-        } else {
-            g_q2Ok = 0;
-            v73Line("S2 SKIP commandQueue reason=%s", how);
+        if (!g_q2Res) {
+            g_q2Res = 1;
+            if (!v73ResolveContainer("Assets.Scripts.Framework", "FrameSynchr", "commandQueue",
+                                     &g_q2Obj, &g_q2Off, &how)) {
+                g_q2Ok = 0; v73Line("S2 SKIP commandQueue reason=%s", how);
+            } else { g_q2Ok = 1; v73Line("S2 resolved commandQueue obj=%p off=0x%x (%s)", g_q2Obj, g_q2Off, how); }
+        }
+        if (g_q2Ok == 1) {
+            if (rd((char *)g_q2Obj + g_q2Off, &sz, 4) && sz >= 0 && sz < 10000) {
+                g_q2N++; g_q2Sum += (unsigned)sz;
+                if ((unsigned)sz > g_q2Max) g_q2Max = (unsigned)sz;
+                if (sz) g_q2Nz++;
+            } else { g_q2Ok = 0; v73Line("S2 SKIP commandQueue reason=read_or_sanity"); }
         }
     }
     if (g_p2Ok != 0) {
-        void *btr = (I2.class_from_name) ? I2.class_from_name(NULL, "Assets.Scripts.GameSystem", "CBattleBackTrack") : NULL;
-        if (v73ContainerSize(btr, "framePkgList", NULL, &sz, &how)) {
-            g_p2Ok = 1; g_p2N++; g_p2Sum += (unsigned)sz;
-            if ((unsigned)sz > g_p2Max) g_p2Max = (unsigned)sz;
-            if (sz) g_p2Nz++;
-        } else {
-            g_p2Ok = 0;
-            v73Line("S2 SKIP framePkgList reason=%s", how);
+        if (!g_p2Res) {
+            g_p2Res = 1;
+            if (!v73ResolveContainer("Assets.Scripts.GameSystem", "CBattleBackTrack", "framePkgList",
+                                     &g_p2Obj, &g_p2Off, &how)) {
+                g_p2Ok = 0; v73Line("S2 SKIP framePkgList reason=%s", how);
+            } else { g_p2Ok = 1; v73Line("S2 resolved framePkgList obj=%p off=0x%x (%s)", g_p2Obj, g_p2Off, how); }
+        }
+        if (g_p2Ok == 1) {
+            if (rd((char *)g_p2Obj + g_p2Off, &sz, 4) && sz >= 0 && sz < 10000) {
+                g_p2N++; g_p2Sum += (unsigned)sz;
+                if ((unsigned)sz > g_p2Max) g_p2Max = (unsigned)sz;
+                if (sz) g_p2Nz++;
+            } else { g_p2Ok = 0; v73Line("S2 SKIP framePkgList reason=read_or_sanity"); }
         }
     }
     v73Line("S2 sec=%u queue_max=%u queue_nz=%u queue_sum=%llu queue_n=%u pkg_max=%u pkg_nz=%u pkg_sum=%llu pkg_n=%u",
-            (unsigned)((CACurrentMediaTime() - g_v73T0)), g_q2Max, g_q2Nz, g_q2Sum, g_q2N,
+            (unsigned)(CACurrentMediaTime() - g_v73T0), g_q2Max, g_q2Nz, g_q2Sum, g_q2N,
             g_p2Max, g_p2Nz, g_p2Sum, g_p2N);
 }
 
-// 阶段 3：协议字段布局
-static void v73Stage3(void) {
-    v73OpenStage(3);
-    struct { const char *ns; const char *cls; const char *fld; } T[6] = {
-        {"CSProtocol",        "FRAME_CMD_PKG",           "bCmdType"},
-        {"CSProtocolWrapper", "FRAME_CMD_PKG",           "bCmdType"},
-        {"CSProtocol",        "FRAME_CMD_PKG",           "stCmdInfo"},
-        {"CSProtocolWrapper", "FRAME_CMD_PKG",           "stCmdInfo"},
-        {"CSProtocolWrapper", "FRAMEPKG_CMD_PLAYERMOVE", "stWorldPos"},
-        {"CSProtocolWrapper", "COMDT_INGAME_PLAYERINFO", "bObjCamp"},
-    };
-    for (int i = 0; i < 6; i++) {
-        void *c = (I2.class_from_name) ? I2.class_from_name(NULL, T[i].ns, T[i].cls) : NULL;
-        if (!c) { v73Line("S3 %s.%s.%s SKIP reason=class_missing", T[i].ns, T[i].cls, T[i].fld); continue; }
-        void *f = findFieldOne(c, T[i].fld);
-        if (!f) { v73Line("S3 %s.%s.%s SKIP reason=field_missing", T[i].ns, T[i].cls, T[i].fld); continue; }
-        int off = (int)I2.field_get_offset(f);
-        unsigned int fl = 0; const char *st = "UNRESOLVED";
-        if (v73FieldFlags(f, &fl)) st = (fl & 0x10) ? "STATIC" : "INSTANCE";
-        void *ty = I2.field_get_type ? I2.field_get_type(f) : NULL;
-        const char *tn = (ty && I2.type_get_name) ? I2.type_get_name(ty) : NULL;
-        int bad = (off <= 0 || off >= 0x400) ? 1 : 0;
-        v73Line("S3 %s.%s.%s off=0x%x type=%s %s%s", T[i].ns, T[i].cls, T[i].fld, off,
-                tn ? tn : "UNRESOLVED", st, bad ? " SUSPECT" : "");
-    }
+static void v73StateNext0C(void) {
+    v73Stage0C(); v73CloseStage(0);
+    g_v73T0 = CACurrentMediaTime(); g_v73Next250 = g_v73T0; g_v73Next1s = g_v73T0;
+    g_v73State = V73_S1;
+    v73OpenStage(1);
+    v73Line("V73 stage2 only (20s, S1 skipped)");
 }
 
-// 阶段 4：tidx 类型名（本包没有 tidx→字段映射 → 按准则 SKIP）
-static void v73Stage4(void) {
-    v73OpenStage(4);
-    int t[5] = { 21249, 21907, 21707, 24279, 102322 };
-    for (int i = 0; i < 5; i++) v73Line("S4 tidx=%d SKIP reason=no_tidx_map", t[i]);
-}
-
-// 驱动（每帧调用）：一次只推进一个阶段，不阻塞
+// ---------- 驱动 ----------
 static void v73Tick(void) {
     if (g_v73Ran) return;
     if (!g_inMatch) return;
     if (g_v73State == V73_IDLE) {
         int force = (g_probeMask & 0x100) ? 1 : 0;
-        if (g_frameStamp < 600 && !force) return;
+        int ft    = (g_probeMask & 0x01) ? 1 : 0;
+        if (force && g_frameStamp < 600) {            // v81：配置写错也不许加载期动手
+            static int warned = 0;
+            if (!warned) { warned = 1; CHECK("WARN force_ignored_before_600"); rtSendLine("WARN force_ignored_before_600"); }
+            force = 0;
+        }
+        if (!ft && !force) return;                    // v80：诊断位未开且没强制 → 不跑
+        if (g_unitCount < 1) return;                  // v80：训练营也满足（原来 u>=40 会永远不触发）
+        if (g_frameStamp < 600 && !force) return;     // 晚触发；强制只能显式配置
         g_v73Cursor = v73ReadIntFile("v73_cursor.txt", -1);
         int hb = v73ReadIntFile("v73_heartbeat.bin", -1);
-        if (hb > g_v73Cursor && hb >= 0) {          // R8：上次崩在那个阶段 → 记 skip
-            v73DocInit();
-            char path[600];
+        if (hb > g_v73Cursor && hb >= 0) {
+            v73DocInit(); char path[600];
             snprintf(path, sizeof(path), "%s/v73_skip.txt", g_v73Dir);
             int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (fd >= 0) { char b[16]; int n = snprintf(b, sizeof(b), "%d\n", hb); (void)write(fd, b, (size_t)n); close(fd); }
         }
-        v73Line("V73 start cursor=%d hb=%d force=%d", g_v73Cursor, hb, force);
-        g_v73State = V73_S0;
-    }
-
-    if (g_v73State == V73_S0) {
-        int r = v73Stage0();
-        if (r != 0) { g_v73Abort = 1; v73CloseStage(); g_v73State = V73_DONE; g_v73Ran = 1; v73Line("V73 ABORT at stage0"); return; }
+        g_v73State = V73_BOOT;
         g_v73T0 = CACurrentMediaTime();
-        g_v73Next250 = g_v73T0;
-        g_v73Next1s = g_v73T0;
+        return;
+    }
+    if (g_v73State == V73_BOOT) {
+        if (!v73Boot()) { g_v73Abort = 1; g_v73Ran = 1; g_v73State = V73_DONE; v73Line("V73 ABORT at boot"); return; }
+        g_v73State = V73_S3;
+        return;
+    }
+    if (g_v73State == V73_S3) { v73Stage3(); g_v73State = V73_S4; return; }
+    if (g_v73State == V73_S4) { v73Stage4(); g_v73State = V73_S0A; return; }
+    if (g_v73State == V73_S0A) {
+        if (!v73Stage0A()) { g_v73Abort = 1; g_v73Ran = 1; g_v73State = V73_DONE; v73Line("V73 ABORT at stage0a"); return; }
+        g_v73State = g_v73TickOk ? V73_S0B : V73_S0C;      // v81：读不到就走 0c
+        return;
+    }
+    if (g_v73State == V73_S0C) {
+        v73Stage0C(); v73CloseStage(0);
+        g_v73T0 = CACurrentMediaTime(); g_v73Next250 = g_v73T0; g_v73Next1s = g_v73T0;
+        g_v73State = V73_S1;
+        v73OpenStage(1);
+        v73Line("V73 stage2 only (20s, S1 skipped)");
+        return;
+    }
+    if (g_v73State == V73_S0B) {
+        if (!v73Stage0B()) { g_v73TickOk = 0; v73StateNext0C(); return; }
+        g_v73WaitT0 = CACurrentMediaTime();
+        g_v73State = V73_S0BW;
+        return;
+    }
+    if (g_v73State == V73_S0BW) {
+        if (CACurrentMediaTime() - g_v73WaitT0 < 1.0) return;
+        if (!v73Stage0BRecheck()) { g_v73TickOk = 0; v73Line("V73 stage1 SKIP reason=channel_dead"); v73StateNext0C(); return; }
+        v73Stage0C();
+        v73CloseStage(0);
+        g_v73T0 = CACurrentMediaTime(); g_v73Next250 = g_v73T0; g_v73Next1s = g_v73T0;
         g_v73State = V73_S1;
         v73OpenStage(1);
         v73Line("V73 stage1 start (60s)");
         return;
     }
-
     if (g_v73State == V73_S1) {
         double now = CACurrentMediaTime();
-        if (now >= g_v73Next250) { g_v73Next250 = now + 0.25; v73S1Sample(); }
-        if (now >= g_v73Next1s)  { g_v73Next1s  = now + 1.0;  v73S2Second(); }
-        if (now - g_v73T0 >= 60.0) {
-            v73CloseStage();
-            g_v73State = V73_S3;
-            v73Line("V73 stage1/2 done");
+        if (g_v73TickOk && now >= g_v73Next250) { g_v73Next250 = now + 0.25; v73S1Sample(); }
+        if (now >= g_v73Next1s)  { g_v73Next1s = now + 1.0; v73S2Second(); }
+        if (now - g_v73T0 >= (g_v73TickOk ? 60.0 : 20.0)) {
+            v73CloseStage(1);
+            g_v73State = V73_DONE; g_v73Ran = 1;
+            v73Line("V73 DONE ticks=%d", g_v73S1N);
         }
-        return;
     }
-    if (g_v73State == V73_S3) { v73Stage3(); v73CloseStage(); g_v73State = V73_S4; return; }
-    if (g_v73State == V73_S4) { v73Stage4(); v73CloseStage(); g_v73State = V73_DONE; g_v73Ran = 1; v73Line("V73 DONE"); return; }
 }
-// ================= v75 V73SPEC end =================
+// ================= v79 V73SPEC end =================
+
+
 
 // ================= v74：KHT —— klass → name 哈希表 =================
 // 规矩落地：任何 klass 指针先查表；表内安全命名，表外一律 unknown，不调 class_get_name。
@@ -3086,6 +3208,7 @@ static void rtConnect(void) {
     if (r < 0 && errno != EINPROGRESS) { close(sk); return; }
     g_rtSock = sk;
     CHECK("RT conn %s:%d", g_rtIP, g_rtPort);
+    rtSendLine("boot v80 hb");        // v80：一连上就先发一条，登录界面就能确认通路
 }
 
 static void rtSendLine(const char *line) {
@@ -5077,13 +5200,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v77  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v81  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v77\n"];
+    [s appendString:@"ESP v81\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -5320,7 +5443,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v77 booting";
+    l.text = @"ESP v81 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -5360,7 +5483,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v77 esp (C2R2)");
+    ImGui::Text("build         : v81 esp (final)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
