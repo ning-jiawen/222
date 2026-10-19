@@ -922,7 +922,7 @@ static void  *g_lastEntries = NULL;
 static int    g_lastCnt     = 0;
 // v35：生命周期字段（全部按名字从元数据取，取不到就是 -1，规则自动降级）
 static int g_offName = -1;      // v67f：name 偏移（按名解析，兜底 0x4B0）
-static unsigned int g_probeMask = 0x09;   // v73：bit0=CE bit3=CAMP2raw bit8=强制跑诊断包
+static unsigned int g_probeMask = 0x100;  // v76：默认只开 bit8（诊断包）；CE/C2R 需显式开（它们反复调 GetCampActors，会崩）
 // v71：可见性候选（-2 = 未解析，-1 = 没有这个字段）
 static int g_offVB  = -2;       // bGetVisibleComponent
 static int g_offISP = -2;       // invisibleSpecialComponents
@@ -1209,7 +1209,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v75 ====");
+    CHECK("==== dump v77 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1220,7 +1220,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v75 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v77 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -3002,19 +3002,30 @@ static void probeCampRaw(void) {
             for (int i = 0; i < 32 && q < (int)sizeof(hx) - 3; i++) q += snprintf(hx + q, sizeof(hx) - q, "%02x", raw[i]);
             CHECK("C2RB %s", hx);
         }
-        static const int strides[3] = { 8, 16, 24 };
-        for (int si = 0; si < 3; si++) {
+        // v77：先看前 8 个 u32 —— 若这些数都落在 1..65535，元素就是「id 数组」而不是句柄数组
+        {
+            unsigned int w[8] = {0};
+            if (rd(items, w, sizeof(w))) {
+                CHECK("C2RW %u %u %u %u %u %u %u %u", w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            }
+        }
+        static const int strides[6] = { 4, 8, 12, 16, 20, 24 };
+        for (int si = 0; si < 6; si++) {
             int st = strides[si];
             for (int off = 0; off <= 8; off += 8) {
                 void *p = NULL;
                 if (!rd((char *)items + off, &p, sizeof(p)) || !okptr((uintptr_t)p)) {
-                    CHECK("C2RS s%-2d o%d p %p bad", st, off, p);
+                    if (st <= 4) {                       // stride 4 时元素本身是 u32
+                        unsigned int u = 0;
+                        if (rd((char *)items + off, &u, 4)) CHECK("C2RU s%-2d o%d u %u", st, off, u);
+                    }
                     continue;
                 }
                 void *k = NULL; rd(p, &k, sizeof(k));
                 unsigned int id = 0; rd((char *)p + 0x4AC, &id, 4);
                 int ok = (k == g_linkerClass) ? 1 : 0;
                 CHECK("C2RS s%-2d o%d p %p k %p id %u ok%d", st, off, p, k, id, ok);
+                if (ok) break;
             }
         }
     }
@@ -3024,7 +3035,8 @@ static void probeCampRaw(void) {
 // 设计约束（作业书 A0）：纯 BSD socket、不阻塞游戏线程、失败直接丢、双写落盘。
 static int    g_rtSock    = -1;
 static unsigned int g_rtSeq = 0;
-static char   g_rtIP[64]  = "";
+static char   g_rtIP[64]  = "192.168.0.101";   // v76：编译期固定 PC IP，UDP 发现成功则覆盖
+static int    g_rtFixedTried = 0;
 static int    g_rtPort    = 8765;
 static double g_rtNextDisc = 0, g_rtNextConn = 0;
 static int    g_rtDiscN   = 0;
@@ -3107,11 +3119,25 @@ static void rtTick(void) {
 //   用 GetCampActors 拿到两个阵营的成员名单（PoolObjHandle 列表），逐个解到 ActorLinker，
 //   只打印**敌方阵营**的 position 与 5 个可见性候选；每 5 秒一拍，共 8 拍 ——
 //   敌人进视野 / 出视野时，哪一列在变，一眼就看出来。
+// v77：静态字段的 offset 是 static_fields 索引，当实例偏移读必错（v75 里 is=1 就是它）
+static int offIfInstance(void *cls, const char *name) {
+    void *f = findField(cls, name);
+    if (!f) return -1;
+    unsigned int fl = 0;
+    if (I2.field_get_flags) {
+        fl = (unsigned int)I2.field_get_flags(f);
+        if (fl & 0x10) return -2;                       // STATIC → 标记 -2，不按实例读
+    }
+    int off = (int)I2.field_get_offset(f);
+    if (off <= 0 || off >= 0x2000) return -1;
+    return off;
+}
+
 static void resolveVisOffsets(void) {
     if (!g_linkerClass) return;
-    if (g_offVB  == -2) { void *f = findField(g_linkerClass, "bGetVisibleComponent");      g_offVB  = f ? (int)I2.field_get_offset(f) : -1; }
-    if (g_offISP == -2) { void *f = findField(g_linkerClass, "invisibleSpecialComponents"); g_offISP = f ? (int)I2.field_get_offset(f) : -1; }
-    if (g_offHUD == -2) { void *f = findField(g_linkerClass, "hudDisguiseType");            g_offHUD = f ? (int)I2.field_get_offset(f) : -1; }
+    if (g_offVB  == -2) g_offVB  = offIfInstance(g_linkerClass, "bGetVisibleComponent");
+    if (g_offISP == -2) g_offISP = offIfInstance(g_linkerClass, "invisibleSpecialComponents");
+    if (g_offHUD == -2) g_offHUD = offIfInstance(g_linkerClass, "hudDisguiseType");
 }
 
 // 从 TinyValueList 取 (items, size)：items@+0x08, size@+0x10（v60 已验证）
@@ -3194,9 +3220,9 @@ static void probeCampExp(void) {
             unsigned char mv = 1, lv = 1, vb = 0, isp = 0, hud = 0;
             if (g_offMeshVis  >= 0) { mv = 0; rd((char *)o + g_offMeshVis,  &mv, 1); }
             if (g_offLogicVis >= 0) { lv = 0; rd((char *)o + g_offLogicVis, &lv, 1); }
-            if (g_offVB  >= 0) rd((char *)o + g_offVB,  &vb,  1);
-            if (g_offISP >= 0) rd((char *)o + g_offISP, &isp, 1);
-            if (g_offHUD >= 0) rd((char *)o + g_offHUD, &hud, 1);
+            if (g_offVB  >  0) rd((char *)o + g_offVB,  &vb,  1);
+            if (g_offISP >  0) rd((char *)o + g_offISP, &isp, 1);
+            if (g_offHUD >  0) rd((char *)o + g_offHUD, &hud, 1);
             if (big) bigTot++;
             if (mv) visM++;
             if (lv) visL++;
@@ -4705,6 +4731,10 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         g_myCamp = 0; g_enemyN = -1;
         g_ceNext = 0; g_ceRuns = 0;      // v72：新对局重新开始采样窗口
     }
+    // v76：诊断包与 LAN 心跳必须在所有 early return 之前跑 ——
+    // v75 把它们放在 g_hideAll 之后，按过 ⊘ 就再也不会启动（实测就是这样丢的）。
+    rtTick();
+    v73Tick();
     if (g_hideAll) {                               // v48：⊘ 只显示 HUD，不画任何框
         g_boxDrawn = 0;
         return;
@@ -5047,13 +5077,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v75  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v77  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v75\n"];
+    [s appendString:@"ESP v77\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -5129,8 +5159,7 @@ static void updateHud(void) {
     if (CALIB_ENABLE && PROBES_DEFAULT && t % 150 == 20 && g_unitCount >= 20 && g_calRuns < 2) { g_calRuns++; probeCalib(); }
     else if (!CALIB_ENABLE && t % 150 == 20 && g_calRuns < 1) { g_calRuns++; CHECK("CALIB disabled (v69)"); }
     if (PROBES_DEFAULT && t % 150 == 10 && g_unitCount >= 5 && g_rvaRuns < 1) { g_rvaRuns++; probeRVA(); }
-    rtTick();                                     // v73：A0 —— 发现/连接，永不阻塞
-    v73Tick();                                    // v75：诊断包状态机（单线程、每帧推进一格）
+    // v76：这两个已前移到渲染函数最开头（g_hideAll 之前），此处不再调用
     if ((g_probeMask & 0x08) && PROBES_DEFAULT && g_unitCount >= 5 && g_c2rRuns < 2 && t % 150 == 5) {
         g_c2rRuns++; probeCampRaw();               // v73：CAMP2 元素布局定死
     }
@@ -5291,7 +5320,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v75 booting";
+    l.text = @"ESP v77 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -5331,7 +5360,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v75 esp (V73SPEC)");
+    ImGui::Text("build         : v77 esp (C2R2)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
