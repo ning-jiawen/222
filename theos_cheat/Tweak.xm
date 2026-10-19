@@ -873,6 +873,9 @@ typedef struct {
     int   movedOnce;    // 曾经动过（v37：frozen 的前提）
     int   stillCnt;     // 连续不动的次数
     int   frz;          // 已经计过 frozen（按唯一英雄计，不按采样次数累加）
+    int   evzCnt;       // v55：这个单位被计入「唯一单位」过没
+    int   evzMoved;     // v55：它曾在 mv0（不可见）时发生过位移
+    int   lastMv;       // v56：上一次采样时的 mv（用来排除「刚走出视野」那一次）
 } FogEnt;
 static FogEnt g_fog[16];
 static int    g_fogRuns = 0;          // 探针跑过几次（最多 24 次 = 2 分钟）
@@ -919,7 +922,7 @@ static int ciEq(const char *a, const char *b) {
 // v48/v49 用枚举做「忽略大小写 + k__BackingField」回退，这条路径在 v47 里不存在，
 // 而 v48 起开始闪退（枚举 API 在泛型/接口类上有踩到 il2cpp 内部断言的风险）。
 // 这里改成显式候选名：精确名 / 首字母大写 / 首字母小写 / <Name>k__BackingField。
-static void *findField(void *cls, const char *name) {
+static void *findFieldOne(void *cls, const char *name) {
     if (!cls || !I2.class_get_field_from_name) return NULL;
     void *f = I2.class_get_field_from_name(cls, name);
     if (f) return f;
@@ -940,14 +943,32 @@ static void *findField(void *cls, const char *name) {
     snprintf(bf, sizeof(bf), "<%s>k__BackingField", name);
     snprintf(cand[n++], 96, "%s", bf);
 
-    for (int i = 0; i < n; i++) {
-        if (i == 0) continue;                 // 第一个就是精确名，已经试过
+    for (int i = 1; i < n; i++) {              // 第一个就是精确名，已经试过
         f = I2.class_get_field_from_name(cls, cand[i]);
+        if (f) return f;
+    }
+    return NULL;
+}
+
+// v55：class_get_field_from_name 不遍历父类 —— IsEmptyActor / IsMirrorActor 这类继承字段
+// 之前一直是 -1，很可能就是这个原因。这里沿 class_get_parent 往上找最多 5 层。
+static void *findField(void *cls, const char *name) {
+    if (!cls) return NULL;
+    void *c = cls;
+    for (int depth = 0; depth < 5 && c; depth++) {
+        void *f = findFieldOne(c, name);
         if (f) {
-            static int s_log = 0;
-            if (s_log < 6) { s_log++; CHECK("FLD %s -> %s", name, cand[i]); }
+            if (depth > 0) {
+                static int s_log2 = 0;
+                if (s_log2 < 8) {
+                    s_log2++;
+                    const char *cn = I2.class_get_name ? I2.class_get_name(c) : "?";
+                    CHECK("FLD %s in parent#%d %s", name, depth, cn ? cn : "?");
+                }
+            }
             return f;
         }
+        c = I2.class_get_parent ? I2.class_get_parent(c) : NULL;
     }
     return NULL;
 }
@@ -1080,7 +1101,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v51 ====");
+    CHECK("==== dump v58 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1091,7 +1112,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v51 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v58 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -2177,13 +2198,14 @@ static void fogProbe(void) {
     int lim = (g_lastCnt < 64) ? g_lastCnt : 64;
 
     unsigned int lid[16]; float lp[16][3]; int lT[16], lC[16], lmv[16], llv[16], lcam[16];
-    int n = 0, summon = 0;
+    int lPid[16];
+    int n = 0, summon = 0, inact = 0;
     for (int i = 0; i < lim && n < 16; i++) {
         void *v = NULL, *k = NULL;
         if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
         if (rd(v, &k, sizeof(k)) && g_linkerClass && k != g_linkerClass) continue;
-        int T = 0, C = 0;
-        readIdentity2(v, &T, &C, NULL, NULL, NULL, NULL);
+        int T = 0, C = 0, pid = 0;
+        readIdentity2(v, &T, &C, NULL, &pid, NULL, NULL);
         if (T != g_heroType) continue;
         int mv = 1, lv = 1, cam = 0, mir = 0, host = 0, call = 0;
         unsigned char bb = 0;
@@ -2194,14 +2216,18 @@ static void fogProbe(void) {
         if (g_offHostActor >= 0) { void *p = NULL; rd((char *)v + g_offHostActor, &p, sizeof(p)); host = p ? 1 : 0; }
         if (g_offCallActor >= 0) { void *p = NULL; rd((char *)v + g_offCallActor, &p, sizeof(p)); call = p ? 1 : 0; }
         if (mir || host || call) { summon++; continue; }        // 分身/傀儡单独计
+        // v54：**不再过滤**。雾里单位天然 mv=0，过滤掉就等于把「要测的东西」删了。
+        // 改成按 mv 分组统计（下面 g1m/g1t），让「一组有位移、一组恒 0」自己浮出来。
+        if (!mv && !cam) inact++;      // 只计数，不停采样
         unsigned int id = 0;
         rd((char *)v + 0x4AC, &id, 4);
-        lid[n] = id; lT[n] = T; lC[n] = C; lmv[n] = mv; llv[n] = lv; lcam[n] = cam;
+        lid[n] = id; lT[n] = T; lC[n] = C; lmv[n] = mv; llv[n] = lv; lcam[n] = cam; lPid[n] = pid;
         lp[n][0] = lp[n][1] = lp[n][2] = 0;
         rd((char *)v + 0x4C4, lp[n], sizeof(float) * 3);
+        if (lp[n][0] == 0.0f && lp[n][2] == 0.0f) { inact++; continue; }   // 回收槽
         n++;
     }
-    if (n == 0) { CHECK("FOGV none (unitCount %d)", g_unitCount); return; }
+    if (n == 0) { CHECK("FOGV none (u %d inact %d)", g_unitCount, inact); return; }
 
     // ---- 参考点：ref1 → ref2 → ref3
     int i1 = heroIdxById(lid, n);
@@ -2222,6 +2248,8 @@ static void fogProbe(void) {
     if (g_myCamp == 0 && refIdx >= 0) g_myCamp = lC[refIdx];     // 本阵营 = 参考点英雄的 ActorCamp
 
     int mov = 0, rt = 0, fz = 0, ninit = 0, enemies = 0;
+    int g1m[2] = {0, 0}, g1t[2] = {0, 0};   // v54：[0]=mv0 组，[1]=mv1 组；m=有位移数 t=总数
+    int evz = 0, evzTot = 0;                // v55：mv0 && dv>0 && pid>0 的唯一单位数 / 唯一单位总数
     float dmin = 1e9f, dmax = 0;
     for (int i = 0; i < n; i++) {
         int isMe = (i == refIdx);
@@ -2233,6 +2261,8 @@ static void fogProbe(void) {
             if (sl >= 0) {
                 g_fog[sl].id = lid[i]; g_fog[sl].n = 0;
                 g_fog[sl].movedOnce = 0; g_fog[sl].stillCnt = 0; g_fog[sl].frz = 0;
+                g_fog[sl].evzCnt = 0; g_fog[sl].evzMoved = 0;
+                g_fog[sl].lastMv = 1;      // 首次见面当作「上次可见」，避免第一拍就误判
                 g_fog[sl].t = now;
             }
         }
@@ -2241,6 +2271,19 @@ static void fogProbe(void) {
             if (g_fog[sl].n > 0) {
                 float dx = lp[i][0] - g_fog[sl].p[0], dz = lp[i][2] - g_fog[sl].p[2];
                 dv = sqrtf(dx * dx + dz * dz);
+            }
+            // v58：换人判据改用 ObjID（表本来就是按 id 匹配，新槽位分配时已重置并写入 id）。
+            // 阈值只作 sanity：超过 5000 说明这一拍数据不可信，**只作废这一拍的 dv**，
+            // 不做记忆重置 —— 因为 5 秒间隔下英雄直线跑就有 2000~2500，2000 阈值会误伤正常奔跑。
+            if (g_fog[sl].id != lid[i]) {
+                g_fog[sl].id = lid[i];             // 补写，否则下一拍仍不等、每拍都重置
+                g_fog[sl].n = 0;
+                g_fog[sl].movedOnce = 0; g_fog[sl].stillCnt = 0; g_fog[sl].frz = 0;
+                g_fog[sl].evzCnt = 0; g_fog[sl].evzMoved = 0;
+                g_fog[sl].lastMv = 1;
+                dv = -1.0f;
+            } else if (dv > 5000.0f) {
+                dv = -1.0f;                        // 只丢这一拍
             }
             g_fog[sl].p[0] = lp[i][0]; g_fog[sl].p[1] = lp[i][1]; g_fog[sl].p[2] = lp[i][2];
             g_fog[sl].n++;
@@ -2255,9 +2298,30 @@ static void fogProbe(void) {
         if (!isMe && dc < dmin) dmin = dc;
         if (!isMe && dc > dmax) dmax = dc;
         if (g_myCamp != 0 && !isMe && !isAlly) enemies++;   // 本阵营未知时不数，避免把队友算成敌人
+        int pv = (sl >= 0) ? g_fog[sl].lastMv : -1;   // v56：上一次采样的 mv
+        {   // v54/v55：按 mv 分组统计位移；mv0 组再按「唯一单位」累计一次
+            int g = lmv[i] ? 1 : 0;
+            g1t[g]++;
+            if (dv > 0.5f) g1m[g]++;
+            // v55：判据收紧 —— 只有挂真实玩家 id 的单位，在「不可见(mv0)」时位移才算证据
+            int isZombie = (lid[i] == 0);
+            if (!isZombie && sl >= 0) {
+                if (!g_fog[sl].evzCnt) { g_fog[sl].evzCnt = 1; evzTot++; }
+                // v56：必须**连续两次**都不可见（pv==0 && mv==0）才算证据 ——
+                // 否则「刚走出视野」那一次会拿可见期间的位移冒充，系统性假阳性。
+                if (pv == 0 && lmv[i] == 0 && dv > 0.5f && lPid[i] > 0 && !g_fog[sl].evzMoved) {
+                    g_fog[sl].evzMoved = 1;
+                    evz++;
+                }
+            }
+        }
+        if (sl >= 0) g_fog[sl].lastMv = lmv[i];       // v56：写回，供下一拍判 pv
         if (i < 6)
-            CHECK("FOG %u T%d C%d mv%d lv%d cam%d dv %.1f d %.0f%s",
-                  lid[i], lT[i], lC[i], lmv[i], llv[i], lcam[i], dv, dc,
+            // v55：删掉 d（违反三角不等式，是噪声），只留原始世界坐标
+            // v56：加 pv 自证（上一次的 mv），判据在日志里就能验，不用回来读代码
+            CHECK("FOG %u pid%d pv%d T%d C%d mv%d lv%d cam%d dv %.1f @ %.0f,%.0f%s",
+                  lid[i], lPid[i], pv, lT[i], lC[i], lmv[i], llv[i], lcam[i], dv,
+                  lp[i][0], lp[i][2],
                   isGoneById(lid[i]) ? " gone" : (isAlly ? " ally" : ""));
         // ---- v40：只有「敌方主身」进桶；队友永远可见，进来就是假阳性
         if (isMe || isAlly || g_myCamp == 0) continue;
@@ -2268,8 +2332,10 @@ static void fogProbe(void) {
     }
     g_enemyN = (g_myCamp != 0) ? enemies : -1;
 
-    CHECK("FOGV t %d/%d n %d enemy %d summon %d | mov %d still %d ninit %d | rng %.0f..%.0f ref %d raw %d ok %d camp %d",
-          g_fogRuns, FOG_RUNS, n, enemies, summon, mov, fz, ninit, dmin, dmax,
+    CHECK("FOGV t %d/%d n %d inact %d enemy %d summon %d | mov %d still %d ninit %d", 
+          g_fogRuns, FOG_RUNS, n, inact, enemies, summon, mov, fz, ninit);
+    CHECK("FOGG mv1 %d/%d mv0 %d/%d | evz %d/%d | rng? %.0f..%.0f ref %d raw %d ok %d camp %d",
+          g1m[1], g1t[1], g1m[0], g1t[0], evz, evzTot, dmin, dmax,
           refSrc, g_rawHostId, g_rawOk, g_myCamp);
     CHECK("BUCKET(cum) enemy 0-2k %d/%d | 2-4k %d/%d | 4-6k %d/%d | 6k+ %d/%d",
           g_bktMov[0], g_bktTot[0], g_bktMov[1], g_bktTot[1],
@@ -3107,6 +3173,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
 //  所以 ImGui 一帧都画不出来。这版把渲染搬到自己创建的 layer 上，Unity 只负责出帧。
 //  另外加一个 UILabel HUD：哪怕 Metal 出问题，也能用文字确认 dylib 真的进了进程。
 static UIWindow      *g_overlayWin   = nil;
+static UIWindow      *g_btnWin       = nil;   // v52：按钮独立小窗口
 static UILabel       *g_hudLabel     = nil;
 static CAMetalLayer  *g_overlayLayer = nil;
 static id<MTLCommandQueue> g_cmdQueue = nil;
@@ -3121,13 +3188,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v51  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v58  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v51\n"];
+    [s appendString:@"ESP v58\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -3213,6 +3280,71 @@ static void updateHud(void) {
 }
 @end
 
+// v52：按钮搬到**自己的小窗口**里。
+// 之前的做法是 addSubview 到游戏 keyWindow —— 游戏重建视图层级时按钮被盖住/清掉，
+// 而手势挂在 window 本身上不受影响，于是出现「手势能用、按钮不见了」。
+// 这个窗口只有 52pt 宽，只吃右上角那一条的触摸。
+static void createButtonWindow(void) {
+    if (g_btnWin) return;
+    CGRect sb = [UIScreen mainScreen].bounds;
+    CGFloat W = MAX(sb.size.width, sb.size.height);
+    CGFloat H = MIN(sb.size.width, sb.size.height);
+    CGFloat bw = 44, gap = 8;
+    CGFloat wx = W - bw - 8;
+    CGFloat wy = 52;
+    CGFloat wh = (bw + gap) * 4 + 4;
+
+    UIWindow *bw2 = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+            if ([sc isKindOfClass:[UIWindowScene class]]) {
+                bw2 = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)sc];
+                break;
+            }
+        }
+    }
+    if (!bw2) bw2 = [[UIWindow alloc] initWithFrame:CGRectMake(wx, wy, bw, wh)];
+    bw2.frame = CGRectMake(wx, wy, bw, wh);
+    bw2.windowLevel = UIWindowLevelAlert + 200;      // 压在我们的 overlay 之上
+    bw2.backgroundColor = [UIColor clearColor];
+    bw2.userInteractionEnabled = YES;                // 只有这一小块收触摸
+    bw2.hidden = NO;
+
+    UIViewController *vc = [[UIViewController alloc] init];
+    vc.view.frame = bw2.bounds;
+    vc.view.backgroundColor = [UIColor clearColor];
+    vc.view.userInteractionEnabled = YES;
+    bw2.rootViewController = vc;
+    [bw2 layoutIfNeeded];
+
+    struct { const char *title; CGFloat size; int tag; } defs[4] = {
+        { "≡", 22, 0 }, { "▤", 20, 1 }, { "⏸", 20, 2 }, { "⊘", 18, 3 }
+    };
+    for (int i = 0; i < 4; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        b.frame = CGRectMake(0, 2 + i * (bw + gap), bw, bw);
+        b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
+        b.layer.cornerRadius = 10;
+        b.tag = defs[i].tag;
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:defs[i].size];
+        [b setTitle:[NSString stringWithUTF8String:defs[i].title] forState:UIControlStateNormal];
+        [b setTitleColor:[UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:0.95]
+                forState:UIControlStateNormal];
+        int tag = defs[i].tag;
+        [b addAction:[UIAction actionWithHandler:^(UIAction *a) {
+            if (tag == 0) { g_hudPage++; }
+            else if (tag == 1) { g_hudForce = g_hudForce ? 0 : 1; }
+            else if (tag == 2) { g_freeze = g_freeze ? 0 : 1; g_pageFreeze = g_freeze; }
+            else { g_hideAll = g_hideAll ? 0 : 1; }
+            updateHud();
+        }] forControlEvents:UIControlEventTouchUpInside];
+        [vc.view addSubview:b];
+        g_btnN++;
+    }
+    g_btnWin = bw2;
+    LOG("button window created (%d buttons) at %.0f,%.0f", g_btnN, wx, wy);
+}
+
 static void setupOverlay(void) {
     // iOS 13+ 如果有 Scene，必须用 initWithWindowScene，否则窗口不会显示
     UIWindow *w = nil;
@@ -3276,7 +3408,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v51 booting";
+    l.text = @"ESP v58 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -3295,6 +3427,7 @@ static void setupOverlay(void) {
     [g_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 
     LOG("overlay created %dx%d", (int)w.bounds.size.width, (int)w.bounds.size.height);
+    createButtonWindow();   // v52：按钮用自己的窗口，不再挂到游戏窗口上
 }
 
 static void setupImGui(void) {
@@ -3315,7 +3448,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v51 esp (lazy-bind)");
+    ImGui::Text("build         : v58 esp (id-reset)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
@@ -3488,15 +3621,8 @@ static void attachMenuGesture(void) {
     if (!win) win = [UIApplication sharedApplication].keyWindow;
     if (!win || win == g_overlayWin) { LOG("no keyWindow, swipe not attached"); return; }
 
-    UISwipeGestureRecognizer *g = [[UISwipeGestureRecognizer alloc]
-        initWithTarget:keepAlive([NSBlockOperation blockOperationWithBlock:^{
-            g_menuOpen = !g_menuOpen;
-        }]) action:@selector(main)];
-    g.numberOfTouchesRequired = 3;
-    g.direction = UISwipeGestureRecognizerDirectionDown;
-    [win addGestureRecognizer:g];
-    g_gestureOn = true;
-    LOG("3-finger swipe attached");
+    // v53：删掉 3 指下滑的 ImGui 菜单手势 —— overlay 不收触摸，那个窗口点不动，是死 UI。
+    g_gestureOn = true;   // 仍然标记「手势已挂」，避免重复 attach
 
     // v13：4 指上滑 = 立刻重扫一遍（所有 image 全量扫）。
     // 菜单里的 re-selfcheck 按钮在真机上是摆设 —— overlay 的 window 不收触摸，
@@ -3563,66 +3689,7 @@ static void attachMenuGesture(void) {
 
     LOG("2-finger L/R = page, 2-finger down = freeze");
 
-    // v41：多指手势在游戏里很容易被吃掉，另外放两个**常驻按钮**（右上角）：
-    //   ≡ 下一页     ▤ 大/小 HUD（长按无效）
-    // 用 block API（iOS 14+），UIAction 由按钮强持有，不存在 target 被释放的问题。
-    {
-        CGFloat bw = 44, bx = win.bounds.size.width - bw - 8;
-        UIButton *bp = [UIButton buttonWithType:UIButtonTypeSystem];
-        bp.frame = CGRectMake(bx, 60, bw, bw);
-        bp.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
-        bp.layer.cornerRadius = 10;
-        bp.titleLabel.font = [UIFont boldSystemFontOfSize:22];
-        [bp setTitle:@"≡" forState:UIControlStateNormal];
-        [bp setTitleColor:[UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:0.95]
-                 forState:UIControlStateNormal];
-        [bp addAction:[UIAction actionWithHandler:^(UIAction *a) {
-            g_hudPage++; updateHud();
-        }] forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:bp]; g_btnN++;
-
-        UIButton *bf = [UIButton buttonWithType:UIButtonTypeSystem];
-        bf.frame = CGRectMake(bx, 60 + bw + 8, bw, bw);
-        bf.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
-        bf.layer.cornerRadius = 10;
-        bf.titleLabel.font = [UIFont boldSystemFontOfSize:20];
-        [bf setTitle:@"▤" forState:UIControlStateNormal];
-        [bf setTitleColor:[UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:0.95]
-                 forState:UIControlStateNormal];
-        [bf addAction:[UIAction actionWithHandler:^(UIAction *a) {
-            g_hudForce = g_hudForce ? 0 : 1; updateHud();
-        }] forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:bf]; g_btnN++;
-        // v47：⏸ 冻结 —— 不再接收新行、停止自动翻页，页内容不再移动，可以慢慢翻慢慢截
-        UIButton *bz = [UIButton buttonWithType:UIButtonTypeSystem];
-        bz.frame = CGRectMake(bx, 60 + (bw + 8) * 2, bw, bw);
-        bz.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
-        bz.layer.cornerRadius = 10;
-        bz.titleLabel.font = [UIFont boldSystemFontOfSize:20];
-        [bz setTitle:@"⏸" forState:UIControlStateNormal];
-        [bz setTitleColor:[UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:0.95]
-                 forState:UIControlStateNormal];
-        [bz addAction:[UIAction actionWithHandler:^(UIAction *a) {
-            g_freeze = g_freeze ? 0 : 1;
-            g_pageFreeze = g_freeze;
-            updateHud();
-        }] forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:bz]; g_btnN++;
-        // v48：⊘ 只显示 HUD，不画框 —— 翻页截图时按一下，世界立刻干净
-        UIButton *bx2 = [UIButton buttonWithType:UIButtonTypeSystem];
-        bx2.frame = CGRectMake(bx, 60 + (bw + 8) * 3, bw, bw);
-        bx2.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
-        bx2.layer.cornerRadius = 10;
-        bx2.titleLabel.font = [UIFont boldSystemFontOfSize:18];
-        [bx2 setTitle:@"⊘" forState:UIControlStateNormal];
-        [bx2 setTitleColor:[UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:0.95]
-                  forState:UIControlStateNormal];
-        [bx2 addAction:[UIAction actionWithHandler:^(UIAction *a) {
-            g_hideAll = g_hideAll ? 0 : 1;
-        }] forControlEvents:UIControlEventTouchUpInside];
-        [win addSubview:bx2]; g_btnN++;
-        LOG("buttons added ≡ / ▤ / ⏸ / ⊘");
-    }
+    createButtonWindow();   // v52：按钮走独立窗口（原来挂游戏窗口会被游戏视图盖掉）
 }
 
 static bool g_initDone = false;
