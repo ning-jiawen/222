@@ -922,6 +922,7 @@ static void  *g_lastEntries = NULL;
 static int    g_lastCnt     = 0;
 // v35：生命周期字段（全部按名字从元数据取，取不到就是 -1，规则自动降级）
 static int g_offName = -1;      // v67f：name 偏移（按名解析，兜底 0x4B0）
+static unsigned int g_probeMask = 0x09;   // v73：bit0=CE bit3=CAMP2raw bit8=强制跑诊断包
 // v71：可见性候选（-2 = 未解析，-1 = 没有这个字段）
 static int g_offVB  = -2;       // bGetVisibleComponent
 static int g_offISP = -2;       // invisibleSpecialComponents
@@ -3027,7 +3028,6 @@ static char   g_rtIP[64]  = "";
 static int    g_rtPort    = 8765;
 static double g_rtNextDisc = 0, g_rtNextConn = 0;
 static int    g_rtDiscN   = 0;
-static unsigned int g_probeMask = 0x09;   // bit0=CE  bit3=CAMP2raw（默认只开这两条）
 static int    g_rtLevel   = 0;
 static int    g_rtFlush   = 500;
 
@@ -3084,9 +3084,11 @@ static void rtSendLine(const char *line) {
     if (n > (int)sizeof(payload) - 1) n = (int)sizeof(payload) - 1;
     char frame[12 + 600];
     unsigned int seq = ++g_rtSeq;
-    memcpy(frame, &(uint32_t){0x45535031u}, 4);
+    unsigned int magic = 0x45535031u;
+    unsigned int len32 = (unsigned int)n;
+    memcpy(frame, &magic, 4);
     memcpy(frame + 4, &seq, 4);
-    memcpy(frame + 8, &(uint32_t){ (uint32_t)n }, 4);
+    memcpy(frame + 8, &len32, 4);
     memcpy(frame + 12, payload, (size_t)n);
     ssize_t w = send(g_rtSock, frame, 12 + (size_t)n, 0);
     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { close(g_rtSock); g_rtSock = -1; }
