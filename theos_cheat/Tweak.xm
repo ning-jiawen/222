@@ -2360,10 +2360,10 @@ static int dumpProtocolMethods(const char *cnm, void *c, int budget) {
 static void probeL3scan(void) {
     if (!I2.domain_get || !I2.domain_get_assemblies || !I2.assembly_get_image) { CHECK("L3 no api"); return; }
     void *dom = I2.domain_get();
-    void *it = NULL;
-    void **a = dom ? I2.domain_get_assemblies(dom, &it) : NULL;
+    size_t asmN = 0;                                  // v64b：这个出参是 size_t（个数），不是 void**
+    void **a = dom ? I2.domain_get_assemblies(dom, &asmN) : NULL;
     if (!a) { CHECK("L3 no assemblies"); return; }
-    int an = 0; while (a[an] && an < 512) an++;
+    int an = (asmN < 512) ? (int)asmN : 512;
 
     static const char *l3aNames[2] = { "ActorNodeInfo", "ActorData" };
     static const char *clsKeys[] = { "Protocol", "Msg", "Handler", "Dispatch", "Net", "Cmd", "Battle", "Sync" };
@@ -4350,4 +4350,3 @@ __attribute__((constructor)) static void cheat_entry(void) {
         });
     });
 }
-
