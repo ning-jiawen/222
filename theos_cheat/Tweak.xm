@@ -193,6 +193,59 @@ static const char *g_pinTag[PIN_N] = {
     "CNT ", "TH ", "PST ", "FOGV", "BUCKET"
 };
 
+static void checkLine(const char *fmt, ...);   // 前向声明（bcReplay 在它定义之前）
+
+// ================= v70：面包屑（崩溃前也能落盘） =================
+static FILE *g_bcFp   = NULL;
+static int   g_bcTried = 0;
+static int   g_bcMute  = 0;
+static char  g_bcPath[512];
+
+static void bcOpen(void) {
+    if (g_bcFp || g_bcTried) return;
+    g_bcTried = 1;
+    NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (!dirs || [dirs count] == 0) return;
+    const char *doc = [[dirs objectAtIndex:0] UTF8String];
+    if (!doc) return;
+    snprintf(g_bcPath, sizeof(g_bcPath), "%s/esp_bc.txt", doc);
+    g_bcFp = fopen(g_bcPath, "a");
+}
+
+static void bcLine(const char *text) {
+    if (g_bcMute) return;
+    bcOpen();
+    if (!g_bcFp) return;
+    fprintf(g_bcFp, "%s\n", text);
+    fflush(g_bcFp);                 // 关键：不缓冲，崩溃前的最后几行也在盘上
+}
+
+// 下次启动回显上一场尾部（最多 18 行），前缀 BC
+static void bcReplay(void) {
+    bcOpen();
+    if (!g_bcPath[0]) { checkLine("BC (no path)"); return; }
+    FILE *f = fopen(g_bcPath, "rb");
+    if (!f) { checkLine("BC (no prev file)"); return; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    long want = (sz > 6000) ? 6000 : sz;
+    fseek(f, sz - want, SEEK_SET);
+    static char tmp[6001];
+    size_t got = fread(tmp, 1, (size_t)want, f);
+    fclose(f);
+    tmp[got] = 0;
+    // 从尾部倒着找最多 18 行
+    int lines = 0;
+    for (long i = (long)got - 1; i >= 0 && lines < 18; i--) {
+        if (tmp[i] == '\n' && i < (long)got - 1) {
+            const char *p = &tmp[i + 1];
+            if (*p) { g_bcMute = 1; checkLine("BC %s", p); g_bcMute = 0; lines++; }
+        }
+    }
+    g_bcMute = 1; checkLine("BC prev tail %d 行 (file %ld B)", lines, sz); g_bcMute = 0;
+}
+// ================= v70 breadcrumb end =================
+
 static void checkLine(const char *fmt, ...) {
     char buf[CHECKLEN];
     va_list ap;
@@ -224,6 +277,7 @@ static void checkLine(const char *fmt, ...) {
         g_checkN++;
     }
     pushLog("%s", buf);
+    bcLine(buf);                    // v70：同时落盘（崩溃也能留下证据）
 }
 #define CHECK(fmt, ...) checkLine(fmt, ##__VA_ARGS__)
 
@@ -1011,6 +1065,7 @@ static int    g_l2Runs  = 0;     // v64：L2 连续采样次数
 static int    g_l3Runs  = 0;     // v64：L3（L3a+L3b 合并扫描）次数
 static int    g_u2Runs  = 0;     // v66：U2 单位身份探针次数
 static int    g_calRuns = 0;     // v68：CALIB 标定次数
+#define CALIB_ENABLE 0           // v69：CALIB 会枚举 5 层父类的字段（v48 就是崩在这个 API），先关
 static int    g_rvaRuns = 0;     // v68b：RVA 探针次数
 #define L3_ENABLE 0              // v65：进对局闪退，先关掉全表扫描止血（改 1 可恢复）
 static void   probeCamps(void);
@@ -1129,7 +1184,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v68 ====");
+    CHECK("==== dump v70 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1140,7 +1195,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v68 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v70 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -2147,7 +2202,7 @@ static int unitNameLen(void *v) {
 
 // v63：自己的世界坐标（优先 rawHostId 对应的单位，取不到就用相机点）
 #define NAME_ON 1     // v67：名字解码重新打开（读取前已过 okptr 校验）
-#define DEEP_ENABLE 1 // v67：深度 dump 打开（解包已改走 safeKlass/safeClassName）
+#define DEEP_ENABLE 0 // v69：dumpObjFields 会枚举类字段（v48 崩点），本轮先关；RVA 不再依赖它
 
 static float g_selfX = 0, g_selfZ = 0;
 static int   g_selfOk = 0;
@@ -2504,37 +2559,30 @@ static void rvaOfMethod(const char *tag, void *mp) {
     CHECK("RVA %-26s = ? (mp %p 不在任何 image 的 __TEXT 内)", tag, mp);
 }
 
-// 打一个类里「名字含 position/Position」的所有方法（getter/setter 都在内）
-static void rvaScanPosition(void *cls, const char *clsName, int maxOut) {
-    if (!cls || !I2.class_get_methods || !I2.method_get_name) { CHECK("RVA %s skip", clsName); return; }
-    void *it = NULL;
-    void **ms = I2.class_get_methods(cls, &it);
-    if (!ms) { CHECK("RVA %s no methods", clsName); return; }
-    int shown = 0;
-    for (int i = 0; ms[i] && shown < maxOut; i++) {
-        void *mi = ms[i];
-        const char *mn = I2.method_get_name(mi);
-        if (!mn) continue;
-        if (!strstr(mn, "osition") && !strstr(mn, "OSITION")) continue;
-        void *mp = NULL;
-        if (!rd(mi, &mp, sizeof(mp)) || !mp) { CHECK("RVA %s::%s mp null", clsName, mn); continue; }
-        char tag[96];
-        snprintf(tag, sizeof(tag), "%s::%s", clsName, mn);
-        rvaOfMethod(tag, mp);
-        shown++;
-    }
-    if (!shown) CHECK("RVA %s: 没有含 position 的方法", clsName);
+// v69：只按名字点查（class_get_method_from_name 不枚举成员，风险等同于我们一直在用的相机查找）
+static void rvaOneMethod(const char *tag, void *cls, const char *mname) {
+    if (!cls) { CHECK("RVA %-26s = (no class)", tag); return; }
+    if (!I2.class_get_method_from_name) { CHECK("RVA %-26s = (no api)", tag); return; }
+    void *mi = I2.class_get_method_from_name(cls, mname, 0);
+    if (!mi) { CHECK("RVA %-26s = (method not found)", tag); return; }
+    void *mp = NULL;
+    if (!rd(mi, &mp, sizeof(mp)) || !mp) { CHECK("RVA %-26s = (mp null)", tag); return; }
+    rvaOfMethod(tag, mp);
 }
 
 static void probeRVA(void) {
     if (!g_linkerClass) { CHECK("RVA no linkerClass"); return; }
-    // v68c：先自证构建（UUID 不一致 → RVA 无意义）
-    printUUIDofImage("UnityFramework");
+    printUUIDofImage("UnityFramework");     // 同一构建校验
     printUUIDofImage("smoba");
-    rvaScanPosition(g_linkerClass, "ActorLinker", 8);
-    if (g_moveCls) rvaScanPosition(g_moveCls, "MoveComponent", 8);
-    else CHECK("RVA MoveComponent 未登记（KNOWN move 0）");
-    if (g_valueCls) rvaScanPosition(g_valueCls, "ValueComponent", 6);
+    rvaOneMethod("ActorLinker::get_position",     g_linkerClass, "get_position");
+    rvaOneMethod("ActorLinker::set_position",     g_linkerClass, "set_position");
+    if (g_moveCls) {
+        rvaOneMethod("MoveComponent::get_remotePosition", g_moveCls, "get_remotePosition");
+        rvaOneMethod("MoveComponent::set_remotePosition", g_moveCls, "set_remotePosition");
+        rvaOneMethod("MoveComponent::get_position",       g_moveCls, "get_position");
+    } else {
+        CHECK("RVA MoveComponent 未登记（KNOWN move 0）");
+    }
 }
 
 // ================= v68：CALIB —— 以「自己」为锚点标定世界坐标字段 =================
@@ -3817,6 +3865,10 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     g_inMatch = nowIn;
     if (nowIn && g_pinN < 0) g_pinN = g_checkN;   // v46：把「类 dump + 绑定日志」固定住
     if (nowIn) bindExtraLazy();                   // v51：首次进对局才绑这 5 个字段
+    {   // v70：上一场面包屑回显（只做一次，且只在对局里，避免大厅刷屏）
+        static int s_bcDone = 0;
+        if (nowIn && !s_bcDone) { s_bcDone = 1; bcReplay(); }
+    }
     if (edgeIn) {                                 // v48：每次进对局重置探针额度 ——
         g_verifyN = 0;                            // 载入界面那点零星 actor 会把 3 次额度吃光，
         g_pstRuns = 0;                            // 正式对局里就再也不打印 CNT/TH/PST 了
@@ -4249,13 +4301,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v68  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v70  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v68\n"];
+    [s appendString:@"ESP v70\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -4328,7 +4380,8 @@ static void updateHud(void) {
     // v64：L2 连续 8 拍（40 秒），L3a/L3b 各一次
     if (PROBES_DEFAULT && t % 150 == 30 && g_unitCount >= 40 && g_l2Runs < 8) { g_l2Runs++; probeL2();   }
     if (PROBES_DEFAULT && t % 150 == 50 && g_unitCount >= 40 && g_u2Runs < 2) { g_u2Runs++; probeUnits20(); }
-    if (PROBES_DEFAULT && t % 150 == 20 && g_unitCount >= 20 && g_calRuns < 2) { g_calRuns++; probeCalib(); }
+    if (CALIB_ENABLE && PROBES_DEFAULT && t % 150 == 20 && g_unitCount >= 20 && g_calRuns < 2) { g_calRuns++; probeCalib(); }
+    else if (!CALIB_ENABLE && t % 150 == 20 && g_calRuns < 1) { g_calRuns++; CHECK("CALIB disabled (v69)"); }
     if (PROBES_DEFAULT && t % 150 == 10 && g_unitCount >= 5 && g_rvaRuns < 1) { g_rvaRuns++; probeRVA(); }
     if (L3_ENABLE && PROBES_DEFAULT && t % 150 == 70 && g_unitCount >= 40 && g_l3Runs < 1) { g_l3Runs++; probeL3scan(); }
     else if (!L3_ENABLE && t % 150 == 70 && g_l3Runs < 1) { g_l3Runs++; CHECK("L3 disabled (v65)"); }
@@ -4478,7 +4531,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v68 booting";
+    l.text = @"ESP v70 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -4518,7 +4571,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v68 esp (calib)");
+    ImGui::Text("build         : v70 esp (rva+breadcrumb)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
