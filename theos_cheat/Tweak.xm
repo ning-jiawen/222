@@ -1080,6 +1080,7 @@ static int    g_l2Runs  = 0;     // v64：L2 连续采样次数
 static int    g_l3Runs  = 0;     // v64：L3（L3a+L3b 合并扫描）次数
 static int    g_u2Runs  = 0;     // v66：U2 单位身份探针次数
 static int    g_calRuns = 0;     // v68：CALIB 标定次数
+#define ENUM_PROBES 0            // v75：0 = 不编译任何 class_get_fields/methods 调用点
 #define CALIB_ENABLE 0           // v69：CALIB 会枚举 5 层父类的字段（v48 就是崩在这个 API），先关
 static int    g_rvaRuns = 0;     // v68b：RVA 探针次数
 static int    g_ceRuns  = 0;     // v71：CE 对照实验拍数
@@ -1097,6 +1098,7 @@ static void   probeRVA(void);
 static void   probeCampExp(void);
 static void   probeCampRaw(void);
 static void   khtSeed(void);
+static void   v73Tick(void);
 static void   rtTick(void);
 static void   probeL3scan(void);
 static void  *fieldByNameish(void *cls, const char *name);
@@ -1206,7 +1208,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v74 ====");
+    CHECK("==== dump v75 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1217,7 +1219,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v74 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v75 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -2231,6 +2233,7 @@ static float g_selfX = 0, g_selfZ = 0;
 static int   g_selfOk = 0;
 
 // 把一个对象的字段全打出来（只打会读的值类型，其余只报名字，避免把指针当数字）
+#if ENUM_PROBES
 static int dumpObjFields(const char *tag, void *obj, void *cls, int maxLines) {
     if (!obj || !cls || !I2.class_get_fields) { CHECK("%s skip (null)", tag); return 0; }
     void *it = NULL;
@@ -2263,6 +2266,10 @@ static int dumpObjFields(const char *tag, void *obj, void *cls, int maxLines) {
     if (shown == 0) CHECK("%s (no printable field)", tag);
     return shown;
 }
+#else
+static int dumpObjFields(const char *tag, void *obj, void *cls, int maxLines) { (void)tag; (void)obj; (void)cls; (void)maxLines; return 0; }
+#endif
+
 
 // v61：把「候选字段名 → 偏移 / 命中类」并列打出来。
 // 上一版把 MoveControl 解析到 @1144，和 PositionRecords@1144 撞了 —— 同偏移不可能是两个字段，
@@ -2524,6 +2531,373 @@ static void probeCampMem(void) {
 }
 // ================= v60 end =================
 
+
+// ================= v75：V73SPEC —— 诊断包（阶段 0~4，单线程、纯点查） =================
+// 准则：宁缺毋错。任何不确定 → SKIP + reason，绝不上报猜测值。
+#define V73_FILE_MAX  (64 * 1024 * 1024)
+enum { V73_IDLE = -1, V73_S0 = 0, V73_S1 = 1, V73_S3 = 3, V73_S4 = 4, V73_S5 = 5, V73_DONE = 9 };
+static int    g_v73State = V73_IDLE;
+static int    g_v73Cursor = -1;
+static int    g_v73Ran = 0;
+static FILE  *g_v73Fp = NULL;
+static int    g_v73FpStage = -1;
+static unsigned long g_v73Bytes = 0;
+static double g_v73T0 = 0, g_v73Next250 = 0, g_v73Next1s = 0;
+static int    g_v73Abort = 0;
+static char   g_v73Dir[512];
+
+// 阶段 2 的累计量
+static unsigned int  g_q2Max = 0; static unsigned long long g_q2Sum = 0; static unsigned int g_q2Nz = 0, g_q2N = 0;
+static unsigned int  g_p2Max = 0; static unsigned long long g_p2Sum = 0; static unsigned int g_p2Nz = 0, g_p2N = 0;
+static int g_q2Ok = -1, g_p2Ok = -1;          // -1 未知 0 不可用 1 可用
+
+// 阶段 1 上一拍
+static unsigned long long g_prevRecv = 0, g_prevExec = 0;
+
+static void v73DocInit(void) {
+    if (g_v73Dir[0]) return;
+    NSArray *dirs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    const char *doc = (dirs && [dirs count]) ? [[dirs objectAtIndex:0] UTF8String] : NULL;
+    snprintf(g_v73Dir, sizeof(g_v73Dir), "%s", doc ? doc : "/tmp");
+}
+
+static int v73ReadIntFile(const char *name, int dflt) {
+    v73DocInit();
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%s", g_v73Dir, name);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return dflt;
+    int v = dflt;
+    if (read(fd, &v, 4) != 4) v = dflt;
+    close(fd);
+    return v;
+}
+
+static void v73WriteIntFile(const char *name, int v) {
+    v73DocInit();
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%s", g_v73Dir, name);
+    int fd = open(path, O_WRONLY | O_CREAT, 0644);
+    if (fd < 0) return;
+    (void)pwrite(fd, &v, 4, 0);
+    close(fd);
+}
+
+static int v73SkipHas(int stage) {
+    v73DocInit();
+    char path[600];
+    snprintf(path, sizeof(path), "%s/v73_skip.txt", g_v73Dir);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[512]; ssize_t n = read(fd, buf, sizeof(buf) - 1); close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    char needle[16]; snprintf(needle, sizeof(needle), "%d", stage);
+    return strstr(buf, needle) ? 1 : 0;
+}
+
+static void v73OpenStage(int stage) {
+    if (g_v73Fp && g_v73FpStage == stage) return;
+    if (g_v73Fp) { fflush(g_v73Fp); fclose(g_v73Fp); g_v73Fp = NULL; }
+    v73DocInit();
+    char path[600];
+    snprintf(path, sizeof(path), "%s/v73_s%d.log", g_v73Dir, stage);
+    g_v73Fp = fopen(path, "a");
+    g_v73FpStage = stage;
+    v73WriteIntFile("v73_heartbeat.bin", stage);     // R8：进阶段先心跳
+}
+
+static void v73CloseStage(void) {
+    if (!g_v73Fp) return;
+    fflush(g_v73Fp);
+    fclose(g_v73Fp);
+    g_v73Fp = NULL;
+    v73WriteIntFile("v73_cursor.txt", g_v73State);   // R7：阶段完成写 cursor
+}
+
+// 统一输出：文件 + LAN（非阻塞，失败即丢）
+static void v73Line(const char *fmt, ...) {
+    char buf[256];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    if (g_v73Fp && g_v73Bytes < V73_FILE_MAX) {
+        size_t n = fprintf(g_v73Fp, "%s\n", buf);
+        if (n > 0) g_v73Bytes += (unsigned long)n;
+    }
+    rtSendLine(buf);
+    checkLine("%s", buf);            // 同时进 HUD，方便截图
+}
+
+// R4：STATIC/INSTANCE 三级回退
+static int v73FieldFlags(void *fi, unsigned int *outFlags) {
+    if (!fi) return 0;
+    if (I2.field_get_flags) { unsigned int f = (unsigned int)I2.field_get_flags(fi); if (outFlags) *outFlags = f; return 1; }
+    void *ty = NULL;
+    if (!rd((char *)fi + 0x08, &ty, sizeof(ty)) || !okptr((uintptr_t)ty)) return 0;
+    unsigned int attrs = 0;
+    if (!rd((char *)ty + 0x08, &attrs, 4)) return 0;
+    if (outFlags) *outFlags = attrs;
+    return 1;
+}
+
+// 读静态字段（API 缺失 → 0）
+static int v73ReadStatic(void *fi, void *out, int sz) {
+    if (!fi || !I2.field_static_get_value) return 0;
+    I2.field_static_get_value(fi, out);
+    return 1;
+}
+
+// 读一个 uint64（先 static，失败再按实例 + offset，用 rd）
+static int v73ReadU64(void *fi, unsigned long long *out, int *isStatic) {
+    unsigned int flags = 0;
+    if (!v73FieldFlags(fi, &flags)) return 0;
+    int st = (flags & 0x10) ? 1 : 0;
+    if (isStatic) *isStatic = st;
+    if (st) {
+        unsigned long long v = 0;
+        if (!v73ReadStatic(fi, &v, (int)sizeof(v))) return 0;
+        *out = v;
+        return 1;
+    }
+    return 0;    // 实例字段：本包拿不到实例 → 由调用方 SKIP
+}
+
+// R1：API 存在性自检 —— 缺哪个就打印 API_MISSING，相关探针整体 SKIP
+static int v73ApiCheck(void) {
+    struct { const char *n; void *p; } T[13] = {
+        { "il2cpp_class_from_name",            (void *)I2.class_from_name },
+        { "il2cpp_class_get_field_from_name",  (void *)I2.class_get_field_from_name },
+        { "il2cpp_field_get_offset",           (void *)I2.field_get_offset },
+        { "il2cpp_field_get_flags",            (void *)I2.field_get_flags },
+        { "il2cpp_field_get_type",             (void *)I2.field_get_type },
+        { "il2cpp_field_static_get_value",     (void *)I2.field_static_get_value },
+        { "il2cpp_class_from_il2cpp_type",     (void *)I2.class_from_il2cpp_type },
+        { "il2cpp_type_get_name",              (void *)I2.type_get_name },
+        { "il2cpp_class_is_valuetype",         (void *)I2.class_is_valuetype },
+        { "il2cpp_class_get_name",             (void *)I2.class_get_name },
+        { "il2cpp_class_get_parent",           (void *)I2.class_get_parent },
+        { "il2cpp_field_get_name",             (void *)I2.field_get_name },
+        { "il2cpp_class_get_method_from_name", (void *)I2.class_get_method_from_name },
+    };
+    int ok = 0;
+    for (int i = 0; i < 13; i++) {
+        if (!T[i].p) v73Line("API_MISSING %s", T[i].n);
+        else ok++;
+    }
+    v73Line("API ok %d/13", ok);
+    return ok;
+}
+
+// 阶段 0：三道正控
+static int v73Stage0(void) {
+    v73OpenStage(0);
+    v73Line("V73 begin stage0");
+    v73ApiCheck();
+    // 0-a
+    void *linker = (I2.class_from_name) ? I2.class_from_name(NULL, "Assets.Scripts.GameSystem", "ActorLinker") : NULL;
+    if (!linker) linker = g_linkerClass;
+    if (!linker) { v73Line("CTRL0 ABORT reason=linker_class_missing"); return -1; }
+    void *fi = findFieldOne(linker, "ObjID");
+    if (!fi) { v73Line("CTRL0 ABORT reason=linker_field_missing"); return -1; }
+    unsigned int fl = 0;
+    if (!v73FieldFlags(fi, &fl)) { v73Line("CTRL0 ABORT reason=no_flags"); return -1; }
+    if (fl & 0x10) { v73Line("CTRL0 ABORT reason=flags_probe_broken flags=0x%x", fl); return -1; }
+    int off = (int)I2.field_get_offset(fi);
+    if (off != 0x4AC) { v73Line("CTRL0 ABORT reason=offset_probe_broken off=0x%x", off); return -1; }
+    v73Line("CTRL0 OK linker.ObjID off=0x%x INSTANCE", off);
+
+    // 0-b：FrameSynchr 的 LogicFrameTick 必须是静态字段，否则拿不到实例 → 直接 ABORT
+    void *fsc = (I2.class_from_name) ? I2.class_from_name(NULL, "Assets.Scripts.Framework", "FrameSynchr") : NULL;
+    if (!fsc) { v73Line("CTRL1 ABORT reason=fsynchr_class_missing"); return -1; }
+    void *ftick = findFieldOne(fsc, "LogicFrameTick");
+    if (!ftick) { v73Line("CTRL1 ABORT reason=logicframe_field_missing"); return -1; }
+    unsigned long long v0 = 0; int st = 0;
+    if (!v73ReadU64(ftick, &v0, &st)) {
+        v73Line("CTRL1 ABORT reason=logicframe_instance_needed static=%d", st);
+        return -1;
+    }
+    if (v0 == 0 || v0 >= 1000000000ULL) { v73Line("CTRL1 ABORT reason=read_channel_dead v0=%llu", v0); return -1; }
+    v73Line("CTRL1 seed LogicFrameTick v0=%llu", v0);
+    g_prevRecv = v0;                      // 借用：0-b 的第二次读数在 250ms 采样里复核
+
+    // 0-c：commandQueue 的可判定性
+    void *fq = findFieldOne(fsc, "commandQueue");
+    if (!fq) { v73Line("CTRL2 commandQueue NOT_FOUND"); }
+    else {
+        unsigned int qf = 0;
+        if (v73FieldFlags(fq, &qf)) {
+            v73Line("CTRL2 commandQueue off=0x%x flags=0x%x %s",
+                    (int)I2.field_get_offset(fq), qf, (qf & 0x10) ? "STATIC" : "INSTANCE");
+        } else {
+            v73Line("CTRL2 commandQueue off=0x%x flags=UNRESOLVED", (int)I2.field_get_offset(fq));
+        }
+    }
+    return 0;
+}
+
+// 阶段 1 采样：FrameSynchr 四个计数器
+static void v73S1Sample(void) {
+    void *fsc = (I2.class_from_name) ? I2.class_from_name(NULL, "Assets.Scripts.Framework", "FrameSynchr") : NULL;
+    if (!fsc) { v73Line("S1 SKIP reason=fsynchr_class_missing"); return; }
+    struct { const char *name; } flds[2] = {
+        { "m_receiveMoveCmdtotalCount" }, { "m_ExecMoveCmdTotalCount" }
+    };
+    unsigned long long v[2] = {0, 0}; int ok[2] = {0, 0}; int st = 0;
+    for (int i = 0; i < 2; i++) {
+        void *f = findFieldOne(fsc, flds[i].name);
+        if (!f) continue;
+        ok[i] = v73ReadU64(f, &v[i], &st);
+    }
+    if (!ok[0] && !ok[1]) { v73Line("S1 SKIP reason=no_static_counters"); return; }
+    for (int i = 0; i < 2; i++) {
+        if (!ok[i]) continue;
+        if (v[i] >= 100000000ULL) { v73Line("S1 SUSPECT %s=%llu", flds[i].name, v[i]); ok[i] = 0; }
+    }
+    if (ok[0] && v[0] < g_prevRecv) { v73Line("S1 SUSPECT recv backstep %llu < %llu", v[0], g_prevRecv); }
+    if (ok[0]) g_prevRecv = v[0];
+    if (ok[1]) g_prevExec = v[1];
+    v73Line("S1 t=%u recv=%llu exec=%llu", g_frameStamp,
+            ok[0] ? g_prevRecv : 0ULL, ok[1] ? g_prevExec : 0ULL);
+}
+
+// 阶段 2：拿容器 _size（纯 API；失败回退 0x10 并打标）
+static int v73ContainerSize(void *cls, const char *fname, void *clsHint, int *outSize, const char **how) {
+    if (!cls) { *how = "no_class"; return 0; }
+    void *f = findFieldOne(cls, fname);
+    if (!f) { *how = "field_missing"; return 0; }
+    unsigned int fl = 0;
+    if (!v73FieldFlags(f, &fl)) { *how = "no_flags"; return 0; }
+    if (!(fl & 0x10)) { *how = "instance_field"; return 0; }        // 没实例 → SKIP
+    void *obj = NULL;
+    if (!v73ReadStatic(f, &obj, (int)sizeof(obj)) || !okptr((uintptr_t)obj)) { *how = "static_value_bad"; return 0; }
+    void *ty = I2.field_get_type ? I2.field_get_type(f) : NULL;
+    void *k2 = (ty && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(ty) : NULL;
+    if (!k2) { *how = "no_type_class"; return 0; }
+    void *fs = findFieldOne(k2, "_size");
+    int off = -1;
+    if (fs) off = (int)I2.field_get_offset(fs);
+    if (off <= 0 || off >= 0x100) {
+        off = 0x10;
+        *how = "FALLBACK off_size=0x10";
+    } else {
+        *how = "api";
+    }
+    int sz = 0;
+    if (!rd((char *)obj + off, &sz, 4)) { *how = "read_fail"; return 0; }
+    if (sz < 0 || sz >= 10000) { *how = "sanity"; return 0; }
+    *outSize = sz;
+    return 1;
+}
+
+static void v73S2Second(void) {
+    int sz = 0; const char *how = "?";
+    if (g_q2Ok != 0) {
+        void *fsc = (I2.class_from_name) ? I2.class_from_name(NULL, "Assets.Scripts.Framework", "FrameSynchr") : NULL;
+        if (v73ContainerSize(fsc, "commandQueue", NULL, &sz, &how)) {
+            g_q2Ok = 1; g_q2N++; g_q2Sum += (unsigned)sz;
+            if ((unsigned)sz > g_q2Max) g_q2Max = (unsigned)sz;
+            if (sz) g_q2Nz++;
+        } else {
+            g_q2Ok = 0;
+            v73Line("S2 SKIP commandQueue reason=%s", how);
+        }
+    }
+    if (g_p2Ok != 0) {
+        void *btr = (I2.class_from_name) ? I2.class_from_name(NULL, "Assets.Scripts.GameSystem", "CBattleBackTrack") : NULL;
+        if (v73ContainerSize(btr, "framePkgList", NULL, &sz, &how)) {
+            g_p2Ok = 1; g_p2N++; g_p2Sum += (unsigned)sz;
+            if ((unsigned)sz > g_p2Max) g_p2Max = (unsigned)sz;
+            if (sz) g_p2Nz++;
+        } else {
+            g_p2Ok = 0;
+            v73Line("S2 SKIP framePkgList reason=%s", how);
+        }
+    }
+    v73Line("S2 sec=%u queue_max=%u queue_nz=%u queue_sum=%llu queue_n=%u pkg_max=%u pkg_nz=%u pkg_sum=%llu pkg_n=%u",
+            (unsigned)((CACurrentMediaTime() - g_v73T0)), g_q2Max, g_q2Nz, g_q2Sum, g_q2N,
+            g_p2Max, g_p2Nz, g_p2Sum, g_p2N);
+}
+
+// 阶段 3：协议字段布局
+static void v73Stage3(void) {
+    v73OpenStage(3);
+    struct { const char *ns; const char *cls; const char *fld; } T[6] = {
+        {"CSProtocol",        "FRAME_CMD_PKG",           "bCmdType"},
+        {"CSProtocolWrapper", "FRAME_CMD_PKG",           "bCmdType"},
+        {"CSProtocol",        "FRAME_CMD_PKG",           "stCmdInfo"},
+        {"CSProtocolWrapper", "FRAME_CMD_PKG",           "stCmdInfo"},
+        {"CSProtocolWrapper", "FRAMEPKG_CMD_PLAYERMOVE", "stWorldPos"},
+        {"CSProtocolWrapper", "COMDT_INGAME_PLAYERINFO", "bObjCamp"},
+    };
+    for (int i = 0; i < 6; i++) {
+        void *c = (I2.class_from_name) ? I2.class_from_name(NULL, T[i].ns, T[i].cls) : NULL;
+        if (!c) { v73Line("S3 %s.%s.%s SKIP reason=class_missing", T[i].ns, T[i].cls, T[i].fld); continue; }
+        void *f = findFieldOne(c, T[i].fld);
+        if (!f) { v73Line("S3 %s.%s.%s SKIP reason=field_missing", T[i].ns, T[i].cls, T[i].fld); continue; }
+        int off = (int)I2.field_get_offset(f);
+        unsigned int fl = 0; const char *st = "UNRESOLVED";
+        if (v73FieldFlags(f, &fl)) st = (fl & 0x10) ? "STATIC" : "INSTANCE";
+        void *ty = I2.field_get_type ? I2.field_get_type(f) : NULL;
+        const char *tn = (ty && I2.type_get_name) ? I2.type_get_name(ty) : NULL;
+        int bad = (off <= 0 || off >= 0x400) ? 1 : 0;
+        v73Line("S3 %s.%s.%s off=0x%x type=%s %s%s", T[i].ns, T[i].cls, T[i].fld, off,
+                tn ? tn : "UNRESOLVED", st, bad ? " SUSPECT" : "");
+    }
+}
+
+// 阶段 4：tidx 类型名（本包没有 tidx→字段映射 → 按准则 SKIP）
+static void v73Stage4(void) {
+    v73OpenStage(4);
+    int t[5] = { 21249, 21907, 21707, 24279, 102322 };
+    for (int i = 0; i < 5; i++) v73Line("S4 tidx=%d SKIP reason=no_tidx_map", t[i]);
+}
+
+// 驱动（每帧调用）：一次只推进一个阶段，不阻塞
+static void v73Tick(void) {
+    if (g_v73Ran) return;
+    if (!g_inMatch) return;
+    if (g_v73State == V73_IDLE) {
+        int force = (g_probeMask & 0x100) ? 1 : 0;
+        if (g_frameStamp < 600 && !force) return;
+        g_v73Cursor = v73ReadIntFile("v73_cursor.txt", -1);
+        int hb = v73ReadIntFile("v73_heartbeat.bin", -1);
+        if (hb > g_v73Cursor && hb >= 0) {          // R8：上次崩在那个阶段 → 记 skip
+            v73DocInit();
+            char path[600];
+            snprintf(path, sizeof(path), "%s/v73_skip.txt", g_v73Dir);
+            int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) { char b[16]; int n = snprintf(b, sizeof(b), "%d\n", hb); (void)write(fd, b, (size_t)n); close(fd); }
+        }
+        v73Line("V73 start cursor=%d hb=%d force=%d", g_v73Cursor, hb, force);
+        g_v73State = V73_S0;
+    }
+
+    if (g_v73State == V73_S0) {
+        int r = v73Stage0();
+        if (r != 0) { g_v73Abort = 1; v73CloseStage(); g_v73State = V73_DONE; g_v73Ran = 1; v73Line("V73 ABORT at stage0"); return; }
+        g_v73T0 = CACurrentMediaTime();
+        g_v73Next250 = g_v73T0;
+        g_v73Next1s = g_v73T0;
+        g_v73State = V73_S1;
+        v73OpenStage(1);
+        v73Line("V73 stage1 start (60s)");
+        return;
+    }
+
+    if (g_v73State == V73_S1) {
+        double now = CACurrentMediaTime();
+        if (now >= g_v73Next250) { g_v73Next250 = now + 0.25; v73S1Sample(); }
+        if (now >= g_v73Next1s)  { g_v73Next1s  = now + 1.0;  v73S2Second(); }
+        if (now - g_v73T0 >= 60.0) {
+            v73CloseStage();
+            g_v73State = V73_S3;
+            v73Line("V73 stage1/2 done");
+        }
+        return;
+    }
+    if (g_v73State == V73_S3) { v73Stage3(); v73CloseStage(); g_v73State = V73_S4; return; }
+    if (g_v73State == V73_S4) { v73Stage4(); v73CloseStage(); g_v73State = V73_DONE; g_v73Ran = 1; v73Line("V73 DONE"); return; }
+}
+// ================= v75 V73SPEC end =================
 
 // ================= v74：KHT —— klass → name 哈希表 =================
 // 规矩落地：任何 klass 指针先查表；表内安全命名，表外一律 unknown，不调 class_get_name。
@@ -2944,6 +3318,7 @@ static void probeRVA(void) {
 // 自己 = ObjID == g_rawHostId（日志里 "raw 29 ok 1" 就是它）。
 // 把它的每个 Vector3/VInt3 字段投影到屏幕：英雄永远在屏幕中心附近，
 // 所以「投影最接近屏幕中心」的那个字段就是世界坐标。
+#if ENUM_PROBES
 static void probeCalib(void) {
     if (!g_lastEntries || g_lastCnt <= 0 || !g_linkerClass) { CHECK("CALIB no entries"); return; }
     if (!g_rawOk || g_rawHostId <= 0) { CHECK("CALIB no rawHostId"); return; }
@@ -3030,6 +3405,10 @@ static void probeCalib(void) {
         }
     }
 }
+#else
+static void probeCalib(void) { CHECK("CALIB disabled (enum off)"); }
+#endif
+
 
 // ================= v66：U2 —— 前 20 个单位逐个暴露身份 =================
 // 目的：搞清楚 T0 到底是不是英雄。同时给出「每个 T 里有多少正在渲染(mv1)」。
@@ -3124,6 +3503,9 @@ static void probeUnits20(void) {
 // ② L2 每行带 via（组件字段名@偏移 + 类名），判据在日志里自证
 
 // 类的字段布局（只打名字/偏移/类型，不读值）
+// v75：整段用 #if L3_ENABLE 包住 —— L3_ENABLE=0 时**不编译**，
+// 于是 class_get_fields / class_get_methods 不会出现在二进制里（交付自检要求）。
+#if L3_ENABLE
 static void dumpClassLayout(const char *tag, void *cls, int maxLines) {
     if (!cls || !I2.class_get_fields) { CHECK("%s skip", tag); return; }
     void *it = NULL;
@@ -3224,6 +3606,7 @@ static void probeL3scan(void) {
     }
     CHECK("L3 done scan %d l3a %d cls %d hit %d", scanned, l3aHit, clsMatched, methodHit);
 }
+#endif  // L3_ENABLE
 
 // L2：前 3 个英雄的 cur/rem 连续采样（dcur / drem），每行带 via
 typedef struct { unsigned int id; float cur[3]; float rem[3]; int n; } L2Ent;
@@ -4055,6 +4438,7 @@ static void probeViewHop(void) {
 // ent / cnt / cap，并同时用 0x18 和 0x20 两种基址去解第一个元素，看哪个 klass 等于 ActorLinker。
 // 结论直接采纳：哪个字段能解出 ActorLinker，就把 g_offDict 换成它，基址也一并定下来。
 // 这样「actorList@8 还是 updatableActorList@16」「0x18 还是 0x20」都不用再猜。
+#if ENUM_PROBES
 static void probeActorLists(void) {
     if (!g_mgr || !g_mgrClass || !I2.class_get_fields || !I2.field_get_type ||
         !I2.type_get_name || !I2.field_get_name) return;
@@ -4128,6 +4512,10 @@ static void probeActorLists(void) {
         CHECK("L none (no DictionaryView field with ActorLinker)");
     }
 }
+#else
+static void probeActorLists(void) { }
+#endif
+
 
 // Dictionary<UInt32,Object> 的 Entry：hashCode(4) next(4) key(4) pad(4) value(8) = 24B
 // 数组头 0x20（klass 8 + monitor 8 + bounds 8 + length 4 + pad 4）。
@@ -4657,13 +5045,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v74  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v75  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v74\n"];
+    [s appendString:@"ESP v75\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -4740,6 +5128,7 @@ static void updateHud(void) {
     else if (!CALIB_ENABLE && t % 150 == 20 && g_calRuns < 1) { g_calRuns++; CHECK("CALIB disabled (v69)"); }
     if (PROBES_DEFAULT && t % 150 == 10 && g_unitCount >= 5 && g_rvaRuns < 1) { g_rvaRuns++; probeRVA(); }
     rtTick();                                     // v73：A0 —— 发现/连接，永不阻塞
+    v73Tick();                                    // v75：诊断包状态机（单线程、每帧推进一格）
     if ((g_probeMask & 0x08) && PROBES_DEFAULT && g_unitCount >= 5 && g_c2rRuns < 2 && t % 150 == 5) {
         g_c2rRuns++; probeCampRaw();               // v73：CAMP2 元素布局定死
     }
@@ -4900,7 +5289,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v74 booting";
+    l.text = @"ESP v75 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -4940,7 +5329,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v74 esp (KHT)");
+    ImGui::Text("build         : v75 esp (V73SPEC)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
