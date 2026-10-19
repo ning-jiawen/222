@@ -931,36 +931,7 @@ static int ciEq(const char *a, const char *b) {
 // v48/v49 用枚举做「忽略大小写 + k__BackingField」回退，这条路径在 v47 里不存在，
 // 而 v48 起开始闪退（枚举 API 在泛型/接口类上有踩到 il2cpp 内部断言的风险）。
 // 这里改成显式候选名：精确名 / 首字母大写 / 首字母小写 / <Name>k__BackingField。
-// ================= v67：指针校验层 =================
-// 三十几版里三次崩溃根因只有一个：**把未校验的指针喂给 il2cpp 函数**。
-// 规矩：任何从内存读出来的指针，在传给 il2cpp 之前必须过 okptr。
-static int g_safeRej = 0;
 
-static int okptr(uintptr_t v) {
-    if (v < 0x100000000ULL) return 0;     // 低于 4GB 一定不是本进程堆
-    if (v & 7) return 0;                   // 未 8 字节对齐
-    return 1;
-}
-
-static void *safeKlass(void *obj) {
-    if (!okptr((uintptr_t)obj)) { g_safeRej++; return NULL; }
-    void *k = NULL;
-    if (!rd(obj, &k, sizeof(k))) { g_safeRej++; return NULL; }
-    if (!okptr((uintptr_t)k)) { g_safeRej++; return NULL; }
-    return k;
-}
-
-// v67b：已知类缓存（全部来自 findCls / class_from_il2cpp_type，可信）
-static void *g_moveCls = NULL, *g_valueCls = NULL, *g_skillCls = NULL, *g_charInfoCls = NULL;
-
-static const char *safeClassName(void *k) {
-    if (!k || !I2.class_get_name) { g_safeRej++; return NULL; }
-    if (!okptr((uintptr_t)k)) { g_safeRej++; return NULL; }
-    const char *n = I2.class_get_name(k);      // 只有 ovptr 过了才调
-    if (n && !okptr((uintptr_t)n)) { g_safeRej++; return NULL; }
-    return n;
-}
-// ================= v67 safe layer end =================
 
 static void *findFieldOne(void *cls, const char *name) {
     if (!cls || !I2.class_get_field_from_name) return NULL;
@@ -1312,6 +1283,38 @@ static bool rd(const void *addr, void *dst, size_t n) {
     return kr == KERN_SUCCESS && got == n;
 }
 
+// ================= v67：指针校验层 =================
+// 三十几版里三次崩溃根因只有一个：**把未校验的指针喂给 il2cpp 函数**。
+// 规矩：任何从内存读出来的指针，在传给 il2cpp 之前必须过 okptr。
+static int g_safeRej = 0;
+
+static int okptr(uintptr_t v) {
+    if (v < 0x100000000ULL) return 0;     // 低于 4GB 一定不是本进程堆
+    if (v & 7) return 0;                   // 未 8 字节对齐
+    return 1;
+}
+
+static void *safeKlass(void *obj) {
+    if (!okptr((uintptr_t)obj)) { g_safeRej++; return NULL; }
+    void *k = NULL;
+    if (!rd(obj, &k, sizeof(k))) { g_safeRej++; return NULL; }
+    if (!okptr((uintptr_t)k)) { g_safeRej++; return NULL; }
+    return k;
+}
+
+// v67b：已知类缓存（全部来自 findCls / class_from_il2cpp_type，可信）
+static void *g_moveCls = NULL, *g_valueCls = NULL, *g_skillCls = NULL, *g_charInfoCls = NULL;
+
+static const char *safeClassName(void *k) {
+    if (!k || !I2.class_get_name) { g_safeRej++; return NULL; }
+    if (!okptr((uintptr_t)k)) { g_safeRej++; return NULL; }
+    const char *n = I2.class_get_name(k);      // 只有 ovptr 过了才调
+    if (n && !okptr((uintptr_t)n)) { g_safeRej++; return NULL; }
+    return n;
+}
+// ================= v67 safe layer end =================
+
+
 static void *findCls(const char *ns, const char *name) {
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) return NULL;
     size_t n = 0;
@@ -1330,6 +1333,16 @@ static void *g_mgrClass = NULL, *g_linkerClass = NULL, *g_vpClass = NULL;
 // v67b：**只对已知类打名字**。未命中就返回 NULL —— 调用方不得再调 il2cpp。
 // 理由：对齐且可读的指针也可能是"不是类"的指针，class_get_name 会按 Il2CppClass 布局去读，
 // 读到任意值甚至中途崩。已知类比对是唯一可靠的路子。
+// v67c：按字段名解析出「声明类」（元数据来源，可信）
+static void *clsOfField(void *cls, const char *fname) {
+    if (!cls || !fname) return NULL;
+    void *f = findField(cls, fname);
+    if (!f) return NULL;
+    void *ft = I2.field_get_type ? I2.field_get_type(f) : NULL;
+    void *kc = (ft && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(ft) : NULL;
+    return kc;
+}
+
 static const char *knownName(void *k) {
     if (!k) return NULL;
     if (k == g_linkerClass)  return "ActorLinker";
