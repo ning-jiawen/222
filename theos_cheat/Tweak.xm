@@ -856,6 +856,7 @@ static void  *g_lastDict    = NULL;   // v34：上一帧用的 dict / entries / 
 static void  *g_lastEntries = NULL;
 static int    g_lastCnt     = 0;
 // v35：生命周期字段（全部按名字从元数据取，取不到就是 -1，规则自动降级）
+static int g_offName = -1;      // v67f：name 偏移（按名解析，兜底 0x4B0）
 static int    g_offMeshVis   = -1;    // _meshVisible    网格是否可见
 static int    g_offLogicVis  = -1;    // _logicVisible   逻辑是否可见
 static int    g_offInCam     = -1;    // _inCamera
@@ -1751,6 +1752,13 @@ static void bindExtraLazy(void) {
     if (!g_skillCls)    g_skillCls    = clsOfField(g_linkerClass, "SkillComponent");
     g_charInfoCls = clsOfField(g_linkerClass, "charInfo");
     if (!g_charInfoCls) g_charInfoCls = clsOfField(g_linkerClass, "CharInfo");
+    // v67f：name 偏移按名解析（唯一一处曾硬编码的偏移）
+    {
+        void *nf = findField(g_linkerClass, "name");
+        if (nf) g_offName = (int)I2.field_get_offset(nf);
+        if (g_offName < 0) g_offName = 0x4B0;
+        CHECK("NAME off %d (resolved %d)", g_offName, nf ? 1 : 0);
+    }
     CHECK("KNOWN move %d value %d skill %d char %d | linker %d cam %d",
           g_moveCls ? 1 : 0, g_valueCls ? 1 : 0, g_skillCls ? 1 : 0, g_charInfoCls ? 1 : 0,
           g_linkerClass ? 1 : 0, g_uCamClass ? 1 : 0);
@@ -2105,7 +2113,7 @@ static const char *nameOfUnit(void *obj, unsigned int id) {
     if (!obj || !id) return "";
     for (int i = 0; i < g_nmN; i++) if (g_nmId[i] == id) return g_nmStr[i];
     void *sp = NULL;
-    rd((char *)obj + 0x4B0, &sp, sizeof(sp));
+    rd((char *)obj + ((g_offName >= 0) ? g_offName : 0x4B0), &sp, sizeof(sp));
     char tmp[40];
     tmp[0] = 0;
     if (okptr((uintptr_t)sp)) readStrUtf8(sp, tmp, sizeof(tmp));
@@ -2116,6 +2124,21 @@ static const char *nameOfUnit(void *obj, unsigned int id) {
         return g_nmStr[g_nmN - 1];
     }
     return "";
+}
+
+
+// v67e：name 字符串长度（只读 len@0x08，不解 UTF-16，零风险）
+// 被玩家操纵的英雄有名字，兵/塔/野怪没有 —— 这是不依赖 cfg 区间/T/pid 的硬判据。
+static int unitNameLen(void *v) {
+    if (!v) return 0;
+    int off = (g_offName >= 0) ? g_offName : 0x4B0;   // 解析不到时才退回旧值
+    void *sp = NULL;
+    if (!rd((char *)v + off, &sp, sizeof(sp))) return 0;
+    if (!okptr((uintptr_t)sp)) return 0;
+    int len = 0;
+    if (!rd((char *)sp + 0x08, &len, sizeof(len))) return 0;
+    if (len <= 0 || len > 64) return 0;
+    return len;
 }
 
 // v63：自己的世界坐标（优先 rawHostId 对应的单位，取不到就用相机点）
@@ -2302,9 +2325,41 @@ static void *findHeroForDeep(unsigned int *outId, int *outPid) {
         void *v = NULL, *k = NULL;
         if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
         if (rd(v, &k, sizeof(k)) && g_linkerClass && k != g_linkerClass) continue;
-        int T = 0, C = 0, pid = 0;
-        readIdentity2(v, &T, &C, NULL, &pid, NULL, NULL);
-        if (T != want || pid <= 0) continue;
+        int T = 0, C = 0, cfg = 0, pid = 0;
+        readIdentity2(v, &T, &C, &cfg, &pid, NULL, NULL);
+        // v67d：英雄判据改成「cfg>0 + 战场量级坐标 + mv==1」——
+        // v65 已证明英雄 pid 恒 0、T0 是展示类，旧判据只会打 "none"。
+        float pp[3] = {0, 0, 0};
+        rd((char *)v + 0x4C4, pp, sizeof(pp));
+        int big = ((pp[0] > 200.0f || pp[0] < -200.0f) || (pp[2] > 200.0f || pp[2] < -200.0f)) ? 1 : 0;
+        unsigned char mv = 1;
+        if (g_offMeshVis >= 0) { mv = 0; rd((char *)v + g_offMeshVis, &mv, 1); }
+        int nl = unitNameLen(v);
+        // v67e：优先「有名字 + 战场坐标」；其次 cfg>0 + big
+        int ok = (nl > 0 && big) || (cfg > 0 && big);
+        if (!ok) continue;
+        (void)want; (void)mv;
+        unsigned int id = 0;
+        rd((char *)v + 0x4AC, &id, 4);
+        if (!id) continue;
+        if (outId) *outId = id;
+        if (outPid) *outPid = pid;
+        return v;
+    }
+    // v67e 回退：只用「战场量级 + 在渲染」，不再用 T==heroType（T0 已证明是展示类）
+    for (int i = 0; i < lim; i++) {
+        void *v = NULL, *k = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        if (rd(v, &k, sizeof(k)) && g_linkerClass && k != g_linkerClass) continue;
+        int T = 0, C = 0, cfg = 0, pid = 0;
+        readIdentity2(v, &T, &C, &cfg, &pid, NULL, NULL);
+        (void)T; (void)cfg;
+        unsigned char mv2 = 1;
+        if (g_offMeshVis >= 0) { mv2 = 0; rd((char *)v + g_offMeshVis, &mv2, 1); }
+        if (!mv2) continue;
+        float pp[3] = {0, 0, 0};
+        rd((char *)v + 0x4C4, pp, sizeof(pp));
+        if (pp[0] == 0.0f && pp[2] == 0.0f) continue;
         unsigned int id = 0;
         rd((char *)v + 0x4AC, &id, 4);
         if (!id) continue;
@@ -2417,8 +2472,8 @@ static void probeUnits20(void) {
         if (shown < 20) {
             // v66b：cfg 是英雄判据的关键；big = 坐标是战场量级（几千）而不是展示台（±50）
             int big = ((p[0] > 200.0f || p[0] < -200.0f) || (p[2] > 200.0f || p[2] < -200.0f)) ? 1 : 0;
-            CHECK("U2 id %u T%d C%d cfg%d pid%d mv%d lv%d big%d @%.0f,%.0f",
-                  id, T, C, cfg, pid, mv ? 1 : 0, lv ? 1 : 0, big, p[0], p[2]);
+            CHECK("U2 id %u T%d C%d cfg%d pid%d mv%d lv%d big%d nl%d @%.0f,%.0f",
+                  id, T, C, cfg, pid, mv ? 1 : 0, lv ? 1 : 0, big, unitNameLen(v), p[0], p[2]);
             shown++;
         }
     }
@@ -2450,6 +2505,30 @@ static void probeUnits20(void) {
             if (!firstId) { firstId = id; firstCfg = cfg; firstT = T; }
         }
         CHECK("U2C cfg>0 & big: %d (mv1 %d) first id %u T%d cfg %d", cand, candMv, firstId, firstT, firstCfg);
+    }
+    // v67e：真正硬的判据 —— nl>0 && big（有名字 + 战场坐标）
+    {
+        int n2 = 0, n2mv = 0; unsigned int fid = 0; int fT = 0, fCfg = 0, fNl = 0;
+        for (int i = 0; i < lim; i++) {
+            void *v = NULL, *k = NULL;
+            if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+            if (rd(v, &k, sizeof(k)) && k != g_linkerClass) continue;
+            int nl = unitNameLen(v);
+            if (nl <= 0) continue;
+            float p[3] = {0, 0, 0};
+            rd((char *)v + 0x4C4, p, sizeof(p));
+            int big = ((p[0] > 200.0f || p[0] < -200.0f) || (p[2] > 200.0f || p[2] < -200.0f)) ? 1 : 0;
+            if (!big) continue;
+            unsigned char mv = 1;
+            if (g_offMeshVis >= 0) { mv = 0; rd((char *)v + g_offMeshVis, &mv, 1); }
+            unsigned int id = 0; rd((char *)v + 0x4AC, &id, 4);
+            int T = 0, C = 0, cfg = 0;
+            readIdentity2(v, &T, &C, &cfg, NULL, NULL, NULL);
+            n2++;
+            if (mv) n2mv++;
+            if (!fid) { fid = id; fT = T; fCfg = cfg; fNl = nl; }
+        }
+        CHECK("U2N nl>0 & big: %d (mv1 %d) first id %u T%d cfg %d nl %d", n2, n2mv, fid, fT, fCfg, fNl);
     }
 }
 // ================= v64：L2 / L3（合并扫描） =================
@@ -2573,12 +2652,15 @@ static void probeL2(void) {
         void *v = NULL, *k = NULL;
         if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
         if (rd(v, &k, sizeof(k)) && g_linkerClass && k != g_linkerClass) continue;
-        int T = 0, C = 0, pid = 0;
-        readIdentity2(v, &T, &C, NULL, &pid, NULL, NULL);
-        unsigned char mv = 1;
-        if (g_offMeshVis >= 0) { mv = 0; rd((char *)v + g_offMeshVis, &mv, 1); }
-        if (!mv) continue;                       // 只采屏幕上真实渲染的
-        if (needType && T != want) continue;
+        int T = 0, C = 0, cfg = 0, pid = 0;
+        readIdentity2(v, &T, &C, &cfg, &pid, NULL, NULL);
+        float pp2[3] = {0, 0, 0};
+        rd((char *)v + 0x4C4, pp2, sizeof(pp2));
+        int big2 = ((pp2[0] > 200.0f || pp2[0] < -200.0f) || (pp2[2] > 200.0f || pp2[2] < -200.0f)) ? 1 : 0;
+        if (!big2) continue;                     // 只采战场量级坐标（排除展示台）
+        int nl2 = unitNameLen(v);
+        if (!(nl2 > 0 || cfg > 0)) continue;     // v67e：有名字优先，其次有配置 id
+        (void)needType; (void)want;
         unsigned int id = 0; rd((char *)v + 0x4AC, &id, 4);
         if (!id) continue;
         ids[hn] = id; objs[hn] = v; hn++;
@@ -2723,18 +2805,40 @@ static void probeMove(void) {
     unsigned int hid[3] = {0, 0, 0};
     int hn = 0;
     {
-        int lim2 = (g_lastCnt < 160) ? g_lastCnt : 160;
+        int lim2 = (g_lastCnt < 256) ? g_lastCnt : 256;
         int want = (g_heroType >= 0) ? g_heroType : 0;
+        // v67d：先用「cfg>0 + 战场量级坐标」挑（英雄 pid 恒 0，旧判据必然空）
         for (int i = 0; i < lim2 && hn < 3; i++) {
             void *v = NULL, *k = NULL;
             if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
             if (rd(v, &k, sizeof(k)) && g_linkerClass && k != g_linkerClass) continue;
-            int T = 0, C = 0, pid = 0;
-            readIdentity2(v, &T, &C, NULL, &pid, NULL, NULL);
-            if (T != want || pid <= 0) continue;
+            int T = 0, C = 0, cfg = 0, pid = 0;
+            readIdentity2(v, &T, &C, &cfg, &pid, NULL, NULL);
+            float pp[3] = {0, 0, 0};
+            rd((char *)v + 0x4C4, pp, sizeof(pp));
+            int big = ((pp[0] > 200.0f || pp[0] < -200.0f) || (pp[2] > 200.0f || pp[2] < -200.0f)) ? 1 : 0;
+            if (!big) continue;
+            int nl = unitNameLen(v);
+            if (!(nl > 0 || cfg > 0)) continue;      // v67e：有名字优先，其次有配置 id
             unsigned int id2 = 0; rd((char *)v + 0x4AC, &id2, 4);
             if (!id2) continue;
             hv[hn] = v; hid[hn] = id2; hn++;
+        }
+        // 回退：一个都没有时按类型兜底
+        if (hn == 0) {
+            for (int i = 0; i < lim2 && hn < 3; i++) {
+                void *v = NULL, *k = NULL;
+                if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+                if (rd(v, &k, sizeof(k)) && g_linkerClass && k != g_linkerClass) continue;
+                int T = 0; readIdentity2(v, &T, NULL, NULL, NULL, NULL, NULL);
+                if (T != want) continue;
+                float pp[3] = {0, 0, 0};
+                rd((char *)v + 0x4C4, pp, sizeof(pp));
+                if (pp[0] == 0.0f && pp[2] == 0.0f) continue;
+                unsigned int id2 = 0; rd((char *)v + 0x4AC, &id2, 4);
+                if (!id2) continue;
+                hv[hn] = v; hid[hn] = id2; hn++;
+            }
         }
     }
     if (hn == 0) { CHECK("MV none (heroType %d)", g_heroType); return; }
