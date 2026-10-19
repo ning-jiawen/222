@@ -1212,7 +1212,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v81 ====");
+    CHECK("==== dump v82 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1223,7 +1223,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v81 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v82 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -2948,6 +2948,15 @@ static void v73Tick(void) {
     if (g_v73Ran) return;
     if (!g_inMatch) return;
     if (g_v73State == V73_IDLE) {
+        {   // v82：每 5 秒报一次「为什么还没开始」，下次不用再猜
+            static double s_waitT = 0;
+            double nw = CACurrentMediaTime();
+            if (nw >= s_waitT) {
+                s_waitT = nw + 5.0;
+                checkLine("V73 wait frame %d inMatch %d u %d mask 0x%x",
+                          g_frameStamp, g_inMatch, g_unitCount, g_probeMask);
+            }
+        }
         int force = (g_probeMask & 0x100) ? 1 : 0;
         int ft    = (g_probeMask & 0x01) ? 1 : 0;
         if (force && g_frameStamp < 600) {            // v81：配置写错也不许加载期动手
@@ -3207,7 +3216,7 @@ static void rtConnect(void) {
     int r = connect(sk, (struct sockaddr *)&a, sizeof(a));
     if (r < 0 && errno != EINPROGRESS) { close(sk); return; }
     g_rtSock = sk;
-    CHECK("RT conn %s:%d", g_rtIP, g_rtPort);
+    { static int s_connN = 0; if (s_connN < 3) { s_connN++; CHECK("RT conn %s:%d", g_rtIP, g_rtPort); } }
     rtSendLine("boot v80 hb");        // v80：一连上就先发一条，登录界面就能确认通路
 }
 
@@ -3226,7 +3235,10 @@ static void rtSendLine(const char *line) {
     memcpy(frame + 8, &len32, 4);
     memcpy(frame + 12, payload, (size_t)n);
     ssize_t w = send(g_rtSock, frame, 12 + (size_t)n, 0);
-    if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { close(g_rtSock); g_rtSock = -1; }
+    if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        { static int s_errN = 0; if (s_errN < 3) { s_errN++; CHECK("RT send fail errno %d", errno); } }
+        close(g_rtSock); g_rtSock = -1;
+    }
 }
 
 // 每帧调用：按时间片做发现/连接，永不阻塞
@@ -4671,6 +4683,10 @@ static void probeActorLists(void) { }
 // Dictionary<UInt32,Object> 的 Entry：hashCode(4) next(4) key(4) pad(4) value(8) = 24B
 // 数组头 0x20（klass 8 + monitor 8 + bounds 8 + length 4 + pad 4）。
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
+    // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
+    // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
+    rtTick();
+    v73Tick();
     g_boxDrawn = 0;                               // 每帧先归零：HUD 靠它判断「框到底画出来没有」
     if (!I2.domain || !g_mgr || !g_linkerClass) return;
     if (g_offDict < 0 || g_offCount < 0 || g_offEntries < 0) return;
@@ -4854,10 +4870,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         g_myCamp = 0; g_enemyN = -1;
         g_ceNext = 0; g_ceRuns = 0;      // v72：新对局重新开始采样窗口
     }
-    // v76：诊断包与 LAN 心跳必须在所有 early return 之前跑 ——
-    // v75 把它们放在 g_hideAll 之后，按过 ⊘ 就再也不会启动（实测就是这样丢的）。
-    rtTick();
-    v73Tick();
+    // v82：tick 已在 renderFrame 第一行调用，这里不再重复
     if (g_hideAll) {                               // v48：⊘ 只显示 HUD，不画任何框
         g_boxDrawn = 0;
         return;
@@ -5200,13 +5213,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v81  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v82  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v81\n"];
+    [s appendString:@"ESP v82\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -5282,14 +5295,14 @@ static void updateHud(void) {
     if (CALIB_ENABLE && PROBES_DEFAULT && t % 150 == 20 && g_unitCount >= 20 && g_calRuns < 2) { g_calRuns++; probeCalib(); }
     else if (!CALIB_ENABLE && t % 150 == 20 && g_calRuns < 1) { g_calRuns++; CHECK("CALIB disabled (v69)"); }
     if (PROBES_DEFAULT && t % 150 == 10 && g_unitCount >= 5 && g_rvaRuns < 1) { g_rvaRuns++; probeRVA(); }
-    // v76：这两个已前移到渲染函数最开头（g_hideAll 之前），此处不再调用
-    if ((g_probeMask & 0x08) && PROBES_DEFAULT && g_unitCount >= 5 && g_c2rRuns < 2 && t % 150 == 5) {
+    // v82：此处不再调用（已前移到 renderFrame 第一行）
+    if ((g_probeMask & 0x10) && PROBES_DEFAULT && g_unitCount >= 5 && g_c2rRuns < 2 && t % 150 == 5) {
         g_c2rRuns++; probeCampRaw();               // v73：CAMP2 元素布局定死
     }
     // v72：按时间采样（3 秒/拍，10 拍 ≈ 30 秒），不受帧率影响
     {
         double nowS = CACurrentMediaTime();
-        if ((g_probeMask & 0x01) && PROBES_DEFAULT && g_unitCount >= 5 && g_ceRuns < 12 && nowS >= g_ceNext) {
+        if ((g_probeMask & 0x08) && PROBES_DEFAULT && g_unitCount >= 5 && g_ceRuns < 12 && nowS >= g_ceNext) {
             g_ceRuns++;
             g_ceNext = nowS + 3.0;
             probeCampExp();
@@ -5443,7 +5456,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v81 booting";
+    l.text = @"ESP v82 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -5483,7 +5496,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v81 esp (final)");
+    ImGui::Text("build         : v82 esp (start-fix)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
