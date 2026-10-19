@@ -931,6 +931,37 @@ static int ciEq(const char *a, const char *b) {
 // v48/v49 用枚举做「忽略大小写 + k__BackingField」回退，这条路径在 v47 里不存在，
 // 而 v48 起开始闪退（枚举 API 在泛型/接口类上有踩到 il2cpp 内部断言的风险）。
 // 这里改成显式候选名：精确名 / 首字母大写 / 首字母小写 / <Name>k__BackingField。
+// ================= v67：指针校验层 =================
+// 三十几版里三次崩溃根因只有一个：**把未校验的指针喂给 il2cpp 函数**。
+// 规矩：任何从内存读出来的指针，在传给 il2cpp 之前必须过 okptr。
+static int g_safeRej = 0;
+
+static int okptr(uintptr_t v) {
+    if (v < 0x100000000ULL) return 0;     // 低于 4GB 一定不是本进程堆
+    if (v & 7) return 0;                   // 未 8 字节对齐
+    return 1;
+}
+
+static void *safeKlass(void *obj) {
+    if (!okptr((uintptr_t)obj)) { g_safeRej++; return NULL; }
+    void *k = NULL;
+    if (!rd(obj, &k, sizeof(k))) { g_safeRej++; return NULL; }
+    if (!okptr((uintptr_t)k)) { g_safeRej++; return NULL; }
+    return k;
+}
+
+// v67b：已知类缓存（全部来自 findCls / class_from_il2cpp_type，可信）
+static void *g_moveCls = NULL, *g_valueCls = NULL, *g_skillCls = NULL, *g_charInfoCls = NULL;
+
+static const char *safeClassName(void *k) {
+    if (!k || !I2.class_get_name) { g_safeRej++; return NULL; }
+    if (!okptr((uintptr_t)k)) { g_safeRej++; return NULL; }
+    const char *n = I2.class_get_name(k);      // 只有 ovptr 过了才调
+    if (n && !okptr((uintptr_t)n)) { g_safeRej++; return NULL; }
+    return n;
+}
+// ================= v67 safe layer end =================
+
 static void *findFieldOne(void *cls, const char *name) {
     if (!cls || !I2.class_get_field_from_name) return NULL;
     void *f = I2.class_get_field_from_name(cls, name);
@@ -1006,12 +1037,14 @@ static int    g_campMemRuns = 0; // v60：阵营成员关系探针次数
 #define CAMP_ENABLE 0            // v65b：probeCamps/probeCampMem 用裸函数指针调用，先关
 static int    g_l2Runs  = 0;     // v64：L2 连续采样次数
 static int    g_l3Runs  = 0;     // v64：L3（L3a+L3b 合并扫描）次数
+static int    g_u2Runs  = 0;     // v66：U2 单位身份探针次数
 #define L3_ENABLE 0              // v65：进对局闪退，先关掉全表扫描止血（改 1 可恢复）
 static void   probeCamps(void);
 static void   probeMove(void);
 static void   probeHeroDeep(void);
 static void   probeCampMem(void);
 static void   probeL2(void);
+static void   probeUnits20(void);
 static void   probeL3scan(void);
 static void  *fieldByNameish(void *cls, const char *name);
 static void   bindExtraLazy(void);
@@ -1120,7 +1153,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v65 ====");
+    CHECK("==== dump v67 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1131,7 +1164,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v65 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v67 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1293,6 +1326,22 @@ static void *findCls(const char *ns, const char *name) {
 }
 
 static void *g_mgrClass = NULL, *g_linkerClass = NULL, *g_vpClass = NULL;
+
+// v67b：**只对已知类打名字**。未命中就返回 NULL —— 调用方不得再调 il2cpp。
+// 理由：对齐且可读的指针也可能是"不是类"的指针，class_get_name 会按 Il2CppClass 布局去读，
+// 读到任意值甚至中途崩。已知类比对是唯一可靠的路子。
+static const char *knownName(void *k) {
+    if (!k) return NULL;
+    if (k == g_linkerClass)  return "ActorLinker";
+    if (k == g_uCamClass)    return "GuishiCamera";
+    if (k == g_camKlass)     return "Camera";
+    if (k == g_moveCls)      return "MoveComponent";
+    if (k == g_valueCls)     return "ValueComponent";
+    if (k == g_skillCls)     return "SkillControl";
+    if (k == g_charInfoCls)  return "CharInfo";
+    return NULL;
+}
+
 
 // v17：按「字段类型名」找静态，处理 v16 漏掉的两种情况：
 //   ① 静态字段是 T[]（数组里放着目标对象）
@@ -1680,6 +1729,18 @@ static void bindExtraLazy(void) {
     if (done) return;
     done = 1;
     if (!g_linkerClass) { CHECK("LAZY no linkerClass"); return; }
+    // v67c：组件类**预登记** —— 必须先登记再解包，否则一个正确的 MoveComponent 指针
+    // 会因为 g_moveCls 还是 NULL 被判成 "unknown class"，把好数据丢掉。
+    g_moveCls     = clsOfField(g_linkerClass, "MoveComponent");
+    if (!g_moveCls)     g_moveCls     = clsOfField(g_linkerClass, "MoveControl");
+    g_valueCls    = clsOfField(g_linkerClass, "ValueComponent");
+    g_skillCls    = clsOfField(g_linkerClass, "SkillControl");
+    if (!g_skillCls)    g_skillCls    = clsOfField(g_linkerClass, "SkillComponent");
+    g_charInfoCls = clsOfField(g_linkerClass, "charInfo");
+    if (!g_charInfoCls) g_charInfoCls = clsOfField(g_linkerClass, "CharInfo");
+    CHECK("KNOWN move %d value %d skill %d char %d | linker %d cam %d",
+          g_moveCls ? 1 : 0, g_valueCls ? 1 : 0, g_skillCls ? 1 : 0, g_charInfoCls ? 1 : 0,
+          g_linkerClass ? 1 : 0, g_uCamClass ? 1 : 0);
     // ---- v42：死亡 / 轨迹相关（同一个「按名字问偏移」的路子）
     void *f2;
     // v42/v43：lastDeadKiller 到底是「对象指针」还是「int id」，问字段类型 —— 不猜。
@@ -2033,7 +2094,8 @@ static const char *nameOfUnit(void *obj, unsigned int id) {
     void *sp = NULL;
     rd((char *)obj + 0x4B0, &sp, sizeof(sp));
     char tmp[40];
-    readStrUtf8(sp, tmp, sizeof(tmp));
+    tmp[0] = 0;
+    if (okptr((uintptr_t)sp)) readStrUtf8(sp, tmp, sizeof(tmp));
     if (g_nmN < 32) {
         g_nmId[g_nmN] = id;
         snprintf(g_nmStr[g_nmN], 40, "%s", tmp);
@@ -2044,8 +2106,8 @@ static const char *nameOfUnit(void *obj, unsigned int id) {
 }
 
 // v63：自己的世界坐标（优先 rawHostId 对应的单位，取不到就用相机点）
-#define NAME_ON 0     // v65：名字解码从未单独验证过（name@0x4B0 若偏移不对就是读野指针），先关
-#define DEEP_ENABLE 0 // v65：深度 dump 的 PoolObjHandle 解包会用未校验 tk 调 class_get_name，先关
+#define NAME_ON 1     // v67：名字解码重新打开（读取前已过 okptr 校验）
+#define DEEP_ENABLE 1 // v67：深度 dump 打开（解包已改走 safeKlass/safeClassName）
 
 static float g_selfX = 0, g_selfZ = 0;
 static int   g_selfOk = 0;
@@ -2157,6 +2219,16 @@ static void dumpOneComponent(const char *fieldName, void *hero, int maxLines) {
             return;
         }
     }
+    // v67b：先把解析出来的类登记进已知表（它们都来自元数据，可信），再打名字
+    {
+        const char *raw = I2.class_get_name ? I2.class_get_name(kc) : NULL;
+        if (raw) {
+            if (strstr(raw, "MoveComponent"))       g_moveCls = kc;
+            else if (strstr(raw, "ValueComponent")) g_valueCls = kc;
+            else if (strstr(raw, "SkillControl"))   g_skillCls = kc;
+            else if (strstr(raw, "CharInfo"))       g_charInfoCls = kc;
+        }
+    }
     const char *cn = I2.class_get_name ? I2.class_get_name(kc) : "?";
     CHECK("HID %s @%d %s %s", fieldName, off, isVal ? "inline" : "ptr", cn ? cn : "?");
     // v62：PoolObjHandle<T> 只是包装，真正的组件在 _handleObj 里 —— 必须再解一层，
@@ -2182,11 +2254,13 @@ static void dumpOneComponent(const char *fieldName, void *hero, int maxLines) {
                 if (!target) {
                     CHECK("HID   _handleObj null");
                 } else {
-                    void *tk = NULL;
-                    if (rd(target, &tk, sizeof(tk)) && tk) {
-                        const char *tcn = I2.class_get_name ? I2.class_get_name(tk) : "?";
-                        CHECK("HID   unwrap _handleObj -> %s", tcn ? tcn : "?");
+                    void *tk = safeKlass(target);
+                    const char *kn = knownName(tk);
+                    if (tk && kn) {
+                        CHECK("HID   unwrap _handleObj -> %s", kn);
                         dumpObjFields("HID   ", target, tk, 30);
+                    } else {
+                        CHECK("HID   unwrap rejected (unknown class, safeRej %d)", g_safeRej);
                     }
                 }
             }
@@ -2301,6 +2375,70 @@ static void probeCampMem(void) {
 // ================= v60 end =================
 
 
+// ================= v66：U2 —— 前 20 个单位逐个暴露身份 =================
+// 目的：搞清楚 T0 到底是不是英雄。同时给出「每个 T 里有多少正在渲染(mv1)」。
+static void probeUnits20(void) {
+    if (!g_lastEntries || g_lastCnt <= 0 || !g_linkerClass) { CHECK("U2 no entries"); return; }
+    int lim = (g_lastCnt < 160) ? g_lastCnt : 160;
+    int shown = 0;
+    int tId[8] = {0}, tTot[8] = {0}, tMv[8] = {0};
+    for (int i = 0; i < lim; i++) {
+        void *v = NULL, *k = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        if (rd(v, &k, sizeof(k)) && k != g_linkerClass) continue;
+        int T = 0, C = 0, cfg = 0, pid = 0;
+        readIdentity2(v, &T, &C, &cfg, &pid, NULL, NULL);
+        unsigned int id = 0; rd((char *)v + 0x4AC, &id, 4);
+        unsigned char mv = 1, lv = 1;
+        if (g_offMeshVis  >= 0) { mv = 0; rd((char *)v + g_offMeshVis,  &mv, 1); }
+        if (g_offLogicVis >= 0) { lv = 0; rd((char *)v + g_offLogicVis, &lv, 1); }
+        float p[3] = {0, 0, 0};
+        rd((char *)v + 0x4C4, p, sizeof(p));
+
+        // 直方图：每个 T 的总数与「渲染中」数
+        int slot = -1;
+        for (int z = 0; z < 8; z++) if (tId[z] == T) { slot = z; break; }
+        if (slot < 0) { for (int z = 0; z < 8; z++) if (tTot[z] == 0) { slot = z; tId[z] = T; break; } }
+        if (slot >= 0) { tTot[slot]++; if (mv) tMv[slot]++; }
+
+        if (shown < 20) {
+            // v66b：cfg 是英雄判据的关键；big = 坐标是战场量级（几千）而不是展示台（±50）
+            int big = ((p[0] > 200.0f || p[0] < -200.0f) || (p[2] > 200.0f || p[2] < -200.0f)) ? 1 : 0;
+            CHECK("U2 id %u T%d C%d cfg%d pid%d mv%d lv%d big%d @%.0f,%.0f",
+                  id, T, C, cfg, pid, mv ? 1 : 0, lv ? 1 : 0, big, p[0], p[2]);
+            shown++;
+        }
+    }
+    char th[200]; int q = 0; th[0] = 0;
+    for (int z = 0; z < 8 && q < 180; z++) {
+        if (tTot[z] == 0) continue;
+        q += snprintf(th + q, sizeof(th) - q, "T%d=%d/mv%d ", tId[z], tTot[z], tMv[z]);
+    }
+    CHECK("U2H %s", th);
+    // v66b：按「cfg>0 + 战场量级」筛一遍 —— 这才是英雄候选的正确判据
+    {
+        int cand = 0, candMv = 0; unsigned int firstId = 0; int firstCfg = 0, firstT = 0;
+        for (int i = 0; i < lim; i++) {
+            void *v = NULL, *k = NULL;
+            if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+            if (rd(v, &k, sizeof(k)) && k != g_linkerClass) continue;
+            int T = 0, C = 0, cfg = 0, pid = 0;
+            readIdentity2(v, &T, &C, &cfg, &pid, NULL, NULL);
+            if (cfg <= 0) continue;
+            float p[3] = {0, 0, 0};
+            rd((char *)v + 0x4C4, p, sizeof(p));
+            int big = ((p[0] > 200.0f || p[0] < -200.0f) || (p[2] > 200.0f || p[2] < -200.0f)) ? 1 : 0;
+            if (!big) continue;
+            unsigned char mv = 1;
+            if (g_offMeshVis >= 0) { mv = 0; rd((char *)v + g_offMeshVis, &mv, 1); }
+            unsigned int id = 0; rd((char *)v + 0x4AC, &id, 4);
+            cand++;
+            if (mv) candMv++;
+            if (!firstId) { firstId = id; firstCfg = cfg; firstT = T; }
+        }
+        CHECK("U2C cfg>0 & big: %d (mv1 %d) first id %u T%d cfg %d", cand, candMv, firstId, firstT, firstCfg);
+    }
+}
 // ================= v64：L2 / L3（合并扫描） =================
 // ① L3a/L3b 合并成一次全表遍历：只卡一次，两段看到同一帧类表
 // ② L2 每行带 via（组件字段名@偏移 + 类名），判据在日志里自证
@@ -2414,7 +2552,8 @@ static L2Ent g_l2[3];
 static void probeL2(void) {
     unsigned int ids[3]; void *objs[3]; int hn = 0;
     int lim = (g_lastCnt < 160) ? g_lastCnt : 160;
-    // v65：heroType 认不出来时不再卡死 —— 退化成「pid>0 且有 ObjID」的候选
+    // v66：候选改成「正在渲染(mv==1)」的单位 —— T0 全是 mv0 的镜像类，pid 也恒 0，
+    //      只有 mv==1 才是屏幕上真实存在、能动的那批。仍保留 type 优先。
     int needType = (g_heroType >= 0);
     int want = needType ? g_heroType : 0;
     for (int i = 0; i < lim && hn < 3; i++) {
@@ -2423,13 +2562,15 @@ static void probeL2(void) {
         if (rd(v, &k, sizeof(k)) && g_linkerClass && k != g_linkerClass) continue;
         int T = 0, C = 0, pid = 0;
         readIdentity2(v, &T, &C, NULL, &pid, NULL, NULL);
-        if (pid <= 0) continue;
+        unsigned char mv = 1;
+        if (g_offMeshVis >= 0) { mv = 0; rd((char *)v + g_offMeshVis, &mv, 1); }
+        if (!mv) continue;                       // 只采屏幕上真实渲染的
         if (needType && T != want) continue;
         unsigned int id = 0; rd((char *)v + 0x4AC, &id, 4);
         if (!id) continue;
         ids[hn] = id; objs[hn] = v; hn++;
     }
-    if (hn == 0) { CHECK("L2 none (heroType %d, no pid>0 candidate)", g_heroType); return; }
+    if (hn == 0) { CHECK("L2 none (no mv1 unit, heroType %d)", g_heroType); return; }
 
     for (int i = 0; i < hn; i++) {
         void *f = findField(g_linkerClass, "MoveComponent");
@@ -2479,18 +2620,34 @@ static void probeL2(void) {
                 continue;
             }
         }
-        // v65：PoolObjHandle 解包整段停用。
-        // 旧写法会把 rd 出来的 target 当对象、再用它首 8 字节当 klass 去调 class_get_name(tk)——
-        // target 是野指针但"恰好可读"时 tk 就是垃圾，class_get_name 直接炸（和"值类型当 klass"同一个坑）。
+        // v67：PoolObjHandle 解包恢复，但每一步都过安全层（这是当初必崩的那条路）
         const char *viaKind = "ptr";
         {
-            const char *cn = I2.class_get_name ? I2.class_get_name(mcls) : "?";
+            const char *cn = safeClassName(mcls);
             if (cn && strstr(cn, "PoolObjHandle")) {
-                CHECK("L2 id %u via PoolObjHandle (unwrap disabled)", ids[i]);
-                continue;                      // 这一拍跳过：不解包、不猜类
+                void *hf = findFieldOne(mcls, "_handleObj");
+                int hoff = hf ? (int)I2.field_get_offset(hf) : -1;
+                if (hoff <= 0) {
+                    CHECK("L2 id %u via PoolObjHandle (offset %d, skip)", ids[i], hoff);
+                    continue;
+                }
+                void *target = NULL;
+                if (!rd((char *)mc + hoff, &target, sizeof(target)) || !okptr((uintptr_t)target)) {
+                    CHECK("L2 id %u via PoolObjHandle (target rejected)", ids[i]);
+                    continue;
+                }
+                void *tk = safeKlass(target);
+                const char *kn = knownName(tk);
+                if (!tk || !kn) {
+                    CHECK("L2 id %u via PoolObjHandle (unknown class, rejected)", ids[i]);
+                    continue;
+                }
+                viaKind = "PoolObjHandle";
+                mc = target; mcls = tk;
+                (void)kn;
             }
         }
-        const char *ccn = I2.class_get_name ? I2.class_get_name(mcls) : "?";
+        const char *ccn = knownName(mcls); if (!ccn) ccn = "?";
         void *fc = findField(mcls, "curPosition");
         void *fr = findField(mcls, "remotePosition");
         float cv[3] = {0, 0, 0}, rv[3] = {0, 0, 0};
@@ -2766,7 +2923,7 @@ static void fogProbe(void) {
         }
     }
     float now = (float)CACurrentMediaTime();
-    int lim = (g_lastCnt < 160) ? g_lastCnt : 160;   // v59：和绘制/直方图一致，别漏掉排在后面的英雄
+    int lim = (g_lastCnt < 256) ? g_lastCnt : 256;   // v66b：和直方图一致，256 覆盖全量
 
     unsigned int lid[16]; float lp[16][3]; int lT[16], lC[16], lmv[16], llv[16], lcam[16];
     int lPid[16];
@@ -2956,7 +3113,7 @@ static void verifyIdentity(void) {
     // v59：数组从 16 扩到 32、扫描上限从 64 提到 160 ——
     // 实测 u=137 时英雄排在 64 之后，旧上限把 T0 整类漏掉，白名单因此自证失败。
     int tv[32] = {0}, tc[32] = {0}, n = 0;
-    int lim = (g_lastCnt < 160) ? g_lastCnt : 160;
+    int lim = (g_lastCnt < 256) ? g_lastCnt : 256;   // v66b：直方图也要看全量（原来只扫 64/160）
     for (int i = 0; i < lim; i++) {
         void *v = NULL, *k = NULL;
         if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
@@ -3790,13 +3947,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v65  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v67  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v65\n"];
+    [s appendString:@"ESP v67\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -3868,6 +4025,7 @@ static void updateHud(void) {
     if (CAMP_ENABLE && PROBES_DEFAULT && t % 150 == 120 && g_unitCount >= 40 && g_campMemRuns < 1) { g_campMemRuns++; probeCampMem(); }
     // v64：L2 连续 8 拍（40 秒），L3a/L3b 各一次
     if (PROBES_DEFAULT && t % 150 == 30 && g_unitCount >= 40 && g_l2Runs < 8) { g_l2Runs++; probeL2();   }
+    if (PROBES_DEFAULT && t % 150 == 50 && g_unitCount >= 40 && g_u2Runs < 2) { g_u2Runs++; probeUnits20(); }
     if (L3_ENABLE && PROBES_DEFAULT && t % 150 == 70 && g_unitCount >= 40 && g_l3Runs < 1) { g_l3Runs++; probeL3scan(); }
     else if (!L3_ENABLE && t % 150 == 70 && g_l3Runs < 1) { g_l3Runs++; CHECK("L3 disabled (v65)"); }
     if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
@@ -4016,7 +4174,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v65 booting";
+    l.text = @"ESP v67 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -4056,7 +4214,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v65 esp (no-L3)");
+    ImGui::Text("build         : v67 esp (safe+Dump)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
