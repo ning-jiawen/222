@@ -1010,6 +1010,8 @@ static int    g_campMemRuns = 0; // v60：阵营成员关系探针次数
 static int    g_l2Runs  = 0;     // v64：L2 连续采样次数
 static int    g_l3Runs  = 0;     // v64：L3（L3a+L3b 合并扫描）次数
 static int    g_u2Runs  = 0;     // v66：U2 单位身份探针次数
+static int    g_calRuns = 0;     // v68：CALIB 标定次数
+static int    g_rvaRuns = 0;     // v68b：RVA 探针次数
 #define L3_ENABLE 0              // v65：进对局闪退，先关掉全表扫描止血（改 1 可恢复）
 static void   probeCamps(void);
 static void   probeMove(void);
@@ -1017,6 +1019,8 @@ static void   probeHeroDeep(void);
 static void   probeCampMem(void);
 static void   probeL2(void);
 static void   probeUnits20(void);
+static void   probeCalib(void);
+static void   probeRVA(void);
 static void   probeL3scan(void);
 static void  *fieldByNameish(void *cls, const char *name);
 static void   bindExtraLazy(void);
@@ -1125,7 +1129,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v67 ====");
+    CHECK("==== dump v68 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1136,7 +1140,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v67 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v68 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -2442,6 +2446,187 @@ static void probeCampMem(void) {
 }
 // ================= v60 end =================
 
+
+// v68c：把某个 image 的 LC_UUID 打出来（同一构建校验；UUID 不一致 RVA 全部作废）
+static void printUUIDofImage(const char *want) {
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm || !strstr(nm, want)) continue;
+        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!h) continue;
+        const struct load_command *lc = (const struct load_command *)((const char *)h + sizeof(struct mach_header_64));
+        for (uint32_t c = 0; c < h->ncmds && lc; c++) {
+            if (lc->cmd == LC_UUID) {
+                unsigned char u[16];
+                memcpy(u, ((const struct uuid_command *)lc)->uuid, 16);
+                CHECK("UUID %s = %02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X (img %u)",
+                      want, u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+                      u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15], i);
+                return;
+            }
+            lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+        }
+        CHECK("UUID %s = (no LC_UUID) img %u", want, i);
+        return;
+    }
+    CHECK("UUID %s = (image not loaded)", want);
+}
+
+// ================= v68b：RVA —— methodPointer 归属到 image + __TEXT 偏移 =================
+// 输出形如：RVA get_position = 0x3f2a1c0  (img 3 UnityFramework, slide 0x10a000000)
+static void rvaOfMethod(const char *tag, void *mp) {
+    if (!mp) { CHECK("RVA %s = null", tag); return; }
+    uintptr_t p = (uintptr_t)mp;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!h) continue;
+        uintptr_t textVm = 0, textSz = 0;
+        const struct load_command *lc = (const struct load_command *)((const char *)h + sizeof(struct mach_header_64));
+        for (uint32_t c = 0; c < h->ncmds && lc; c++) {
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+                if (strcmp(seg->segname, "__TEXT") == 0) { textVm = (uintptr_t)seg->vmaddr; textSz = (uintptr_t)seg->vmsize; }
+            }
+            lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+        }
+        if (!textSz) continue;
+        uintptr_t base = (uintptr_t)h;                 // __TEXT 头地址 == slide + textVm
+        if (p >= base && p < base + textSz) {
+            CHECK("RVA %-26s = 0x%llx  (img %u %s slide 0x%llx)",
+                  tag, (unsigned long long)(p - base), i,
+                  _dyld_get_image_name(i) ? _dyld_get_image_name(i) : "?",
+                  (unsigned long long)_dyld_get_image_vmaddr_slide(i));
+            return;
+        }
+    }
+    CHECK("RVA %-26s = ? (mp %p 不在任何 image 的 __TEXT 内)", tag, mp);
+}
+
+// 打一个类里「名字含 position/Position」的所有方法（getter/setter 都在内）
+static void rvaScanPosition(void *cls, const char *clsName, int maxOut) {
+    if (!cls || !I2.class_get_methods || !I2.method_get_name) { CHECK("RVA %s skip", clsName); return; }
+    void *it = NULL;
+    void **ms = I2.class_get_methods(cls, &it);
+    if (!ms) { CHECK("RVA %s no methods", clsName); return; }
+    int shown = 0;
+    for (int i = 0; ms[i] && shown < maxOut; i++) {
+        void *mi = ms[i];
+        const char *mn = I2.method_get_name(mi);
+        if (!mn) continue;
+        if (!strstr(mn, "osition") && !strstr(mn, "OSITION")) continue;
+        void *mp = NULL;
+        if (!rd(mi, &mp, sizeof(mp)) || !mp) { CHECK("RVA %s::%s mp null", clsName, mn); continue; }
+        char tag[96];
+        snprintf(tag, sizeof(tag), "%s::%s", clsName, mn);
+        rvaOfMethod(tag, mp);
+        shown++;
+    }
+    if (!shown) CHECK("RVA %s: 没有含 position 的方法", clsName);
+}
+
+static void probeRVA(void) {
+    if (!g_linkerClass) { CHECK("RVA no linkerClass"); return; }
+    // v68c：先自证构建（UUID 不一致 → RVA 无意义）
+    printUUIDofImage("UnityFramework");
+    printUUIDofImage("smoba");
+    rvaScanPosition(g_linkerClass, "ActorLinker", 8);
+    if (g_moveCls) rvaScanPosition(g_moveCls, "MoveComponent", 8);
+    else CHECK("RVA MoveComponent 未登记（KNOWN move 0）");
+    if (g_valueCls) rvaScanPosition(g_valueCls, "ValueComponent", 6);
+}
+
+// ================= v68：CALIB —— 以「自己」为锚点标定世界坐标字段 =================
+// 自己 = ObjID == g_rawHostId（日志里 "raw 29 ok 1" 就是它）。
+// 把它的每个 Vector3/VInt3 字段投影到屏幕：英雄永远在屏幕中心附近，
+// 所以「投影最接近屏幕中心」的那个字段就是世界坐标。
+static void probeCalib(void) {
+    if (!g_lastEntries || g_lastCnt <= 0 || !g_linkerClass) { CHECK("CALIB no entries"); return; }
+    if (!g_rawOk || g_rawHostId <= 0) { CHECK("CALIB no rawHostId"); return; }
+    int lim = (g_lastCnt < 256) ? g_lastCnt : 256;
+    void *self = NULL; unsigned int selfId = 0;
+    for (int i = 0; i < lim && !self; i++) {
+        void *v = NULL, *k = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        if (rd(v, &k, sizeof(k)) && k != g_linkerClass) continue;
+        unsigned int id = 0; rd((char *)v + 0x4AC, &id, 4);
+        if (id == (unsigned int)g_rawHostId) { self = v; selfId = id; }
+    }
+    if (!self) { CHECK("CALIB self id %d not found", g_rawHostId); return; }
+    {
+        int T = 0, C = 0, cfg = 0, pid = 0;
+        readIdentity2(self, &T, &C, &cfg, &pid, NULL, NULL);
+        float p0[3] = {0, 0, 0};
+        rd((char *)self + 0x4C4, p0, sizeof(p0));
+        CHECK("CALIB self id %u T%d C%d cfg%d pid%d pos0 %.0f,%.0f", selfId, T, C, cfg, pid, p0[0], p0[2]);
+    }
+    // 逐个 Vector3/VInt3 字段投影
+    int shown = 0, best = -1;
+    float bestD = 1e18f, bestOff = 0, bestX = 0, bestY = 0;
+    const char *bestName = "";
+    void *cls = g_linkerClass;
+    for (int lv = 0; lv < 5 && cls && shown < 30; lv++) {
+        void *it = NULL;
+        void **fs = I2.class_get_fields ? I2.class_get_fields(cls, &it) : NULL;
+        if (!fs) break;
+        for (int i = 0; fs[i] && shown < 30; i++) {
+            void *f = fs[i];
+            const char *fn = I2.field_get_name ? I2.field_get_name(f) : NULL;
+            if (!fn) continue;
+            void *ft = I2.field_get_type ? I2.field_get_type(f) : NULL;
+            const char *tn = (ft && I2.type_get_name) ? I2.type_get_name(ft) : NULL;
+            if (!tn) continue;
+            if (!strstr(tn, "Vector3") && !strstr(tn, "VInt3") && !strstr(tn, "Vector2")) continue;
+            int off = (int)I2.field_get_offset(f);
+            if (off <= 0) continue;
+            float v[3] = {0, 0, 0};
+            if (!rd((char *)self + off, v, sizeof(v))) continue;
+            float sx = 0, sy = 0;
+            int ok = w2sPx(v[0], v[1], v[2], &sx, &sy);
+            CHECK("CALIB %s @%d v %.0f,%.0f,%.0f -> s %.0f,%.0f %s",
+                  fn, off, v[0], v[1], v[2], sx, sy, ok ? "ok" : "off");
+            shown++;
+            if (ok) {
+                float dx = sx - g_scrW * 0.5f, dy = sy - g_scrH * 0.5f;
+                float d = dx * dx + dy * dy;
+                if (d < bestD) { bestD = d; best = off; bestName = fn; bestOff = (float)off; bestX = sx; bestY = sy; }
+            }
+        }
+        cls = I2.class_get_parent ? I2.class_get_parent(cls) : NULL;
+    }
+    if (best > 0) CHECK("CALIB BEST %s @%.0f -> s %.0f,%.0f (d %.0f)", bestName, bestOff, bestX, bestY, sqrtf(bestD));
+    else          CHECK("CALIB BEST none");
+    // 自己的标量字段（找 HP / CD 用）
+    {
+        int n = 0; void *c2 = g_linkerClass;
+        for (int lv = 0; lv < 5 && c2 && n < 40; lv++) {
+            void *it2 = NULL;
+            void **fs2 = I2.class_get_fields ? I2.class_get_fields(c2, &it2) : NULL;
+            if (!fs2) break;
+            for (int i = 0; fs2[i] && n < 40; i++) {
+                void *f = fs2[i];
+                const char *fn = I2.field_get_name ? I2.field_get_name(f) : NULL;
+                if (!fn) continue;
+                void *ft = I2.field_get_type ? I2.field_get_type(f) : NULL;
+                const char *tn = (ft && I2.type_get_name) ? I2.type_get_name(ft) : NULL;
+                if (!tn) continue;
+                int off = (int)I2.field_get_offset(f);
+                if (off <= 0) continue;
+                if (strstr(tn, "Int32") || strstr(tn, "Single")) {
+                    int iv = 0; rd((char *)self + off, &iv, 4);
+                    CHECK("SELFF %s @%d = %d", fn, off, iv);
+                    n++;
+                } else if (strstr(tn, "Int64")) {
+                    long long iv = 0; rd((char *)self + off, &iv, 8);
+                    CHECK("SELFF %s @%d = %lld", fn, off, iv);
+                    n++;
+                }
+            }
+            c2 = I2.class_get_parent ? I2.class_get_parent(c2) : NULL;
+        }
+    }
+}
 
 // ================= v66：U2 —— 前 20 个单位逐个暴露身份 =================
 // 目的：搞清楚 T0 到底是不是英雄。同时给出「每个 T 里有多少正在渲染(mv1)」。
@@ -4064,13 +4249,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v67  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v68  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v67\n"];
+    [s appendString:@"ESP v68\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -4143,6 +4328,8 @@ static void updateHud(void) {
     // v64：L2 连续 8 拍（40 秒），L3a/L3b 各一次
     if (PROBES_DEFAULT && t % 150 == 30 && g_unitCount >= 40 && g_l2Runs < 8) { g_l2Runs++; probeL2();   }
     if (PROBES_DEFAULT && t % 150 == 50 && g_unitCount >= 40 && g_u2Runs < 2) { g_u2Runs++; probeUnits20(); }
+    if (PROBES_DEFAULT && t % 150 == 20 && g_unitCount >= 20 && g_calRuns < 2) { g_calRuns++; probeCalib(); }
+    if (PROBES_DEFAULT && t % 150 == 10 && g_unitCount >= 5 && g_rvaRuns < 1) { g_rvaRuns++; probeRVA(); }
     if (L3_ENABLE && PROBES_DEFAULT && t % 150 == 70 && g_unitCount >= 40 && g_l3Runs < 1) { g_l3Runs++; probeL3scan(); }
     else if (!L3_ENABLE && t % 150 == 70 && g_l3Runs < 1) { g_l3Runs++; CHECK("L3 disabled (v65)"); }
     if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
@@ -4291,7 +4478,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v67 booting";
+    l.text = @"ESP v68 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -4331,7 +4518,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v67 esp (safe+Dump)");
+    ImGui::Text("build         : v68 esp (calib)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
