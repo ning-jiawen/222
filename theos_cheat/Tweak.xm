@@ -1003,8 +1003,10 @@ static int    g_campRuns = 0;   // CampsActors 探针次数
 static int    g_mvRuns   = 0;   // MoveControl 探针次数
 static int    g_deepRuns = 0;   // v60：英雄深度 dump 次数
 static int    g_campMemRuns = 0; // v60：阵营成员关系探针次数
+#define CAMP_ENABLE 0            // v65b：probeCamps/probeCampMem 用裸函数指针调用，先关
 static int    g_l2Runs  = 0;     // v64：L2 连续采样次数
 static int    g_l3Runs  = 0;     // v64：L3（L3a+L3b 合并扫描）次数
+#define L3_ENABLE 0              // v65：进对局闪退，先关掉全表扫描止血（改 1 可恢复）
 static void   probeCamps(void);
 static void   probeMove(void);
 static void   probeHeroDeep(void);
@@ -1118,7 +1120,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v64 ====");
+    CHECK("==== dump v65 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1129,7 +1131,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v64 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v65 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -2042,6 +2044,9 @@ static const char *nameOfUnit(void *obj, unsigned int id) {
 }
 
 // v63：自己的世界坐标（优先 rawHostId 对应的单位，取不到就用相机点）
+#define NAME_ON 0     // v65：名字解码从未单独验证过（name@0x4B0 若偏移不对就是读野指针），先关
+#define DEEP_ENABLE 0 // v65：深度 dump 的 PoolObjHandle 解包会用未校验 tk 调 class_get_name，先关
+
 static float g_selfX = 0, g_selfZ = 0;
 static int   g_selfOk = 0;
 
@@ -2363,7 +2368,11 @@ static void probeL3scan(void) {
     size_t asmN = 0;                                  // v64b：这个出参是 size_t（个数），不是 void**
     void **a = dom ? I2.domain_get_assemblies(dom, &asmN) : NULL;
     if (!a) { CHECK("L3 no assemblies"); return; }
-    int an = (asmN < 512) ? (int)asmN : 512;
+    // v65：不要直接相信 asmN 去索引 a[] —— 一旦语义不对就会读到数组外，
+    // 拿垃圾指针调 assembly_get_image 必崩。以 NULL 结尾为准，asmN 只当上限。
+    int cap = (asmN > 0 && asmN < 256) ? (int)asmN : 256;
+    int an = 0;
+    while (an < cap && a[an]) an++;
 
     static const char *l3aNames[2] = { "ActorNodeInfo", "ActorData" };
     static const char *clsKeys[] = { "Protocol", "Msg", "Handler", "Dispatch", "Net", "Cmd", "Battle", "Sync" };
@@ -2405,19 +2414,22 @@ static L2Ent g_l2[3];
 static void probeL2(void) {
     unsigned int ids[3]; void *objs[3]; int hn = 0;
     int lim = (g_lastCnt < 160) ? g_lastCnt : 160;
-    int want = (g_heroType >= 0) ? g_heroType : 0;
+    // v65：heroType 认不出来时不再卡死 —— 退化成「pid>0 且有 ObjID」的候选
+    int needType = (g_heroType >= 0);
+    int want = needType ? g_heroType : 0;
     for (int i = 0; i < lim && hn < 3; i++) {
         void *v = NULL, *k = NULL;
         if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
         if (rd(v, &k, sizeof(k)) && g_linkerClass && k != g_linkerClass) continue;
         int T = 0, C = 0, pid = 0;
         readIdentity2(v, &T, &C, NULL, &pid, NULL, NULL);
-        if (T != want || pid <= 0) continue;
+        if (pid <= 0) continue;
+        if (needType && T != want) continue;
         unsigned int id = 0; rd((char *)v + 0x4AC, &id, 4);
         if (!id) continue;
         ids[hn] = id; objs[hn] = v; hn++;
     }
-    if (hn == 0) { CHECK("L2 none (heroType %d)", g_heroType); return; }
+    if (hn == 0) { CHECK("L2 none (heroType %d, no pid>0 candidate)", g_heroType); return; }
 
     for (int i = 0; i < hn; i++) {
         void *f = findField(g_linkerClass, "MoveComponent");
@@ -2428,32 +2440,54 @@ static void probeL2(void) {
         void *ft = I2.field_get_type ? I2.field_get_type(f) : NULL;
         void *mcls = (ft && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(ft) : NULL;
         if (!mcls) { CHECK("L2 no comp class"); return; }
+        // v65b：类型推导出来的类**先和「按名字找到的真类」比对**，不一致就整条跳过。
+        // 这是"不校验就不碰 il2cpp"的落地：class_from_il2cpp_type 遇到泛型参数时可能给出可疑指针。
+        {
+            // v65c：只认可「按名字找到的真类」。expect 拿不到就不往下走 ——
+            // 绝不用 class_from_il2cpp_type 推导出来的指针去调 class_get_name / findField。
+            void *expect = findCls("Assets.Scripts.GameLogic", "MoveComponent");
+            if (!expect) expect = findCls("Assets.Scripts.GameLogic", "MoveControl");
+            if (!expect) {
+                CHECK("L2 expected cls unresolved, skip");
+                continue;
+            }
+            if (mcls != expect) {
+                CHECK("L2 comp cls %p != expected %p, skip", mcls, expect);
+                continue;
+            }
+            mcls = expect;                    // 之后只用这个已确认的类
+        }
         int isVal = I2.class_is_valuetype ? (I2.class_is_valuetype(mcls) ? 1 : 0) : 0;
         void *mc = NULL;
         if (isVal) {
             mc = (char *)objs[i] + off;
         } else {
-            rd((char *)objs[i] + off, &mc, sizeof(mc));
-            if (!mc) { CHECK("L2 id %u comp null", ids[i]); continue; }
+            mc = NULL;
+            if (!rd((char *)objs[i] + off, &mc, sizeof(mc)) || !mc) {
+                CHECK("L2 id %u comp null", ids[i]);
+                continue;
+            }
+            // v65：解引用前先验指针。真实堆地址都是 0x15b… 量级；
+            // < 0x100000000 或非 8 字节对齐 → 不是指针（多半是内联结构体的坐标字节）。
+            if ((uintptr_t)mc < 0x100000000ULL || ((uintptr_t)mc & 7)) {
+                CHECK("L2 id %u comp out of range %p (inline?)", ids[i], mc);
+                continue;
+            }
             void *k2 = NULL;
-            if (!rd(mc, &k2, sizeof(k2)) || k2 != mcls) { CHECK("L2 id %u comp klass mismatch", ids[i]); continue; }
+            if (!rd(mc, &k2, sizeof(k2)) || k2 != mcls) {
+                CHECK("L2 id %u comp klass mismatch", ids[i]);
+                continue;
+            }
         }
-        // 被 PoolObjHandle 包着就解一层（并把解包这件事记进 via）
+        // v65：PoolObjHandle 解包整段停用。
+        // 旧写法会把 rd 出来的 target 当对象、再用它首 8 字节当 klass 去调 class_get_name(tk)——
+        // target 是野指针但"恰好可读"时 tk 就是垃圾，class_get_name 直接炸（和"值类型当 klass"同一个坑）。
         const char *viaKind = "ptr";
-        const char *cn = I2.class_get_name ? I2.class_get_name(mcls) : "?";
-        if (cn && strstr(cn, "PoolObjHandle")) {
-            void *hf = findFieldOne(mcls, "_handleObj");
-            if (hf) {
-                int hoff = (int)I2.field_get_offset(hf);
-                if (hoff > 0) {
-                    void *t = NULL; rd((char *)mc + hoff, &t, sizeof(t));
-                    if (t) {
-                        void *tk = NULL;
-                        if (rd(t, &tk, sizeof(tk)) && tk) { mc = t; mcls = tk; viaKind = "PoolObjHandle"; }
-                    }
-                } else {
-                    CHECK("L2 id %u via skip: _handleObj@0 (open generic)", ids[i]);
-                }
+        {
+            const char *cn = I2.class_get_name ? I2.class_get_name(mcls) : "?";
+            if (cn && strstr(cn, "PoolObjHandle")) {
+                CHECK("L2 id %u via PoolObjHandle (unwrap disabled)", ids[i]);
+                continue;                      // 这一拍跳过：不解包、不猜类
             }
         }
         const char *ccn = I2.class_get_name ? I2.class_get_name(mcls) : "?";
@@ -3434,9 +3468,8 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
                 g_selfX = pp[0]; g_selfZ = pp[2]; g_selfOk = 1; hit = 1; break;
             }
         }
-        if (!hit) {
-            float lpx[1][3]; if (camRefPos(lpx, 1, &g_selfX, &g_selfZ)) g_selfOk = 1;
-        }
+        // v65：不再用 camRefPos 兜底（少一次相机方法调用）；拿不到 rawHostId 就先不显示距离
+        (void)hit;
     }
     for (int i = 0; i < cnt && drawn < 32; i++) {
         void *obj = NULL;
@@ -3700,7 +3733,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         }
         dl->AddCircleFilled(ImVec2(sx, sy), 3.0f, col);
         char buf[96];
-        const char *nm = nameOfUnit(obj, objId);
+        const char *nm = NAME_ON ? nameOfUnit(obj, objId) : "";
         float dist = 0.0f;
         if (g_selfOk) {
             float ddx = pos[0] - g_selfX, ddz = pos[2] - g_selfZ;
@@ -3757,13 +3790,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v64  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v65  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v64\n"];
+    [s appendString:@"ESP v65\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -3829,13 +3862,14 @@ static void updateHud(void) {
     // v42：PositionRecords / PlayerId 分组，各跑 3 次就够
     if (PROBES_DEFAULT && t % 150 == 0 && g_unitCount > 0 && (g_pstRuns < 3 || g_pidRuns < 3)) probeExtras();
     // v48：阵营容器 + 运动组件，各跑 2 次就够
-    if (PROBES_DEFAULT && t % 150 == 30 && g_unitCount > 0 && g_campRuns < 1) { g_campRuns++; probeCamps(); }
+    if (CAMP_ENABLE && PROBES_DEFAULT && t % 150 == 30 && g_unitCount > 0 && g_campRuns < 1) { g_campRuns++; probeCamps(); }
     if (PROBES_DEFAULT && t % 150 == 60 && g_unitCount > 0 && g_mvRuns   < 1) { g_mvRuns++;   probeMove();  }
-    if (PROBES_DEFAULT && t % 150 == 90 && g_unitCount >= 40 && g_deepRuns < 1) { g_deepRuns++; probeHeroDeep(); }
-    if (PROBES_DEFAULT && t % 150 == 120 && g_unitCount >= 40 && g_campMemRuns < 1) { g_campMemRuns++; probeCampMem(); }
+    if (DEEP_ENABLE && PROBES_DEFAULT && t % 150 == 90 && g_unitCount >= 40 && g_deepRuns < 1) { g_deepRuns++; probeHeroDeep(); }
+    if (CAMP_ENABLE && PROBES_DEFAULT && t % 150 == 120 && g_unitCount >= 40 && g_campMemRuns < 1) { g_campMemRuns++; probeCampMem(); }
     // v64：L2 连续 8 拍（40 秒），L3a/L3b 各一次
     if (PROBES_DEFAULT && t % 150 == 30 && g_unitCount >= 40 && g_l2Runs < 8) { g_l2Runs++; probeL2();   }
-    if (PROBES_DEFAULT && t % 150 == 70 && g_unitCount >= 40 && g_l3Runs < 1) { g_l3Runs++; probeL3scan(); }
+    if (L3_ENABLE && PROBES_DEFAULT && t % 150 == 70 && g_unitCount >= 40 && g_l3Runs < 1) { g_l3Runs++; probeL3scan(); }
+    else if (!L3_ENABLE && t % 150 == 70 && g_l3Runs < 1) { g_l3Runs++; CHECK("L3 disabled (v65)"); }
     if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
 }
 @end
@@ -3982,7 +4016,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v64 booting";
+    l.text = @"ESP v65 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -4022,7 +4056,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v64 esp (L2L3)");
+    ImGui::Text("build         : v65 esp (no-L3)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
