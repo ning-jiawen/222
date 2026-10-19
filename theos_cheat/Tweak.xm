@@ -911,6 +911,10 @@ static void  *g_lastEntries = NULL;
 static int    g_lastCnt     = 0;
 // v35：生命周期字段（全部按名字从元数据取，取不到就是 -1，规则自动降级）
 static int g_offName = -1;      // v67f：name 偏移（按名解析，兜底 0x4B0）
+// v71：可见性候选（-2 = 未解析，-1 = 没有这个字段）
+static int g_offVB  = -2;       // bGetVisibleComponent
+static int g_offISP = -2;       // invisibleSpecialComponents
+static int g_offHUD = -2;       // hudDisguiseType
 static int    g_offMeshVis   = -1;    // _meshVisible    网格是否可见
 static int    g_offLogicVis  = -1;    // _logicVisible   逻辑是否可见
 static int    g_offInCam     = -1;    // _inCamera
@@ -1067,6 +1071,8 @@ static int    g_u2Runs  = 0;     // v66：U2 单位身份探针次数
 static int    g_calRuns = 0;     // v68：CALIB 标定次数
 #define CALIB_ENABLE 0           // v69：CALIB 会枚举 5 层父类的字段（v48 就是崩在这个 API），先关
 static int    g_rvaRuns = 0;     // v68b：RVA 探针次数
+static int    g_ceRuns  = 0;     // v71：CE 对照实验拍数
+static double g_ceNext  = 0;     // v72：下一拍的时间点（按时间而不是帧数）
 #define L3_ENABLE 0              // v65：进对局闪退，先关掉全表扫描止血（改 1 可恢复）
 static void   probeCamps(void);
 static void   probeMove(void);
@@ -1076,6 +1082,7 @@ static void   probeL2(void);
 static void   probeUnits20(void);
 static void   probeCalib(void);
 static void   probeRVA(void);
+static void   probeCampExp(void);
 static void   probeL3scan(void);
 static void  *fieldByNameish(void *cls, const char *name);
 static void   bindExtraLazy(void);
@@ -1184,7 +1191,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v70 ====");
+    CHECK("==== dump v72 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1195,7 +1202,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v70 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v72 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -2501,6 +2508,137 @@ static void probeCampMem(void) {
 }
 // ================= v60 end =================
 
+
+// ================= v71：CE —— 可见性对照实验（CAMP2 的 34 个真单位） =================
+// 目的：判定「不可见」是客户端过滤还是本来就没数据。
+//   用 GetCampActors 拿到两个阵营的成员名单（PoolObjHandle 列表），逐个解到 ActorLinker，
+//   只打印**敌方阵营**的 position 与 5 个可见性候选；每 5 秒一拍，共 8 拍 ——
+//   敌人进视野 / 出视野时，哪一列在变，一眼就看出来。
+static void resolveVisOffsets(void) {
+    if (!g_linkerClass) return;
+    if (g_offVB  == -2) { void *f = findField(g_linkerClass, "bGetVisibleComponent");      g_offVB  = f ? (int)I2.field_get_offset(f) : -1; }
+    if (g_offISP == -2) { void *f = findField(g_linkerClass, "invisibleSpecialComponents"); g_offISP = f ? (int)I2.field_get_offset(f) : -1; }
+    if (g_offHUD == -2) { void *f = findField(g_linkerClass, "hudDisguiseType");            g_offHUD = f ? (int)I2.field_get_offset(f) : -1; }
+}
+
+// 从 TinyValueList 取 (items, size)：items@+0x08, size@+0x10（v60 已验证）
+static int tvListHead(void *lst, void **items, int *size) {
+    if (!lst) return 0;
+    void *it = NULL; int n = 0;
+    if (!rd((char *)lst + 0x08, &it, sizeof(it))) return 0;
+    if (!rd((char *)lst + 0x10, &n, 4)) return 0;
+    if (!okptr((uintptr_t)it) || n <= 0 || n > 64) return 0;
+    *items = it; *size = n;
+    return 1;
+}
+
+// 从 PoolObjHandle 元素取 ActorLinker（stride 16，obj 在 +8）
+static void *handleObjAt(void *items, int i) {
+    void *o = NULL;
+    if (!rd((char *)items + (size_t)i * 16 + 8, &o, sizeof(o))) return NULL;
+    if (!okptr((uintptr_t)o)) return NULL;
+    void *k = NULL;
+    if (!rd(o, &k, sizeof(k))) return NULL;
+    if (g_linkerClass && k != g_linkerClass) return NULL;
+    return o;
+}
+
+typedef struct { unsigned int id; float x, z; unsigned char mv; int n; } CETrk;
+static CETrk g_ce[16];
+
+static void probeCampExp(void) {
+    if (!g_mgr || !g_mgrClass || !I2.class_get_method_from_name) { CHECK("CE no mgr"); return; }
+    void *mi = I2.class_get_method_from_name(g_mgrClass, "GetCampActors", 1);
+    if (!mi) { CHECK("CE no GetCampActors(int)"); return; }
+    void *fn = *(void **)mi;
+    if (!fn) { CHECK("CE methodPointer null"); return; }
+    {   // 返回值必须是引用类型（值类型要 sret，按指针调会崩）
+        void *rt = I2.method_get_return_type ? I2.method_get_return_type(mi) : NULL;
+        void *rc = (rt && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(rt) : NULL;
+        int rval = (rc && I2.class_is_valuetype) ? (I2.class_is_valuetype(rc) ? 1 : 0) : -1;
+        if (rval != 0) { CHECK("CE ret val %d, skip", rval); return; }
+    }
+    resolveVisOffsets();
+
+    void *items[3] = {NULL, NULL, NULL};
+    int   size[3]  = {0, 0, 0};
+    for (int camp = 1; camp <= 2; camp++) {
+        void *lst = ((void *(*)(void *, int, void *))fn)(g_mgr, camp, mi);
+        if (!tvListHead(lst, &items[camp], &size[camp])) { CHECK("CE camp%d list bad", camp); items[camp] = NULL; }
+    }
+    if (!items[1] && !items[2]) { CHECK("CE 两个阵营列表都取不到"); return; }
+
+    // 自己在哪个阵营
+    int mine = 0;
+    if (g_rawOk && g_rawHostId > 0) {
+        for (int camp = 1; camp <= 2 && !mine; camp++) {
+            if (!items[camp]) continue;
+            for (int i = 0; i < size[camp]; i++) {
+                void *o = handleObjAt(items[camp], i);
+                if (!o) continue;
+                unsigned int id = 0; rd((char *)o + 0x4AC, &id, 4);
+                if (id == (unsigned int)g_rawHostId) { mine = camp; break; }
+            }
+        }
+    }
+
+    int bigTot = 0, visM = 0, visL = 0, vbN = 0, ispN = 0, hudN = 0;
+    int shown = 0, moved = 0, frozen = 0;
+    float dmax = 0;
+    for (int camp = 1; camp <= 2; camp++) {
+        if (!items[camp]) continue;
+        int perCamp = 0;                                    // v72：两边都打，各最多 5 行
+        for (int i = 0; i < size[camp] && perCamp < 5; i++) {
+            void *o = handleObjAt(items[camp], i);
+            if (!o) continue;
+            unsigned int id = 0; rd((char *)o + 0x4AC, &id, 4);
+            if (!id) continue;
+            int T = 0, C = 0, cfg = 0;
+            readIdentity2(o, &T, &C, &cfg, NULL, NULL, NULL);
+            float p[3] = {0, 0, 0};
+            rd((char *)o + 0x4C4, p, sizeof(p));
+            int big = ((p[0] > 200.0f || p[0] < -200.0f) || (p[2] > 200.0f || p[2] < -200.0f)) ? 1 : 0;
+            unsigned char mv = 1, lv = 1, vb = 0, isp = 0, hud = 0;
+            if (g_offMeshVis  >= 0) { mv = 0; rd((char *)o + g_offMeshVis,  &mv, 1); }
+            if (g_offLogicVis >= 0) { lv = 0; rd((char *)o + g_offLogicVis, &lv, 1); }
+            if (g_offVB  >= 0) rd((char *)o + g_offVB,  &vb,  1);
+            if (g_offISP >= 0) rd((char *)o + g_offISP, &isp, 1);
+            if (g_offHUD >= 0) rd((char *)o + g_offHUD, &hud, 1);
+            if (big) bigTot++;
+            if (mv) visM++;
+            if (lv) visL++;
+            if (vb) vbN++;
+            if (isp) ispN++;
+            if (hud) hudN++;
+
+            // v72b：跨拍位移 —— 判「不可见时位置是否仍在变」的唯一判据
+            //       首拍（没有上一拍）打 d?，绝不算成 d=0，否则「新出现」会被误读成「冻结」
+            int sl = -1;
+            for (int k = 0; k < 16; k++) if (g_ce[k].id == id) { sl = k; break; }
+            int hasPrev = (sl >= 0 && g_ce[sl].n > 0);
+            if (hasPrev) {
+                float dx = p[0] - g_ce[sl].x, dz = p[2] - g_ce[sl].z;
+                float d = sqrtf(dx * dx + dz * dz);
+                int pv = g_ce[sl].mv ? 1 : 0;
+                if (d > 5.0f) moved++; else frozen++;
+                if (d > dmax) dmax = d;
+                CHECK("CE2 id %u camp%d prev %.0f,%.0f now %.0f,%.0f d %.0f pv%d mv%d",
+                      id, camp, g_ce[sl].x, g_ce[sl].z, p[0], p[2], d, pv, mv ? 1 : 0);
+            } else {
+                CHECK("CE2 id %u camp%d first now %.0f,%.0f d? mv%d", id, camp, p[0], p[2], mv ? 1 : 0);
+            }
+            if (sl < 0) { for (int k = 0; k < 16; k++) if (g_ce[k].id == 0) { sl = k; break; } }
+            if (sl >= 0) { g_ce[sl].id = id; g_ce[sl].x = p[0]; g_ce[sl].z = p[2]; g_ce[sl].mv = mv; g_ce[sl].n++; }
+
+            CHECK("CE c%d id %u T%d C%d cfg%d big%d mv%d lv%d vb%d is%d hud%d @%.0f,%.0f",
+                  camp, id, T, C, cfg, big, mv ? 1 : 0, lv ? 1 : 0, vb ? 1 : 0, isp ? 1 : 0, hud ? 1 : 0, p[0], p[2]);
+            shown++; perCamp++;
+        }
+    }
+    CHECK("CEA mine %d | c1 n%d c2 n%d | shown %d big %d | mv %d lv %d vb %d is %d hud %d | moved %d frozen %d dmax %.0f | off vb%d is%d hud%d",
+          mine, size[1], size[2], shown, bigTot, visM, visL, vbN, ispN, hudN,
+          moved, frozen, dmax, g_offVB, g_offISP, g_offHUD);
+}
 
 // v68c：把某个 image 的 LC_UUID 打出来（同一构建校验；UUID 不一致 RVA 全部作废）
 static void printUUIDofImage(const char *want) {
@@ -3958,6 +4096,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         for (int k = 0; k < 64; k++) { g_deadTbl[k].id = 0; g_deadTbl[k].t = 0; }             // v43：换局清死亡表
         for (int k = 0; k < 16; k++) { g_pst[k].id = 0; g_pst[k].n = 0; }                       // v45：换局清 PST 记忆
         g_myCamp = 0; g_enemyN = -1;
+        g_ceNext = 0; g_ceRuns = 0;      // v72：新对局重新开始采样窗口
     }
     if (g_hideAll) {                               // v48：⊘ 只显示 HUD，不画任何框
         g_boxDrawn = 0;
@@ -4301,13 +4440,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v70  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v72  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v70\n"];
+    [s appendString:@"ESP v72\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -4383,6 +4522,15 @@ static void updateHud(void) {
     if (CALIB_ENABLE && PROBES_DEFAULT && t % 150 == 20 && g_unitCount >= 20 && g_calRuns < 2) { g_calRuns++; probeCalib(); }
     else if (!CALIB_ENABLE && t % 150 == 20 && g_calRuns < 1) { g_calRuns++; CHECK("CALIB disabled (v69)"); }
     if (PROBES_DEFAULT && t % 150 == 10 && g_unitCount >= 5 && g_rvaRuns < 1) { g_rvaRuns++; probeRVA(); }
+    // v72：按时间采样（3 秒/拍，10 拍 ≈ 30 秒），不受帧率影响
+    {
+        double nowS = CACurrentMediaTime();
+        if (PROBES_DEFAULT && g_unitCount >= 5 && g_ceRuns < 12 && nowS >= g_ceNext) {
+            g_ceRuns++;
+            g_ceNext = nowS + 3.0;
+            probeCampExp();
+        }
+    }
     if (L3_ENABLE && PROBES_DEFAULT && t % 150 == 70 && g_unitCount >= 40 && g_l3Runs < 1) { g_l3Runs++; probeL3scan(); }
     else if (!L3_ENABLE && t % 150 == 70 && g_l3Runs < 1) { g_l3Runs++; CHECK("L3 disabled (v65)"); }
     if (t % 60 == 0 && (!g_vpReady || !g_mgr)) { resolveEsp(); }
@@ -4531,7 +4679,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v70 booting";
+    l.text = @"ESP v72 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -4571,7 +4719,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v70 esp (rva+breadcrumb)");
+    ImGui::Text("build         : v72 esp (camp-exp+delta)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
