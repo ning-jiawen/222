@@ -1212,7 +1212,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v82 ====");
+    CHECK("==== dump v83 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1223,7 +1223,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v82 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v83 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -2943,6 +2943,9 @@ static void v73StateNext0C(void) {
     v73Line("V73 stage2 only (20s, S1 skipped)");
 }
 
+// v83：新对局重置（只重置状态机，磁盘上的 v73_s*.log 保留）
+void v83_reset_v73(void);
+
 // ---------- 驱动 ----------
 static void v73Tick(void) {
     if (g_v73Ran) return;
@@ -3026,6 +3029,21 @@ static void v73Tick(void) {
             v73Line("V73 DONE ticks=%d", g_v73S1N);
         }
     }
+}
+// v83：实现（extern 声明在 v73Tick 之前，实现在这里即可）
+void v83_reset_v73(void) {
+    if (g_v73Fp) { fflush(g_v73Fp); fclose(g_v73Fp); g_v73Fp = NULL; g_v73FpStage = -999; }
+    g_v73Ran = 0;
+    g_v73State = V73_IDLE;
+    g_v73TickOk = 0;
+    g_v73Abort = 0;
+    g_v73S1N = 0;
+    g_ceRuns = 0;
+    g_c2rRuns = 0;
+    g_q2Res = g_p2Res = 0; g_q2Ok = g_p2Ok = -1;
+    g_q2Max = g_q2Nz = g_q2N = 0; g_q2Sum = 0;
+    g_p2Max = g_p2Nz = g_p2N = 0; g_p2Sum = 0;
+    checkLine("V73 reset (new match)");
 }
 // ================= v79 V73SPEC end =================
 
@@ -3166,7 +3184,10 @@ static void probeCampRaw(void) {
 // 设计约束（作业书 A0）：纯 BSD socket、不阻塞游戏线程、失败直接丢、双写落盘。
 static int    g_rtSock    = -1;
 static unsigned int g_rtSeq = 0;
-static char   g_rtIP[64]  = "192.168.0.101";   // v76：编译期固定 PC IP，UDP 发现成功则覆盖
+// v83：两个候选（手机连热点 → 192.168.137.1；连路由器 → 192.168.0.101）
+static const char *g_rtCand[2] = { "192.168.137.1", "192.168.0.101" };
+static int    g_rtCandIdx = 0;
+static char   g_rtIP[64]  = "192.168.137.1";
 static int    g_rtFixedTried = 0;
 static int    g_rtPort    = 8765;
 static double g_rtNextDisc = 0, g_rtNextConn = 0;
@@ -3214,7 +3235,12 @@ static void rtConnect(void) {
     a.sin_port = htons((uint16_t)g_rtPort);
     a.sin_addr.s_addr = inet_addr(g_rtIP);
     int r = connect(sk, (struct sockaddr *)&a, sizeof(a));
-    if (r < 0 && errno != EINPROGRESS) { close(sk); return; }
+    if (r < 0 && errno != EINPROGRESS) {
+        close(sk);
+        g_rtCandIdx = (g_rtCandIdx + 1) & 1;                 // v83：换下一个候选地址
+        snprintf(g_rtIP, sizeof(g_rtIP), "%s", g_rtCand[g_rtCandIdx]);
+        return;
+    }
     g_rtSock = sk;
     { static int s_connN = 0; if (s_connN < 3) { s_connN++; CHECK("RT conn %s:%d", g_rtIP, g_rtPort); } }
     rtSendLine("boot v80 hb");        // v80：一连上就先发一条，登录界面就能确认通路
@@ -4769,6 +4795,11 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         g_vpReady = false; g_vpInst = NULL; g_vpSrc = -100;
         g_hudWasGood = 0;
         CHECK("leave match: cam/vp reset");
+        // v83：每局允许诊断包重跑一次；否则 g_v73Ran=1 会让新对局永远拿不到 C2RW
+        {
+            extern void v83_reset_v73(void);
+            v83_reset_v73();
+        }
     }
     g_prevInMatch = nowIn;
     // v20：读到单位 = 已经在对局里；只有这时才去碰相机/视矩阵（大厅里没有这些对象）
@@ -5213,13 +5244,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v82  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v83  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v82\n"];
+    [s appendString:@"ESP v83\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -5456,7 +5487,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v82 booting";
+    l.text = @"ESP v83 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -5496,7 +5527,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v82 esp (start-fix)");
+    ImGui::Text("build         : v83 esp (per-match)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
