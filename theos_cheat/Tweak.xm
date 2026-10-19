@@ -8,7 +8,14 @@
 //    3. 延迟挂载 —— 启动后 15 秒才初始化 IL2CPP，避开腾讯启动期高频扫描
 //    4. 自我隐藏 —— hook _dyld_image_count / _dyld_get_image_name 过滤自己
 //    5. 反调试 —— sysctl 里抹掉 P_TRACED，task_get_exception_ports 返回空
-
+//
+//  v2 新增（解决「卡密框 30 秒自动关闭 = 游戏一起没了」）：
+//    A. 退出熔断 —— hook exit / _exit / abort / kill / raise，一律吞掉
+//    B. 卡密静音 —— hook ASStatusView 的 startAutoDismissTimer: / autoDismissTimerFired
+//                   / startCountdownTimer / countdownTimerFired / showWithAnimation
+//    C. 屏幕诊断 —— 所有日志进 ImGui 面板，Windows 上看不到 NSLog 也能截图排查
+//
+//  v11-S（截图版，2026-10-18）—— 设备不越狱，唯一数据通道是手机截图：
 //    1. HUD 从「诊断文字」升级成「字段表阅读器」：每页 20 行，6 秒翻页，到底循环
 //    2. 字段缓冲 160 → 760 行，每行带 `名字 @十六进制偏移`，类头带 `(Nf)` 总字段数
 //    3. dump 名单改「包含匹配 + 相机优先」：CameraVP / CameraFocus / CameraOffs /
