@@ -898,6 +898,9 @@ static void   resolveCam(void);
 //     还会每 2 秒跑一遍，实战里就是周期性卡顿。
 static int    g_camBadN     = 0;      // camcall bad 次数：有限重试，不再一次就永久放弃
 static int    g_boxDrawn    = 0;      // 本帧真正画出的框数（0 = W2S 没产出可用坐标）
+#define V84_OFFN 32
+static int    g_offN        = 0;      // v84：屏幕外指示数量
+static int    g_scanN       = 0;      // v84：本帧扫过的单位数
 static int    g_hudForce    = 0;      // 1 = 强制展开大 HUD（3 指上滑）
 static int    g_hudWasGood  = 0;      // 本局曾经真的画出过框（关掉 ESP 后 HUD 仍然保持收起）
 static int    g_prevInMatch = 0;      // 进/出对局边沿
@@ -1212,7 +1215,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v83 ====");
+    CHECK("==== dump v84 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1223,7 +1226,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v83 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v84 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -3237,9 +3240,22 @@ static void rtConnect(void) {
     int r = connect(sk, (struct sockaddr *)&a, sizeof(a));
     if (r < 0 && errno != EINPROGRESS) {
         close(sk);
-        g_rtCandIdx = (g_rtCandIdx + 1) & 1;                 // v83：换下一个候选地址
+        g_rtCandIdx = (g_rtCandIdx + 1) & 1;
         snprintf(g_rtIP, sizeof(g_rtIP), "%s", g_rtCand[g_rtCandIdx]);
         return;
+    }
+    {   // v84：非阻塞 connect 必须 select + SO_ERROR 判定，否则永远"成功"
+        fd_set wf; FD_ZERO(&wf); FD_SET(sk, &wf);
+        struct timeval tv = {0, 0};
+        int sr = select(sk + 1, NULL, &wf, NULL, &tv);
+        int soerr = 0; socklen_t sl = sizeof(soerr);
+        int okc = (sr > 0) && (getsockopt(sk, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0) && (soerr == 0);
+        if (!okc) {
+            close(sk);
+            g_rtCandIdx = (g_rtCandIdx + 1) & 1;
+            snprintf(g_rtIP, sizeof(g_rtIP), "%s", g_rtCand[g_rtCandIdx]);
+            return;
+        }
     }
     g_rtSock = sk;
     { static int s_connN = 0; if (s_connN < 3) { s_connN++; CHECK("RT conn %s:%d", g_rtIP, g_rtPort); } }
@@ -4713,7 +4729,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
     v73Tick();
-    g_boxDrawn = 0;                               // 每帧先归零：HUD 靠它判断「框到底画出来没有」
+    g_boxDrawn = 0; g_offN = 0; g_scanN = 0;       // 每帧先归零
     if (!I2.domain || !g_mgr || !g_linkerClass) return;
     if (g_offDict < 0 || g_offCount < 0 || g_offEntries < 0) return;
 
@@ -5063,6 +5079,8 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         }
 
         float sx = 0, sy = 0;
+        int offscreen = 0;                       // v84：投影到屏幕外 → 画边缘指示
+        g_scanN++;
         if (useW2S) {
             // 实例方法 Vector3 WorldToScreenPoint(Vector3)：HFA 在 s0-s2 传参/返回，
             // methodPointer 的签名是 (self, args..., MethodInfo*)。
@@ -5070,9 +5088,13 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
             if (!fn2) break;
             Vec3 wp = { pos[0], pos[1], pos[2] };
             Vec3 sp3 = ((Vec3 (*)(void *, Vec3, void *))fn2)(g_camObj, wp, g_miW2S);
-            if (!(sp3.z > 0.01f)) continue;                       // z<=0 = 在相机背后
-            if (!(sp3.x > -100000.0f && sp3.x < 100000.0f)) continue;
-            if (!(sp3.y > -100000.0f && sp3.y < 100000.0f)) continue;
+            if (!(sp3.z > 0.01f)) {                              // 相机背后
+                offscreen = 1;
+                sx = (sp3.x >= 0.0f) ? (sw - 26.0f) : 26.0f;
+                sy = sh * 0.5f;
+            }
+            if (!offscreen && !(sp3.x > -100000.0f && sp3.x < 100000.0f)) offscreen = 1;
+            if (!offscreen && !(sp3.y > -100000.0f && sp3.y < 100000.0f)) offscreen = 1;
             // v31：换算系数现算 = 相机像素宽 / 窗口点数宽（2622/874≈3.0）。
             // 写死 UIScreen.scale 的话，降分辨率渲染 / iPad 分屏 / 动态分辨率都会整体偏。
             float sc = (g_camPxW > 0 && sw > 1.0f) ? ((float)g_camPxW / sw)
@@ -5086,7 +5108,20 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
             sx = sp.x;
             sy = sp.y;
         }
-        if (sx < -200 || sx > sw + 200 || sy < -200 || sy > sh + 200) continue;
+        if (!offscreen && (sx < -200 || sx > sw + 200 || sy < -200 || sy > sh + 200)) {
+            offscreen = 1;
+            if (sx < 0) sx = 22.0f; else if (sx > sw) sx = sw - 22.0f;
+            if (sy < 0) sy = 22.0f; else if (sy > sh) sy = sh - 22.0f;
+        }
+        if (offscreen) {
+            ImU32 oc = (camp == 0) ? IM_COL32(90, 190, 255, 200) : IM_COL32(255, 80, 80, 220);
+            dl->AddCircleFilled(ImVec2(sx, sy), 6.0f, oc, 12);
+            char ob[24];
+            snprintf(ob, sizeof(ob), "%u", objId);
+            dl->AddText(ImVec2(sx + 8.0f, sy - 6.0f), oc, ob);
+            if (g_offN < V84_OFFN) g_offN++;
+            continue;
+        }
 
         // ---- v41：轨迹与外推。视野外客户端拿不到新坐标（位置冻结），
         // 所以用「最后一次移动的速度」外推一个预测点，画成橙色虚线框 + 连线 + 年龄。
@@ -5244,13 +5279,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v83  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v84  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v83\n"];
+    [s appendString:@"ESP v84\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -5487,7 +5522,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v83 booting";
+    l.text = @"ESP v84 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -5527,7 +5562,8 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v83 esp (per-match)");
+    ImGui::Text("build         : v84 esp (offscreen)");
+    ImGui::Text("DRAW          : on %d  off %d  scan %d", g_boxDrawn, g_offN, g_scanN);
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
