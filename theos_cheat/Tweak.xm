@@ -915,25 +915,44 @@ static int ciEq(const char *a, const char *b) {
     return (*a == 0 && *b == 0) ? 1 : 0;
 }
 
-// v48：字段查找三级回退 —— 精确名 → 忽略大小写 → <Name>k__BackingField（自动属性）
-// 之前 mirror / empty 取不到就是名字对不上（IsMirrorActor 大写 I；IsEmptyActor 是自动属性）
+// v50：字段查找 —— 只用 class_get_field_from_name（字符串查找），**不再枚举 class_get_fields**。
+// v48/v49 用枚举做「忽略大小写 + k__BackingField」回退，这条路径在 v47 里不存在，
+// 而 v48 起开始闪退（枚举 API 在泛型/接口类上有踩到 il2cpp 内部断言的风险）。
+// 这里改成显式候选名：精确名 / 首字母大写 / 首字母小写 / <Name>k__BackingField。
 static void *findField(void *cls, const char *name) {
     if (!cls || !I2.class_get_field_from_name) return NULL;
     void *f = I2.class_get_field_from_name(cls, name);
     if (f) return f;
-    char alt[96];
-    snprintf(alt, sizeof(alt), "<%s>k__BackingField", name);
-    void *iter = NULL;
-    void **fields = I2.class_get_fields ? I2.class_get_fields(cls, &iter) : NULL;
-    if (!fields) return NULL;
-    for (int i = 0; fields[i]; i++) {
-        const char *fn = I2.field_get_name ? I2.field_get_name(fields[i]) : NULL;
-        if (!fn) continue;
-        if (ciEq(fn, name) || ciEq(fn, alt)) return fields[i];
+
+    char cand[4][96];
+    int n = 0;
+    snprintf(cand[n++], 96, "%s", name);
+
+    char cap[96], low[96];
+    snprintf(cap, sizeof(cap), "%s", name);
+    snprintf(low, sizeof(low), "%s", name);
+    if (cap[0] >= 'a' && cap[0] <= 'z') cap[0] = (char)(cap[0] - 32);
+    if (low[0] >= 'A' && low[0] <= 'Z') low[0] = (char)(low[0] + 32);
+    snprintf(cand[n++], 96, "%s", cap);
+    snprintf(cand[n++], 96, "%s", low);
+
+    char bf[96];
+    snprintf(bf, sizeof(bf), "<%s>k__BackingField", name);
+    snprintf(cand[n++], 96, "%s", bf);
+
+    for (int i = 0; i < n; i++) {
+        if (i == 0) continue;                 // 第一个就是精确名，已经试过
+        f = I2.class_get_field_from_name(cls, cand[i]);
+        if (f) {
+            static int s_log = 0;
+            if (s_log < 6) { s_log++; CHECK("FLD %s -> %s", name, cand[i]); }
+            return f;
+        }
     }
     return NULL;
 }
 
+// v49：忽略大小写比较（保留给别处用；findField 已不再依赖它）
 // v43：死亡计时（灰虚线 1.5s 淡出后不再画）
 typedef struct { unsigned int id; float t; } DeadEnt;
 static DeadEnt g_deadTbl[64];
@@ -955,6 +974,7 @@ static int    g_mvRuns   = 0;   // MoveControl 探针次数
 static void   probeCamps(void);
 static void   probeMove(void);
 static void  *fieldByNameish(void *cls, const char *name);
+static void   bindExtraLazy(void);
 static void   bindExtraFlags(void);
 static void   probeExtras(void);
 static TkEnt g_tk[64];
@@ -1060,7 +1080,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v49 ====");
+    CHECK("==== dump v51 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1071,7 +1091,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v49 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v51 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1613,17 +1633,13 @@ static void bindMeta(void) {
 
 // v35：把生命周期用到的几个字段偏移按名字问出来（不猜偏移）。
 // 任何一个取不到就保持 -1，对应的判据自动失效，退回「全画」，不会因为缺字段就白屏。
-static void bindLinkerFlags(void) {
-    static int tried = 0;
-    if (tried || !g_linkerClass || !I2.class_get_field_from_name) return;
-    tried = 1;
-    void *f;
-    if ((f = I2.class_get_field_from_name(g_linkerClass, "_meshVisible")))    g_offMeshVis   = (int)I2.field_get_offset(f);
-    if ((f = I2.class_get_field_from_name(g_linkerClass, "_logicVisible")))   g_offLogicVis  = (int)I2.field_get_offset(f);
-    if ((f = I2.class_get_field_from_name(g_linkerClass, "_inCamera")))       g_offInCam     = (int)I2.field_get_offset(f);
-    if ((f = I2.class_get_field_from_name(g_linkerClass, "isMirrorActor")))   g_offMirror    = (int)I2.field_get_offset(f);
-    if ((f = I2.class_get_field_from_name(g_linkerClass, "hostActor")))       g_offHostActor = (int)I2.field_get_offset(f);
-    if ((f = I2.class_get_field_from_name(g_linkerClass, "callActor")))       g_offCallActor = (int)I2.field_get_offset(f);
+// v51：**lazy 绑定** —— 这 5 个字段只在「第一次真正进对局」时才查一次。
+// 主菜单不会触碰，类未就绪也不崩；失败只试一次，不反复刷。
+static void bindExtraLazy(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    if (!g_linkerClass) { CHECK("LAZY no linkerClass"); return; }
     // ---- v42：死亡 / 轨迹相关（同一个「按名字问偏移」的路子）
     void *f2;
     // v42/v43：lastDeadKiller 到底是「对象指针」还是「int id」，问字段类型 —— 不猜。
@@ -1664,6 +1680,19 @@ static void bindLinkerFlags(void) {
         if (gap > 0.0f && gap < 10.0f) g_posRecGap = gap;
         CHECK("PSTR gap %.3f", g_posRecGap);
     }
+}
+
+static void bindLinkerFlags(void) {
+    static int tried = 0;
+    if (tried || !g_linkerClass || !I2.class_get_field_from_name) return;
+    tried = 1;
+    void *f;
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "_meshVisible")))    g_offMeshVis   = (int)I2.field_get_offset(f);
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "_logicVisible")))   g_offLogicVis  = (int)I2.field_get_offset(f);
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "_inCamera")))       g_offInCam     = (int)I2.field_get_offset(f);
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "isMirrorActor")))   g_offMirror    = (int)I2.field_get_offset(f);
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "hostActor")))       g_offHostActor = (int)I2.field_get_offset(f);
+    if ((f = I2.class_get_field_from_name(g_linkerClass, "callActor")))       g_offCallActor = (int)I2.field_get_offset(f);
     CHECK("LFLAG mesh %d logic %d cam %d mirror %d host %d call %d",
           g_offMeshVis, g_offLogicVis, g_offInCam, g_offMirror, g_offHostActor, g_offCallActor);
     CHECK("DEAD killer %d empty %d", g_offDeadKiller, g_offEmptyActor);
@@ -1990,30 +2019,27 @@ static void probeMove(void) {
         float pos[3] = {0, 0, 0};
         rd((char *)v + 0x4C4, pos, sizeof(pos));
 
-        // 只打第一次：这个类里所有「位置类」字段（含定点数）
+        // v50：不再枚举字段（v48 那处枚举已证明可疑），改固定候选名 —— 位置类字段就那么几个
         static int s_dumped = 0;
         if (!s_dumped) {
             s_dumped = 1;
             const char *cn = I2.class_get_name ? I2.class_get_name(mccls) : "?";
             CHECK("MVF cls %s", cn ? cn : "?");
-            void *iter = NULL;
-            void **fields = I2.class_get_fields ? I2.class_get_fields(mccls, &iter) : NULL;
+            static const char *kPosNames[] = {
+                "curPosition", "remotePosition", "position", "m_Position", "pos",
+                "moveForward", "rotation", "tarRotation", "targetPos"
+            };
             int dumped = 0;
-            if (fields) {
-                for (int j = 0; fields[j] && dumped < 6; j++) {
-                    void *ft = I2.field_get_type(fields[j]);
-                    const char *tn = (ft && I2.type_get_name) ? I2.type_get_name(ft) : NULL;
-                    if (!tn) continue;
-                    if (!strstr(tn, "Vector3") && !strstr(tn, "VInt3") && !strstr(tn, "Int3")) continue;
-                    float p3[3] = {0, 0, 0}; int raw3[3] = {0, 0, 0}; const char *kk = "?";
-                    if (!readPosFieldRaw(mc, fields[j], p3, raw3, &kk)) continue;
-                    const char *fn = I2.field_get_name ? I2.field_get_name(fields[j]) : "?";
-                    CHECK("MVF %s @%d %s raw %d,%d -> %.0f,%.0f", fn ? fn : "?", (int)I2.field_get_offset(fields[j]),
-                          kk, raw3[0], raw3[2], p3[0], p3[2]);
-                    dumped++;
-                }
+            for (int j = 0; j < (int)(sizeof(kPosNames) / sizeof(kPosNames[0])); j++) {
+                void *fl = fieldByNameish(mccls, kPosNames[j]);
+                if (!fl) continue;
+                float p3[3] = {0, 0, 0}; int raw3[3] = {0, 0, 0}; const char *kk = "?";
+                if (!readPosFieldRaw(mc, fl, p3, raw3, &kk)) continue;
+                CHECK("MVF %s @%d %s raw %d,%d -> %.0f,%.0f", kPosNames[j],
+                      (int)I2.field_get_offset(fl), kk, raw3[0], raw3[2], p3[0], p3[2]);
+                dumped++;
             }
-            if (!dumped) CHECK("MVF none (no Vector3/VInt3 field)");
+            if (!dumped) CHECK("MVF none (no known pos field)");
         }
 
         // 每帧都打的对照行：pos vs curPosition vs remotePosition
@@ -2692,6 +2718,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v20：读到单位 = 已经在对局里；只有这时才去碰相机/视矩阵（大厅里没有这些对象）
     g_inMatch = nowIn;
     if (nowIn && g_pinN < 0) g_pinN = g_checkN;   // v46：把「类 dump + 绑定日志」固定住
+    if (nowIn) bindExtraLazy();                   // v51：首次进对局才绑这 5 个字段
     if (edgeIn) {                                 // v48：每次进对局重置探针额度 ——
         g_verifyN = 0;                            // 载入界面那点零星 actor 会把 3 次额度吃光，
         g_pstRuns = 0;                            // 正式对局里就再也不打印 CNT/TH/PST 了
@@ -3094,13 +3121,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v49  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
+            @"ESP v51  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
             g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
             g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v49\n"];
+    [s appendString:@"ESP v51\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -3249,7 +3276,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v49 booting";
+    l.text = @"ESP v51 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -3288,7 +3315,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v49 esp (safe-probes)");
+    ImGui::Text("build         : v51 esp (lazy-bind)");
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
     ImGui::Text("disarm        : %s  (%d hit)",
