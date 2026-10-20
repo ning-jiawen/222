@@ -812,6 +812,15 @@ static const struct { const char *ns; const char *name; int cap; } g_targets[] =
 static void *findCls(const char *ns, const char *name);
 static void *findInstanceByStatic(void *klass);
 
+// v115：名字安全层的"原始指针"保存槽 —— 声明必须早于 findClsDeep（L48xx 用它做 0-syscall 比对），
+// 实际赋值在 installSafeNames() 里（绑定完成后）。
+static t_class_get_name      real_class_get_name;
+static t_class_get_namespace real_class_get_namespace;
+static t_field_get_name      real_field_get_name;
+static t_image_get_name      real_image_get_name;
+static t_method_get_name     real_method_get_name;
+
+
 // ---- v16：ESP 数据链（声明提前，selfCheck 要打诊断）----
 static void resolveEsp(void);
 static void  *g_mgr        = NULL;   // ActorManager 实例
@@ -7557,12 +7566,6 @@ static void rescanTick(void) {
 // 做法：在 bind 完成后**把 I2 里的名字获取换成本地安全版本** —— 先逐字节 vm_read 拷进环形缓冲，
 // 读失败返回 "<bad>"。这样全文件 151 处 %s 调用点一行都不用改，且不可能再顺着坏指针读。
 // ============================================================================
-static t_class_get_name      real_class_get_name;
-static t_class_get_namespace real_class_get_namespace;
-static t_field_get_name      real_field_get_name;
-static t_image_get_name      real_image_get_name;
-static t_method_get_name     real_method_get_name;
-
 #define SAFE_RING 16
 #define SAFE_CAP  128
 static char g_safeRing[SAFE_RING][SAFE_CAP];
