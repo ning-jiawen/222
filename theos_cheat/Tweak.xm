@@ -5076,6 +5076,13 @@ static int g_v112_sawA = 0, g_v112_sawB = 0;       // 精确命中：整数通�
 static int g_v112_sawAF = 0, g_v112_sawBF = 0;     // 精确命中：float 通道（±1 容差）
 static int g_v112_hitVis = 0, g_v112_hitInv = 0;   // 命中归属：lv>0 记可见，否则记雾中/未知
 static int g_v112_gone[4], g_v112_inEnum[4];       // 该槽离开枚举器次数（要 objID 佐证才算数）
+// v112 修订5（评审 B2/B3/B4）：rem 一旦升级为判定面，就必须和 cur 同等待遇 —— 双读防撕裂 + 自己的位移/年龄。
+//   偏移来源：字段名 remotePosition → I2.field_get_offset(g_mv_fRem)（与 cur 的 curPosition 同一条路），
+//   g_v110_remOff 为直读偏移；未命中时退回 field_get_value，两条路都写进 g_v106_rem。
+static int   g_v112_remTorn[4];                    // rem 双读不一致（半更新样本，不能当差异证据）
+static int   g_v112_prem[4][3];                    // 上一帧 rem 的整数解释
+static float g_v112_remD[4];                       // 每帧 rem 位移（与 cur 的 d 同一 /100 标定，可直接比大小）
+static int   g_v112_remAge[4];                     // rem 多少秒没变（与 age 同义）
 
 static inline int v112Abs(int v) { return v < 0 ? -v : v; }
 
@@ -5641,9 +5648,15 @@ static void v106ScanHeroes(void) {
                 } else if (g_mv_fCur) {
                     I2.field_get_value(mvc, g_mv_fCur, g_v106_cur[idx]);
                 }
+                g_v112_remTorn[idx] = 0;
                 if (g_v110_remOff > 0) {
-                    unsigned char b3[12];
-                    if (rd((char *)mvc + g_v110_remOff, b3, 12)) memcpy(g_v106_rem[idx], b3, 12);
+                    // v112r5（评审 B3）：rem 与 cur 同构双读比对 —— 只读一次会把"半更新"当成"rem 在动"，
+                    // 进而误判"真值在 rem"。不一致就标记，面板打 RT，判据⑤ 自动不作数。
+                    unsigned char b3[12], b4[12];
+                    if (rd((char *)mvc + g_v110_remOff, b3, 12) && rd((char *)mvc + g_v110_remOff, b4, 12)) {
+                        if (memcmp(b3, b4, 12) != 0) g_v112_remTorn[idx] = 1;
+                        else memcpy(g_v106_rem[idx], b3, 12);
+                    }
                 } else if (g_mv_fRem) {
                     I2.field_get_value(mvc, g_mv_fRem, g_v106_rem[idx]);
                 }
@@ -5702,6 +5715,9 @@ static void v106ScanHeroes(void) {
             g_v111_tornRun[i] = 0;
             // v112 修订2：vis/inv/saw 全部是全局计数，换人不再清零（评审 B3：per-row 清零会造出
             // "saw 涨但行计数 0"这种四支判据都覆盖不到的状态）。这里只清 gone 的槽位语义。
+            // v112r5：rem 位移的基准也要跟着换人重置，否则第一帧会算出一个巨大的假位移。
+            { int r0[3] = {0, 0, 0}; memcpy(r0, g_v106_rem[i], sizeof(r0)); memcpy(g_v112_prem[i], r0, sizeof(r0)); }
+            g_v112_remD[i] = 0; g_v112_remAge[i] = -1;
         } else if (g_v110_torn[i]) {
             g_v111_tornRun[i]++;
             g_v110_tPrev[i] = nowT;            // 撕裂样本不算 d
@@ -5718,6 +5734,19 @@ static void v106ScanHeroes(void) {
             if (d > 0.05f) g_v109_age[i] = 0; else if (g_v109_age[i] >= 0) g_v109_age[i] += (int)(dt + 0.5);
             memcpy(g_v110_pci[i], g_v110_ci[i], sizeof(g_v110_ci[i]));
             g_v110_tPrev[i] = nowT;
+
+            // v112r5（评审 B4）：rem 自己的位移与年龄 —— 判据⑤"cur 冻结而 rem 在动"必须能直接读出来。
+            // rem 半更新（RT）时不算，避免把撕裂当成"rem 在动"。
+            if (!g_v112_remTorn[i]) {
+                int rx[3] = {0, 0, 0};
+                memcpy(rx, g_v106_rem[i], sizeof(rx));
+                int rdx = rx[0] - g_v112_prem[i][0], rdz = rx[2] - g_v112_prem[i][2];
+                float rlen = sqrtf((float)(rdx * rdx + rdz * rdz));
+                g_v112_remD[i] = rlen / 100.0f;       // 与 cur 的 d 同一标定，可直接比大小
+                if (g_v112_remD[i] > 0.05f) g_v112_remAge[i] = 0;
+                else if (g_v112_remAge[i] >= 0) g_v112_remAge[i] += (int)(dt + 0.5);
+                memcpy(g_v112_prem[i], rx, sizeof(rx));
+            }
         }
         // prAge：距离上次 Count 变化的时间
         if (g_v110_prN[i] != g_v109_pr[i]) { g_v110_prN[i] = g_v109_pr[i]; g_v110_prAge[i] = 0; }
@@ -5735,8 +5764,12 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     const float fs = 15.0f, lh = 18.0f;
     const float x0 = sw * 0.50f;
     float y = 8.0f;
-    char buf[512];
-    int lines = 3 + 4 + 4 + 2;
+    // v112r5（评审 B2）：E 行并排 cur/rem 后单行会长到 ~460 字符，而面板从屏幕中线起画，
+    // 逻辑宽度只有约 430px（≈55 字符）→ 会直接跑出屏幕，截图里看起来仍像"正常数字"。
+    // 所以前两个槽位（1v1 里就是自己+敌方）拆成两段短行，其余槽位压成一段。
+    // buf 取 768：单段最坏（i==0 那段带 cF）≈240 字符，留 3× 余量。
+    char buf[768];
+    int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
     dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v112 P0");
@@ -5773,22 +5806,30 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
         char tag[64];
         v112Tag(i, tag, sizeof(tag));
         if (i < g_v106_n) {
-            // v112 修订4：同一行里同时打 cur 与 rem 的整数解释。
-            // 理由：TrueVision 的分工是"cur=客户端预测、rem=服务器权威"，雾里可能只改写其中一个；
-            // 一次装机里把两者摆在一起，才能回答"到底哪一份被改写/哪一份停更"，否则又要多打一版。
+            // 段一：身份 + 两份位置 + 标签（≤60 字符，能放进半屏）
             int ri[3] = {0, 0, 0};
             memcpy(ri, g_v106_rem[i], sizeof(ri));
-            snprintf(buf, sizeof(buf), "E%d id=%-5d lv=%d cI=(%d,%d,%d) cF=(%.0f,%.0f,%.0f) R=(%d,%d) d=%.2f/%.3f dM=%.2f age=%d prN=%d prAge=%d T=%d%s%s %s",
+            snprintf(buf, sizeof(buf), "E%d id=%d lv=%d cI=(%d,%d,%d) R=(%d,%d)%s%s %s",
                      i, g_v106_id[i], g_v106_lv[i],
                      g_v110_ci[i][0], g_v110_ci[i][1], g_v110_ci[i][2],
-                     g_v110_cf[i][0], g_v110_cf[i][1], g_v110_cf[i][2],
                      ri[0], ri[2],
-                     g_v111_d100[i], g_v111_d1k[i], g_v110_dMax[i], g_v109_age[i],
-                     g_v109_pr[i], g_v110_prAge[i], g_v110_torn[i],
-                     (g_v111_tornRun[i] >= 3) ? " STALE" : "",
+                     g_v112_remTorn[i] ? " RT" : "",
                      (g_v104_host > 0 && g_v106_id[i] == g_v104_host) ? " SELF" : "",
                      tag);
             dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(120, 255, 120, 255), buf);
+            y += lh;
+            // 段二：位移/年龄（cur 与 rem 各自一套，判据⑤ 就是比这两组）+ i==0 附带 float 解释
+            if (i == 0) {
+                snprintf(buf, sizeof(buf), "   cF=(%.0f,%.0f,%.0f) rd=%.2f rage=%d | d=%.2f age=%d T=%d",
+                         g_v110_cf[i][0], g_v110_cf[i][1], g_v110_cf[i][2],
+                         g_v112_remD[i], g_v112_remAge[i],
+                         g_v111_d100[i], g_v109_age[i], g_v110_torn[i]);
+            } else {
+                snprintf(buf, sizeof(buf), "   rd=%.2f rage=%d | d=%.2f age=%d T=%d",
+                         g_v112_remD[i], g_v112_remAge[i],
+                         g_v111_d100[i], g_v109_age[i], g_v110_torn[i]);
+            }
+            dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(120, 220, 140, 255), buf);
         } else if (g_v110_id[i] != 0) {
             // 槽位曾经有敌人，现在枚举器里没了：打最后已知 id + 消失次数（这就是"敌方被摘掉"的证据）
             snprintf(buf, sizeof(buf), "E%d id=%-5d GONE=%d  lv=%d cI=(%d,%d,%d) last",
@@ -6789,7 +6830,7 @@ static void drawLogPane(void) {
     }
 }
 
-static void drawMenu(void) {
+static void drawMenu(ImDrawList *dl, float sw, float sh) {
     ImGui::SetNextWindowSize(ImVec2(430, 620), ImGuiCond_FirstUseEver);
     ImGui::Begin("ESP", &g_menuOpen, ImGuiWindowFlags_NoCollapse);
 
@@ -6849,7 +6890,9 @@ static void renderOverlay(void) {
         ImGui::NewFrame();
 
         if (g_espOn) renderFrame(ImGui::GetBackgroundDrawList(), io.DisplaySize.x, io.DisplaySize.y);
-        if (g_menuOpen) drawMenu();
+        // v112r6：drawMenu 需要 dl/sw/sh（它内部要调 drawFixedPanel），签名与调用点必须一起改。
+        // 这三个值只存在于本函数的 Io/参数里，过去写成无参调用 → 编译期 undeclared identifier。
+        if (g_menuOpen) drawMenu(ImGui::GetBackgroundDrawList(), io.DisplaySize.x, io.DisplaySize.y);
 
         ImGui::Render();
         ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), cb, enc);
