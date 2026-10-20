@@ -6902,7 +6902,7 @@ static void v115ProbeDD(void) {
                     if (obj && okptr((uintptr_t)obj)) {
                         // List<T>: _items@+0x10, _size@+0x18 ；数组: max_length@+0x18
                         // B3（审核）：_items/_size 单读可能读到半更新值 → 双读一致才用。
-                        int32_t sz1 = -1, sz2 = -1; void *it1 = NULL, *it2 = NULL;
+                        int32_t sz1 = -1, sz2 = -1; void *it1 = NULL, *it2 = NULL, *items = NULL;
                         if (rd((char *)obj + 0x18, &sz1, 4) && rd((char *)obj + 0x18, &sz2, 4) && sz1 == sz2) cnt = sz1;
                         if (rd((char *)obj + 0x10, &it1, 8) && rd((char *)obj + 0x10, &it2, 8) &&
                             it1 == it2 && okptr((uintptr_t)it1)) items = it1;
