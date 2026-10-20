@@ -1239,7 +1239,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v111 ====");
+    CHECK("==== dump v112 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1250,7 +1250,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v111 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v112 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -5058,6 +5058,69 @@ static int   g_v111_tornRun[4];
 static int   g_v110_prN[4], g_v110_prAge[4];
 static double g_v110_tPrev[4];
 
+// ======================= v112 (P0) 修订2：精确哨兵判定 =======================
+// 只回答一个问题：雾中那行的坐标，会不会**精确**变成 50000 / 55000？
+//   50000 = 二进制里唯一真实存在的哨兵常量（movz w0,#50000 ×4：
+//           0x0ada42ec / 0x0bda71b4 / 0x0bda78a8 / 0x0df1ecd0；float 池 50000.0f @file 0x10eac910）；
+//   55000 = 只出现在日志文本（"invisible2visible change to 55000"）。
+//   → 用**精确相等**计数，天生不依赖单位：raw 也好、米也好、厘米也好，50000 永远是 50000。
+//     这是本版唯一判据；没有阈值，所以没有"阈值定错"这一支。
+// 本版**不做**（评审 D1/D2 指出它们要么属下一版、要么已装版本就能读）：
+//   - 量级标定（mx）：v111 已装机，面板本来就在打 cI/cF，读图即可；
+//   - 阈值法：单位未证（curPosition typeIdx=103617 未落名），一旦是 raw，50000 落在常态量级内，
+//     任何阈值都分不开 → 阈值法作废，正确的替代是"精确值 + 冻结判据"，属下一版；
+//   - 冻结判据：另一个问题，另开一版。
+#define V112_A 50000
+#define V112_B 55000
+static int g_v112_sawA = 0, g_v112_sawB = 0;       // 精确命中：整数通道
+static int g_v112_sawAF = 0, g_v112_sawBF = 0;     // 精确命中：float 通道（±1 容差）
+static int g_v112_hitVis = 0, g_v112_hitInv = 0;   // 命中归属：lv>0 记可见，否则记雾中/未知
+static int g_v112_gone[4], g_v112_inEnum[4];       // 该槽离开枚举器次数（要 objID 佐证才算数）
+
+static inline int v112Abs(int v) { return v < 0 ? -v : v; }
+
+// 全部计数走全局（评审 B3）：不做 per-row 清零，就不会出现"saw 涨、行计数 0"这种判据覆盖不到的状态。
+// lv = _logicVisible：>0 可见 / ==0 雾中 / <0 读失败（归入 inv，E 行的 lv 字段能看出来）。
+static void v112Tick(int i, int lv) {
+    if (i < 0 || i >= 4) return;
+    g_v112_inEnum[i] = 1;
+    const int *iv = g_v110_ci[i];
+    int ax = v112Abs(iv[0]), az = v112Abs(iv[2]);
+    int v = ax >= az ? iv[0] : iv[2];
+    int av = v112Abs(v);
+    int hit = 0;
+    if (av == V112_A)      { g_v112_sawA++; hit = 1; }
+    else if (av == V112_B) { g_v112_sawB++; hit = 1; }
+    if (hit) { if (lv > 0) g_v112_hitVis++; else g_v112_hitInv++; }
+    const float *fv = g_v110_cf[i];
+    float fax = fv[0] < 0 ? -fv[0] : fv[0], faz = fv[2] < 0 ? -fv[2] : fv[2];
+    float f2 = fax >= faz ? fv[0] : fv[2];
+    float fav = f2 < 0 ? -f2 : f2;
+    if (fav > 49999.0f && fav < 50001.0f) {
+        g_v112_sawAF++; if (lv > 0) g_v112_hitVis++; else g_v112_hitInv++;
+    } else if (fav > 54999.0f && fav < 55001.0f) {
+        g_v112_sawBF++; if (lv > 0) g_v112_hitVis++; else g_v112_hitInv++;
+    }
+}
+
+// 行尾瞬时标签：只标精确命中与占位/零值，不再有"FOG<任意大值>"（那属于阈值法，已废）
+static void v112Tag(int i, char *out, size_t n) {
+    char a[28] = "", b[28] = "";
+    const int *iv = g_v110_ci[i];
+    int ax = v112Abs(iv[0]), az = v112Abs(iv[2]);
+    int v = ax >= az ? iv[0] : iv[2], av = v112Abs(v);
+    if (av == V112_A)                        snprintf(a, sizeof(a), "I:50k");
+    else if (av == V112_B)                   snprintf(a, sizeof(a), "I:55k");
+    else if (iv[0] == 1000 && iv[2] == 1000)  snprintf(a, sizeof(a), "I:POOL");
+    else if (iv[0] == 0 && iv[2] == 0)        snprintf(a, sizeof(a), "I:ZERO");
+    const float *fv = g_v110_cf[i];
+    float fax = fv[0] < 0 ? -fv[0] : fv[0], faz = fv[2] < 0 ? -fv[2] : fv[2];
+    float v2 = fax >= faz ? fv[0] : fv[2], av2 = v2 < 0 ? -v2 : v2;
+    if (av2 > 49999.0f && av2 < 50001.0f)      snprintf(b, sizeof(b), "F:50k");
+    else if (av2 > 54999.0f && av2 < 55001.0f) snprintf(b, sizeof(b), "F:55k");
+    snprintf(out, n, "%s%s%s", a, (a[0] && b[0]) ? " " : "", b);
+}
+
 static void v98Init(void) {
     if (g_v98Ready == 1) return;      // 正在初始化中
     {   // v102：失败重试节流 —— 0.5 秒最多一次（findClsDeep 是全类扫描，不能每帧跑）
@@ -5611,6 +5674,9 @@ static void v106ScanHeroes(void) {
                 }
             }
         }
+        // v112 (P0)：哨兵判定打点（撕裂样本不计，避免把并行写当成 FOG）
+        // 带上 _logicVisible：把"可见命中"和"雾中命中"分开，才能证明改写发生在雾里而不是阈值定低了
+        if (!g_v110_torn[idx]) v112Tick(idx, g_v106_lv[idx]);
         g_v106_n++;
     }
 
@@ -5620,7 +5686,12 @@ static void v106ScanHeroes(void) {
     if (dt < 0.001) return;                    // 同帧重复调用，丢弃
     g_v109_tPrev = nowT;
     for (int i = 0; i < 4; i++) {
-        if (i >= g_v106_n) { g_v109_age[i] = -1; g_v109_move[i] = -1; g_v110_prAge[i] = -1; continue; }
+        if (i >= g_v106_n) {
+            // v112：这一行从枚举器里消失了 —— 记下来。否则"fogI 不涨"既可能是"没改写"，
+            // 也可能是"这行没了"，判据无法证伪（评审 B3）。
+            if (g_v112_inEnum[i]) { g_v112_inEnum[i] = 0; g_v112_gone[i]++; }
+            g_v109_age[i] = -1; g_v109_move[i] = -1; g_v110_prAge[i] = -1; continue;
+        }
         if (g_v110_id[i] != g_v106_id[i]) {    // 换人了：重置这一行
             g_v110_id[i] = g_v106_id[i];
             memcpy(g_v110_pci[i], g_v110_ci[i], sizeof(g_v110_ci[i]));
@@ -5629,6 +5700,8 @@ static void v106ScanHeroes(void) {
             g_v110_prN[i] = g_v109_pr[i];
             g_v110_prAge[i] = -1;              // v111：首帧不给 0
             g_v111_tornRun[i] = 0;
+            // v112 修订2：vis/inv/saw 全部是全局计数，换人不再清零（评审 B3：per-row 清零会造出
+            // "saw 涨但行计数 0"这种四支判据都覆盖不到的状态）。这里只清 gone 的槽位语义。
         } else if (g_v110_torn[i]) {
             g_v111_tornRun[i]++;
             g_v110_tPrev[i] = nowT;            // 撕裂样本不算 d
@@ -5662,11 +5735,11 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     const float fs = 15.0f, lh = 18.0f;
     const float x0 = sw * 0.50f;
     float y = 8.0f;
-    char buf[256];
-    int lines = 2 + 4 + 4 + 2;
+    char buf[512];
+    int lines = 3 + 4 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v111");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v112 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -5675,16 +5748,57 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(255, 255, 0, 255), buf);
     y += lh;
 
-    for (int i = 0; i < 4 && i < g_v106_n; i++) {
-        snprintf(buf, sizeof(buf), "E%d id=%-5d lv=%d cI=(%d,%d,%d) cF=(%.0f,%.0f,%.0f) d=%.2f/%.3f dM=%.2f age=%d prN=%d prAge=%d T=%d%s%s",
-                 i, g_v106_id[i], g_v106_lv[i],
-                 g_v110_ci[i][0], g_v110_ci[i][1], g_v110_ci[i][2],
-                 g_v110_cf[i][0], g_v110_cf[i][1], g_v110_cf[i][2],
-                 g_v111_d100[i], g_v111_d1k[i], g_v110_dMax[i], g_v109_age[i],
-                 g_v109_pr[i], g_v110_prAge[i], g_v110_torn[i],
-                 (g_v111_tornRun[i] >= 3) ? " STALE" : "",
-                 (g_v104_host > 0 && g_v106_id[i] == g_v104_host) ? " SELF" : "");
-        dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(120, 255, 120, 255), buf);
+    // v112 (P0) 修订3：一行回答一个问题 —— 雾中那行的坐标会不会**精确**变成 50000 / 55000？
+    //   评审 B2：curOff 没解析出来时 g_v110_ci 恒 0 → 命中恒 0，会被读成"未改写副本"。所以先判有无样本。
+    if (g_v110_curOff <= 0) {
+        snprintf(buf, sizeof(buf), "P0 NOSMP curOff=%d remOff=%d enum=%d  (无样本，本局结论作废)",
+                 g_v110_curOff, g_v110_remOff, g_v106_n);
+        dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(255, 80, 80, 255), buf);
+        y += lh;
+    } else {
+        //   50k/55k = 整数通道精确命中次数（F 前缀 = float 通道，±1 容差）
+        //   vis/inv = 命中发生时 lv>0（可见）/ 其它（雾中或 lv 读失败）；gone = 槽离开枚举器次数（要 objID 佐证）
+        snprintf(buf, sizeof(buf), "P0 50k=%d(F%d) 55k=%d(F%d) | vis=%d inv=%d | gone=%d enum=%d off=%d",
+                 g_v112_sawA, g_v112_sawAF, g_v112_sawB, g_v112_sawBF,
+                 g_v112_hitVis, g_v112_hitInv,
+                 g_v112_gone[0] + g_v112_gone[1] + g_v112_gone[2] + g_v112_gone[3],
+                 g_v106_n, g_v110_curOff);
+        dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(255, 140, 0, 255), buf);
+        y += lh;
+    }
+
+    // v112 修订3（评审 B3）：恒看 4 个槽位 —— 行从枚举器消失后也要继续打印最后已知的 id，
+    // 否则"消失的是哪个 objID"永远抓不到，判据②就成了不可判条款。
+    for (int i = 0; i < 4; i++) {
+        char tag[64];
+        v112Tag(i, tag, sizeof(tag));
+        if (i < g_v106_n) {
+            // v112 修订4：同一行里同时打 cur 与 rem 的整数解释。
+            // 理由：TrueVision 的分工是"cur=客户端预测、rem=服务器权威"，雾里可能只改写其中一个；
+            // 一次装机里把两者摆在一起，才能回答"到底哪一份被改写/哪一份停更"，否则又要多打一版。
+            int ri[3] = {0, 0, 0};
+            memcpy(ri, g_v106_rem[i], sizeof(ri));
+            snprintf(buf, sizeof(buf), "E%d id=%-5d lv=%d cI=(%d,%d,%d) cF=(%.0f,%.0f,%.0f) R=(%d,%d) d=%.2f/%.3f dM=%.2f age=%d prN=%d prAge=%d T=%d%s%s %s",
+                     i, g_v106_id[i], g_v106_lv[i],
+                     g_v110_ci[i][0], g_v110_ci[i][1], g_v110_ci[i][2],
+                     g_v110_cf[i][0], g_v110_cf[i][1], g_v110_cf[i][2],
+                     ri[0], ri[2],
+                     g_v111_d100[i], g_v111_d1k[i], g_v110_dMax[i], g_v109_age[i],
+                     g_v109_pr[i], g_v110_prAge[i], g_v110_torn[i],
+                     (g_v111_tornRun[i] >= 3) ? " STALE" : "",
+                     (g_v104_host > 0 && g_v106_id[i] == g_v104_host) ? " SELF" : "",
+                     tag);
+            dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(120, 255, 120, 255), buf);
+        } else if (g_v110_id[i] != 0) {
+            // 槽位曾经有敌人，现在枚举器里没了：打最后已知 id + 消失次数（这就是"敌方被摘掉"的证据）
+            snprintf(buf, sizeof(buf), "E%d id=%-5d GONE=%d  lv=%d cI=(%d,%d,%d) last",
+                     i, g_v110_id[i], g_v112_gone[i], g_v106_lv[i],
+                     g_v110_ci[i][0], g_v110_ci[i][1], g_v110_ci[i][2]);
+            dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(255, 200, 80, 255), buf);
+        } else {
+            snprintf(buf, sizeof(buf), "E%d --  (枚举器里没有这个槽位)", i);
+            dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(140, 140, 140, 255), buf);
+        }
         y += lh;
     }
     for (int i = 0; i < 4 && i < g_v105_heroN; i++) {
@@ -6328,13 +6442,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v111 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
+            @"ESP v112 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v111 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v112 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -6571,7 +6685,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v111 booting";
+    l.text = @"ESP v112 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -6611,7 +6725,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v111 esp (quiet)");
+    ImGui::Text("build         : v112 P0 (fog sentinel probe)");
     if (g_v105_ready) {
         ImGui::Text("TBL   cnt=%d ty0=%d gHero=%d c1=%d c2=%d self=%d",
                     g_v105_n, g_v105_heroN, g_v106_gHero, g_v106_c1, g_v106_c2, g_v104_host);
