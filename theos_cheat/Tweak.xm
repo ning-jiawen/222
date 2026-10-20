@@ -1236,7 +1236,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v95 ====");
+    CHECK("==== dump v96 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1247,7 +1247,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v95 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v96 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -4860,54 +4860,6 @@ static int rfContainerCount(void *obj) {
     return -1;
 }
 
-// v95：全局扫描"谁持有 targetCls" —— 只扫类名含关键字的类，成本可控
-// 返回 1 = 找到；outObj 为静态字段的值，outHolder 为持有者类名，outField 为字段名
-static int rfFindHolder(void *targetCls, void **outObj, char *outHolder, int hcap, char *outField, int fcap) {
-    if (!targetCls || !I2.domain_get_assemblies || !I2.image_get_class_count ||
-        !I2.image_get_class || !I2.class_get_name || !I2.class_get_fields ||
-        !I2.field_static_get_value || !I2.field_get_type || !I2.class_from_il2cpp_type) return 0;
-
-    static const char *keys[5] = { "Frame", "Synchr", "Battle", "Game", "Logic" };
-    size_t n = 0;
-    void **asms = I2.domain_get_assemblies(I2.domain, &n);
-    if (!asms) return 0;
-
-    int scanned = 0;
-    for (size_t a = 0; a < n; a++) {
-        void *img = I2.assembly_get_image(asms[a]);
-        if (!img) continue;
-        int cc = I2.image_get_class_count(img);
-        for (int ci = 0; ci < cc; ci++) {
-            void *k = I2.image_get_class(img, ci);
-            if (!k) continue;
-            const char *cn = I2.class_get_name(k);
-            if (!cn) continue;
-            int hit = 0;
-            for (int q = 0; q < 5; q++) if (strstr(cn, keys[q])) { hit = 1; break; }
-            if (!hit) continue;
-            scanned++;
-            if (scanned > 4000) return 0;                    // 预算上限，绝不长时间卡主线程
-            void *it = NULL, *f = NULL;
-            int guard = 0;
-            while ((f = I2.class_get_fields(k, &it)) && guard++ < 200) {
-                if (!rfIsStatic(f)) continue;
-                void *ft = I2.field_get_type(f);
-                if (!ft) continue;
-                if (I2.class_from_il2cpp_type(ft) != targetCls) continue;
-                void *v = NULL;
-                I2.field_static_get_value(f, &v);
-                if (!v || !okptr((uintptr_t)v)) continue;
-                const char *fn = I2.field_get_name ? I2.field_get_name(f) : "?";
-                snprintf(outHolder, hcap, "%s", cn);
-                snprintf(outField, fcap, "%s", fn ? fn : "?");
-                *outObj = v;
-                return 1;
-            }
-        }
-    }
-    return 0;
-}
-
 // v93 报告：3~6 行，全部用"名字"读
 static void rfProbe(void) {
     // ① FrameSynchr 单例 + commandQueue 长度
@@ -4927,15 +4879,7 @@ static void rfProbe(void) {
                 if (okptr((uintptr_t)r)) { fs = r; src = mnames[mi]; }
             }
         }
-        if (!fs) {
-            char hc[128] = {0}, hf[96] = {0};
-            void *hv = NULL;
-            if (rfFindHolder(fsCls, &hv, hc, sizeof(hc), hf, sizeof(hf))) {
-                fs = hv; src = "holder";
-                CHECK("RF HOLDER %s.%s -> FrameSynchr %p", hc, hf, hv);
-            }
-        }
-        if (!fs) CHECK("RF FS inst none (self/field/get_Instance/holder all failed)");
+        if (!fs) CHECK("RF FS inst none (no static field, no get_Instance)");
         else {
             void *q = rfPtr(fs, fsCls, "commandQueue");
             int qn = -1;
@@ -4949,33 +4893,7 @@ static void rfProbe(void) {
             CHECK("RF FS inst %p src=%s q %p n=%d frame=%d", fs, src, q, qn, cf);
         }
     }
-    // ② v95：单位表（训练营只有 2 个英雄，靠这张表能直接认出"谁是谁"）
-    if (g_rfSample) {
-        void *lkCls2 = findCls("Assets.Scripts.GameLogic", "ActorLinker");
-        if (lkCls2 && rfKlassIs(g_rfSample, lkCls2)) {
-            int uid = 0, mc = -1, t2 = -1, cfg2 = -1;
-            float p3[3] = {0, 0, 0};
-            rfInt(g_rfSample, lkCls2, "ObjID", &uid);
-            rfF3(g_rfSample, lkCls2, "position", p3);
-            if (g_offTheMeta >= 0) {
-                if (g_metaStruct == 1) {
-                    rd((char *)g_rfSample + g_offTheMeta + g_offACamp, &mc, 4);
-                    rd((char *)g_rfSample + g_offTheMeta + g_offAType, &t2, 4);
-                    rd((char *)g_rfSample + g_offTheMeta + g_offCfgId, &cfg2, 4);
-                } else {
-                    void *mp = NULL;
-                    if (rd((char *)g_rfSample + g_offTheMeta, &mp, sizeof(mp)) && okptr((uintptr_t)mp)) {
-                        rd((char *)mp + g_offACamp, &mc, 4);
-                        rd((char *)mp + g_offAType, &t2, 4);
-                        rd((char *)mp + g_offCfgId, &cfg2, 4);
-                    }
-                }
-            }
-            CHECK("RF U id=%d camp=%d T=%d cfg=%d pos=(%.0f,%.0f)", uid, mc, t2, cfg2, p3[0], p3[2]);
-        }
-    }
-
-    // ③ 反射 vs 偏移：拿绘制循环里已通过 klass 校验的单位，两种方式读 position
+    // ② 反射 vs 偏移：拿绘制循环里已通过 klass 校验的单位，两种方式读 position
     if (g_rfSample) {
         void *lkCls = findCls("Assets.Scripts.GameLogic", "ActorLinker");
         if (lkCls && rfKlassIs(g_rfSample, lkCls)) {
@@ -4997,11 +4915,74 @@ static void rfProbe(void) {
 }
 
 
+
+// ======================= v96：FrameCommandFactory.CreateFrameCommand hook =======================
+// 离线（metadata v29）确认：
+//   Assets.Scripts.Framework.FrameCommandFactory.CreateFrameCommand(params=1)  静态
+//   Assets.Scripts.Framework.FrameCommand 字段：_sendCnt _isCSSync _playerID _frameNum _cmdId _cmdType
+static void  *g_fcMi = NULL;          // MethodInfo*
+static void  *g_fcOrig = NULL;        // 原始 methodPointer
+static void  *g_fCmdType = NULL;      // FieldInfo: _cmdType
+static void  *g_fPlayerID = NULL;     // FieldInfo: _playerID
+static void  *g_fFrameNum = NULL;     // FieldInfo: _frameNum
+static void  *g_fCmdId  = NULL;       // FieldInfo: _cmdId
+static volatile int g_cmdN = 0;
+static volatile int g_cmdTypeN[16];
+static volatile int g_cmdPlayer[16];
+static int   g_cmdHookState = 0;      // 0=未装 1=已装 -1=失败
+
+// 转发：先调原函数，再统计返回值
+static void *v96Thunk(void *a0) {
+    void *r = NULL;
+    if (g_fcOrig) r = ((void *(*)(void *))g_fcOrig)(a0);
+    if (r) {
+        int ct = -1;
+        if (g_fCmdType && I2.field_get_value) I2.field_get_value(r, g_fCmdType, &ct);
+        if (ct >= 0 && ct < 16) g_cmdTypeN[ct]++;
+        int pid = -1;
+        if (g_fPlayerID && I2.field_get_value) I2.field_get_value(r, g_fPlayerID, &pid);
+        if (pid >= 0 && pid < 16) g_cmdPlayer[pid]++;
+        g_cmdN++;
+    }
+    return r;
+}
+
+static void v96Install(void) {
+    if (g_cmdHookState != 0) return;
+    g_cmdHookState = -1;
+    if (!I2.class_get_method_from_name || !I2.class_get_field_from_name || !I2.field_get_value) return;
+    void *cls = findCls("Assets.Scripts.Framework", "FrameCommandFactory");
+    if (!cls) { CHECK("CMD hook: factory class none"); return; }
+    void *mi = I2.class_get_method_from_name(cls, "CreateFrameCommand", 1);
+    if (!mi) { CHECK("CMD hook: method none"); return; }
+    // 先核对签名：参数必须是 1 个，否则调用约定不符，第一条命令就会崩
+    if (I2.method_get_param_count) {
+        int pc = I2.method_get_param_count(mi);
+        if (pc != 1) { CHECK("CMD hook: param count=%d (expect 1) -> skip", pc); return; }
+    }
+    void *orig = *(void **)mi;
+    if (!okptr((uintptr_t)orig)) { CHECK("CMD hook: bad methodPointer %p", orig); return; }
+
+    void *fc = findCls("Assets.Scripts.Framework", "FrameCommand");
+    if (fc) {
+        g_fCmdType = I2.class_get_field_from_name(fc, "_cmdType");
+        g_fPlayerID = I2.class_get_field_from_name(fc, "_playerID");
+        g_fFrameNum = I2.class_get_field_from_name(fc, "_frameNum");
+        g_fCmdId   = I2.class_get_field_from_name(fc, "_cmdId");
+    }
+    g_fcOrig = orig;
+    g_fcMi = mi;
+    *(void **)mi = (void *)&v96Thunk;       // 只改 MethodInfo 里的指针，不动 __TEXT
+    g_cmdHookState = 1;
+    CHECK("CMD hook OK mi=%p orig=%p f(cmdType=%p pid=%p)", mi, orig, g_fCmdType, g_fPlayerID);
+}
+
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
     v73Tick();
+    if (g_inMatch) v96Install();   // v96：进对局后装一次（静态方法 hook，只改 MethodInfo 指针）
     {   // v93：反射探针（每 5 秒一次，进对局后才跑）
         static double s_rfNext = 0;
         if (g_inMatch) {
@@ -5557,6 +5538,10 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         double nwS = CACurrentMediaTime();
         if (nwS >= s_nextSk) {
             s_nextSk = nwS + 1.0;
+            CHECK("CMD n=%d t0..t7=%d/%d/%d/%d/%d/%d/%d/%d p0..p3=%d/%d/%d/%d",
+                  g_cmdN, g_cmdTypeN[0], g_cmdTypeN[1], g_cmdTypeN[2], g_cmdTypeN[3],
+                  g_cmdTypeN[4], g_cmdTypeN[5], g_cmdTypeN[6], g_cmdTypeN[7],
+                  g_cmdPlayer[0], g_cmdPlayer[1], g_cmdPlayer[2], g_cmdPlayer[3]);
             CHECK("SKIP n=%d on=%d drawn=%d | nul=%d noP=%d zeroP=%d noHero=%d dup=%d off=%d | camp %d/%d/%d/%d/%d",
                   cnt, g_onscrN, drawn, g_sk[1], g_sk[3], g_sk[4], g_sk[5], g_sk[6], g_offN,
                   g_campN[0], g_campN[1], g_campN[2], g_campN[3], g_campN[4]);
@@ -5594,13 +5579,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v95 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
+            @"ESP v96 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v95\n"];
+    [s appendString:@"ESP v96\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -5837,7 +5822,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v95 booting";
+    l.text = @"ESP v96 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -5877,7 +5862,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v95 esp (holder)");
+    ImGui::Text("build         : v96 esp (cmdhook)");
     ImGui::Text("DRAW          : on %d  off %d  scan %d", g_boxDrawn, g_offN, g_scanN);
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
