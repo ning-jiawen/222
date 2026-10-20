@@ -1256,7 +1256,7 @@ static void selfCheck(void) {
             for (int ci = 0; ci < cc && shown < 48; ci++) {
                 void *k = I2.image_get_class(img, ci);
                 if (!k || !I2.class_get_name) continue;
-                const char *cn = I2.class_get_name(k, NULL);
+                const char *cn = I2.class_get_name(k);
                 if (!cn) continue;
                 int hit = 0;
                 for (int q = 0; q < 6; q++) if (strstr(cn, keys[q])) { hit = 1; break; }
