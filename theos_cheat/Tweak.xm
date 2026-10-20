@@ -1229,122 +1229,6 @@ static void dumpStaticsOf(void *klass, const char *wantType) {
 }
 
 
-// v93：反射层用到、但定义在后面的符号，先声明
-static int okptr(const void *p);
-static bool rd(const void *addr, void *dst, size_t n);
-
-// ======================= v93：il2cpp 反射层（按名字读，不用偏移）=======================
-static void *rfFld(void *cls, const char *name) {
-    if (!cls || !name || !I2.class_get_field_from_name) return NULL;
-    return I2.class_get_field_from_name(cls, name);
-}
-
-static int rfIsStatic(void *f) {
-    if (!f || !I2.field_get_flags) return 0;
-    return (I2.field_get_flags(f) & 0x0010) != 0;          // FIELD_ATTRIBUTE_STATIC
-}
-
-// 读实例 int 字段（obj 必须非空且已确认类型）
-static int rfInt(void *obj, void *cls, const char *name, int *out) {
-    void *f = rfFld(cls, name);
-    if (!f || !obj || !out || !I2.field_get_value) return 0;
-    int v = 0;
-    I2.field_get_value(obj, f, &v);
-    *out = v;
-    return 1;
-}
-
-static int rfF3(void *obj, void *cls, const char *name, float out3[3]) {
-    void *f = rfFld(cls, name);
-    if (!f || !obj || !I2.field_get_value) return 0;
-    float v[3] = {0, 0, 0};
-    I2.field_get_value(obj, f, v);
-    out3[0] = v[0]; out3[1] = v[1]; out3[2] = v[2];
-    return 1;
-}
-
-static void *rfPtr(void *obj, void *cls, const char *name) {
-    void *f = rfFld(cls, name);
-    if (!f || !obj || !I2.field_get_value) return NULL;
-    void *v = NULL;
-    I2.field_get_value(obj, f, &v);
-    return v;
-}
-
-// 某个类自己的静态单例：找「静态 + 类型就是它自己」的字段，读第一个非空
-static void *rfStaticSelf(void *cls) {
-    if (!cls || !I2.class_get_fields || !I2.field_static_get_value ||
-        !I2.field_get_type || !I2.class_from_il2cpp_type) return NULL;
-    void *it = NULL, *f = NULL;
-    int guard = 0;
-    while ((f = I2.class_get_fields(cls, &it)) && guard++ < 400) {
-        if (!rfIsStatic(f)) continue;
-        void *ft = I2.field_get_type(f);
-        if (!ft) continue;
-        void *fc = I2.class_from_il2cpp_type(ft);
-        if (fc != cls) continue;
-        void *buf = NULL;
-        I2.field_static_get_value(f, &buf);
-        if (buf) return buf;
-    }
-    return NULL;
-}
-
-// 泛型容器长度：按名字依次试 _size / size / _count / Count
-static int rfContainerCount(void *obj) {
-    if (!obj) return -1;
-    void *k = *(void **)obj;                     // klass 指针（IL2CPP 对象头）
-    if (!okptr(k)) return -1;
-    const char *names[4] = { "_size", "size", "_count", "_countValue" };
-    for (int i = 0; i < 4; i++) {
-        int v = -1;
-        if (rfInt(obj, k, names[i], &v)) {
-            if (v >= 0 && v < 100000) return v;
-        }
-    }
-    return -1;
-}
-
-// v93 报告：3~6 行，全部用"名字"读
-static void rfProbe(void) {
-    // ① FrameSynchr 单例 + commandQueue 长度
-    void *fsCls = findCls("Assets.Scripts.Framework", "FrameSynchr");
-    if (!fsCls) { CHECK("RF FS cls none"); }
-    else {
-        void *fs = rfStaticSelf(fsCls);
-        if (!fs) CHECK("RF FS inst none (static self not found)");
-        else {
-            void *q = rfPtr(fs, fsCls, "commandQueue");
-            int qn = rfContainerCount(q);
-            int cf = -1;
-            rfInt(fs, fsCls, "curFrameNum", &cf);
-            CHECK("RF FS inst %p q %p n=%d frame=%d", fs, q, qn, cf);
-        }
-    }
-    // ② 反射 vs 偏移：同一个单位的 position 用两种方式读，必须一致
-    if (g_mgr && g_arrBase >= 0 && g_unitCount > 0) {
-        void *entries = NULL;
-        if (rd((char *)g_mgr + g_offDict, &entries, sizeof(entries)) && okptr(entries)) {
-            void *dict = entries;
-            int cnt = 0;
-            if (rd((char *)dict + 0x18, &cnt, 4) && cnt > 0) {
-                for (int i = 0; i < cnt && i < 160; i++) {
-                    void *o = NULL;
-                    if (!rd((char *)dict + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr(o)) continue;
-                    float byName[3] = {0, 0, 0}, byOff[3] = {0, 0, 0};
-                    void *lkCls = findCls("Assets.Scripts.GameLogic", "ActorLinker");
-                    if (!lkCls || !rfF3(o, lkCls, "position", byName)) continue;
-                    if (!rd((char *)o + 0x4C4, byOff, sizeof(byOff))) continue;
-                    CHECK("RF LK byname=(%.1f,%.1f) byoff=(%.1f,%.1f) same=%d",
-                          byName[0], byName[2], byOff[0], byOff[2],
-                          (byName[0] == byOff[0] && byName[2] == byOff[2]) ? 1 : 0);
-                    break;
-                }
-            }
-        }
-    }
-}
-
 static void selfCheck(void) {
     g_checkN = 0;                 // 重跑时清空，否则页码翻倍
     g_hudPage = 0;
@@ -1463,7 +1347,6 @@ static void selfCheck(void) {
 
     // v16：解析 ESP 数据链（实例 → 字典 → 偏移），结果直接进 HUD
     resolveEsp();
-    rfProbe();                       // v93：反射探针（按名字读，不用偏移）
     CHECK("-- esp chain --");
     CHECK("mgr %p vp %p ok %d", g_mgr, g_vpInst, g_vpOk);
     CHECK("cam %p src %d struct %d", g_camInst, g_vpSrc, g_vpIsStruct);
@@ -4906,11 +4789,131 @@ static void probeActorLists(void) { }
 
 // Dictionary<UInt32,Object> 的 Entry：hashCode(4) next(4) key(4) pad(4) value(8) = 24B
 // 数组头 0x20（klass 8 + monitor 8 + bounds 8 + length 4 + pad 4）。
+// ======================= v93：il2cpp 反射层（按名字读，不用偏移）=======================
+static void *rfFld(void *cls, const char *name) {
+    if (!cls || !name || !I2.class_get_field_from_name) return NULL;
+    return I2.class_get_field_from_name(cls, name);
+}
+
+static int rfIsStatic(void *f) {
+    if (!f || !I2.field_get_flags) return 0;
+    return (I2.field_get_flags(f) & 0x0010) != 0;          // FIELD_ATTRIBUTE_STATIC
+}
+
+// 读实例 int 字段（obj 必须非空且已确认类型）
+static int rfInt(void *obj, void *cls, const char *name, int *out) {
+    void *f = rfFld(cls, name);
+    if (!f || !obj || !out || !I2.field_get_value) return 0;
+    int v = 0;
+    I2.field_get_value(obj, f, &v);
+    *out = v;
+    return 1;
+}
+
+static int rfF3(void *obj, void *cls, const char *name, float out3[3]) {
+    void *f = rfFld(cls, name);
+    if (!f || !obj || !I2.field_get_value) return 0;
+    float v[3] = {0, 0, 0};
+    I2.field_get_value(obj, f, v);
+    out3[0] = v[0]; out3[1] = v[1]; out3[2] = v[2];
+    return 1;
+}
+
+static void *rfPtr(void *obj, void *cls, const char *name) {
+    void *f = rfFld(cls, name);
+    if (!f || !obj || !I2.field_get_value) return NULL;
+    void *v = NULL;
+    I2.field_get_value(obj, f, &v);
+    return v;
+}
+
+// 某个类自己的静态单例：找「静态 + 类型就是它自己」的字段，读第一个非空
+static void *rfStaticSelf(void *cls) {
+    if (!cls || !I2.class_get_fields || !I2.field_static_get_value ||
+        !I2.field_get_type || !I2.class_from_il2cpp_type) return NULL;
+    void *it = NULL, *f = NULL;
+    int guard = 0;
+    while ((f = I2.class_get_fields(cls, &it)) && guard++ < 400) {
+        if (!rfIsStatic(f)) continue;
+        void *ft = I2.field_get_type(f);
+        if (!ft) continue;
+        void *fc = I2.class_from_il2cpp_type(ft);
+        if (fc != cls) continue;
+        void *buf = NULL;
+        I2.field_static_get_value(f, &buf);
+        if (buf) return buf;
+    }
+    return NULL;
+}
+
+// 泛型容器长度：按名字依次试 _size / size / _count / Count
+static int rfContainerCount(void *obj) {
+    if (!obj) return -1;
+    void *k = *(void **)obj;                     // klass 指针（IL2CPP 对象头）
+    if (!okptr(k)) return -1;
+    const char *names[4] = { "_size", "size", "_count", "_countValue" };
+    for (int i = 0; i < 4; i++) {
+        int v = -1;
+        if (rfInt(obj, k, names[i], &v)) {
+            if (v >= 0 && v < 100000) return v;
+        }
+    }
+    return -1;
+}
+
+// v93 报告：3~6 行，全部用"名字"读
+static void rfProbe(void) {
+    // ① FrameSynchr 单例 + commandQueue 长度
+    void *fsCls = findCls("Assets.Scripts.Framework", "FrameSynchr");
+    if (!fsCls) { CHECK("RF FS cls none"); }
+    else {
+        void *fs = rfStaticSelf(fsCls);
+        if (!fs) CHECK("RF FS inst none (static self not found)");
+        else {
+            void *q = rfPtr(fs, fsCls, "commandQueue");
+            int qn = rfContainerCount(q);
+            int cf = -1;
+            rfInt(fs, fsCls, "curFrameNum", &cf);
+            CHECK("RF FS inst %p q %p n=%d frame=%d", fs, q, qn, cf);
+        }
+    }
+    // ② 反射 vs 偏移：同一个单位的 position 用两种方式读，必须一致
+    if (g_mgr && g_arrBase >= 0 && g_unitCount > 0) {
+        void *entries = NULL;
+        if (rd((char *)g_mgr + g_offDict, &entries, sizeof(entries)) && okptr(entries)) {
+            void *dict = entries;
+            int cnt = 0;
+            if (rd((char *)dict + 0x18, &cnt, 4) && cnt > 0) {
+                for (int i = 0; i < cnt && i < 160; i++) {
+                    void *o = NULL;
+                    if (!rd((char *)dict + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr(o)) continue;
+                    float byName[3] = {0, 0, 0}, byOff[3] = {0, 0, 0};
+                    void *lkCls = findCls("Assets.Scripts.GameLogic", "ActorLinker");
+                    if (!lkCls || !rfF3(o, lkCls, "position", byName)) continue;
+                    if (!rd((char *)o + 0x4C4, byOff, sizeof(byOff))) continue;
+                    CHECK("RF LK byname=(%.1f,%.1f) byoff=(%.1f,%.1f) same=%d",
+                          byName[0], byName[2], byOff[0], byOff[2],
+                          (byName[0] == byOff[0] && byName[2] == byOff[2]) ? 1 : 0);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
     v73Tick();
+    {   // v93：反射探针（每 5 秒一次，进对局后才跑）
+        static double s_rfNext = 0;
+        if (g_inMatch) {
+            double nwr = CACurrentMediaTime();
+            if (nwr >= s_rfNext) { s_rfNext = nwr + 5.0; rfProbe(); }
+        }
+    }
     g_boxDrawn = 0; g_offN = 0; g_scanN = 0; g_onscrN = 0;   // 每帧先归零
     for (int zi = 0; zi < 8; zi++) { g_sk[zi] = 0; g_campN[zi] = 0; }
     if (!I2.domain || !g_mgr || !g_linkerClass) return;
