@@ -854,8 +854,16 @@ static const struct { const char *ns; const char *name; int cap; } g_targets[] =
     {"Assets.Scripts.GameLogic",  "MoveComponent",       20},
     {"Assets.Scripts.GameLogic",  "SkillControlIndicator", 20},
     {"Assets.Scripts.GameLogic",  "ActorManager",        16},
+    // v92：命令层 —— 逻辑位置真正可能出现的地方
+    {"Assets.Scripts.GameLogic",  "BaseCmd",             30},
+    {"Assets.Scripts.Framework",  "FrameCommand",        30},
+    {"Assets.Scripts.GameLogic",  "CLogicActorInfo",     10},
 };
 #define NTARGET ((int)(sizeof(g_targets) / sizeof(g_targets[0])))
+
+// v92：selfCheck 里要用到（定义在后面），先声明
+static void *findCls(const char *ns, const char *name);
+static void *findInstanceByStatic(void *klass);
 
 // ---- v16：ESP 数据链（声明提前，selfCheck 要打诊断）----
 static void resolveEsp(void);
@@ -1220,12 +1228,128 @@ static void dumpStaticsOf(void *klass, const char *wantType) {
     }
 }
 
+
+// v93：反射层用到、但定义在后面的符号，先声明
+static int okptr(const void *p);
+extern void *g_linkerClass;
+
+// ======================= v93：il2cpp 反射层（按名字读，不用偏移）=======================
+static void *rfFld(void *cls, const char *name) {
+    if (!cls || !name || !I2.class_get_field_from_name) return NULL;
+    return I2.class_get_field_from_name(cls, name);
+}
+
+static int rfIsStatic(void *f) {
+    if (!f || !I2.field_get_flags) return 0;
+    return (I2.field_get_flags(f) & 0x0010) != 0;          // FIELD_ATTRIBUTE_STATIC
+}
+
+// 读实例 int 字段（obj 必须非空且已确认类型）
+static int rfInt(void *obj, void *cls, const char *name, int *out) {
+    void *f = rfFld(cls, name);
+    if (!f || !obj || !out || !I2.field_get_value) return 0;
+    int v = 0;
+    I2.field_get_value(obj, f, &v);
+    *out = v;
+    return 1;
+}
+
+static int rfF3(void *obj, void *cls, const char *name, float out3[3]) {
+    void *f = rfFld(cls, name);
+    if (!f || !obj || !I2.field_get_value) return 0;
+    float v[3] = {0, 0, 0};
+    I2.field_get_value(obj, f, v);
+    out3[0] = v[0]; out3[1] = v[1]; out3[2] = v[2];
+    return 1;
+}
+
+static void *rfPtr(void *obj, void *cls, const char *name) {
+    void *f = rfFld(cls, name);
+    if (!f || !obj || !I2.field_get_value) return NULL;
+    void *v = NULL;
+    I2.field_get_value(obj, f, &v);
+    return v;
+}
+
+// 某个类自己的静态单例：找「静态 + 类型就是它自己」的字段，读第一个非空
+static void *rfStaticSelf(void *cls) {
+    if (!cls || !I2.class_get_fields || !I2.field_static_get_value ||
+        !I2.field_get_type || !I2.class_from_il2cpp_type) return NULL;
+    void *it = NULL, *f = NULL;
+    int guard = 0;
+    while ((f = I2.class_get_fields(cls, &it)) && guard++ < 400) {
+        if (!rfIsStatic(f)) continue;
+        void *ft = I2.field_get_type(f);
+        if (!ft) continue;
+        void *fc = I2.class_from_il2cpp_type(ft);
+        if (fc != cls) continue;
+        void *buf = NULL;
+        I2.field_static_get_value(f, &buf);
+        if (buf) return buf;
+    }
+    return NULL;
+}
+
+// 泛型容器长度：按名字依次试 _size / size / _count / Count
+static int rfContainerCount(void *obj) {
+    if (!obj) return -1;
+    void *k = *(void **)obj;                     // klass 指针（IL2CPP 对象头）
+    if (!okptr(k)) return -1;
+    const char *names[4] = { "_size", "size", "_count", "_countValue" };
+    for (int i = 0; i < 4; i++) {
+        int v = -1;
+        if (rfInt(obj, k, names[i], &v)) {
+            if (v >= 0 && v < 100000) return v;
+        }
+    }
+    return -1;
+}
+
+// v93 报告：3~6 行，全部用"名字"读
+static void rfProbe(void) {
+    // ① FrameSynchr 单例 + commandQueue 长度
+    void *fsCls = findCls("Assets.Scripts.Framework", "FrameSynchr");
+    if (!fsCls) { CHECK("RF FS cls none"); }
+    else {
+        void *fs = rfStaticSelf(fsCls);
+        if (!fs) CHECK("RF FS inst none (static self not found)");
+        else {
+            void *q = rfPtr(fs, fsCls, "commandQueue");
+            int qn = rfContainerCount(q);
+            int cf = -1;
+            rfInt(fs, fsCls, "curFrameNum", &cf);
+            CHECK("RF FS inst %p q %p n=%d frame=%d", fs, q, qn, cf);
+        }
+    }
+    // ② 反射 vs 偏移：同一个单位的 position 用两种方式读，必须一致
+    if (g_mgr && g_arrBase >= 0 && g_unitCount > 0) {
+        void *entries = NULL;
+        if (rd((char *)g_mgr + g_offDict, &entries, sizeof(entries)) && okptr(entries)) {
+            void *dict = entries;
+            int cnt = 0;
+            if (rd((char *)dict + 0x18, &cnt, 4) && cnt > 0) {
+                for (int i = 0; i < cnt && i < 160; i++) {
+                    void *o = NULL;
+                    if (!rd((char *)dict + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr(o)) continue;
+                    float byName[3] = {0, 0, 0}, byOff[3] = {0, 0, 0};
+                    if (!rfF3(o, g_linkerClass, "position", byName)) continue;
+                    if (!rd((char *)o + 0x4C4, byOff, sizeof(byOff))) continue;
+                    CHECK("RF LK byname=(%.1f,%.1f) byoff=(%.1f,%.1f) same=%d",
+                          byName[0], byName[2], byOff[0], byOff[2],
+                          (byName[0] == byOff[0] && byName[2] == byOff[2]) ? 1 : 0);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 static void selfCheck(void) {
     g_checkN = 0;                 // 重跑时清空，否则页码翻倍
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v91 ====");
+    CHECK("==== dump v93 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1236,13 +1360,32 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v91 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v93 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
         void *img = I2.assembly_get_image(asms[a]);
         if (!img) continue;
         g_clsScanned += I2.image_get_class_count ? I2.image_get_class_count(img) : 0;
+    }
+
+    // ---- v92：FrameSynchr.commandQueue 探针（只读 3 个字段，不遍历元素）----
+    if (g_inMatch) {
+        void *fcls = findCls("Assets.Scripts.Framework", "FrameSynchr");
+        if (!fcls) { CHECK("FS cls none"); }
+        else {
+            static void *s_fs = NULL;
+            if (!s_fs) s_fs = findInstanceByStatic(fcls);
+            if (!s_fs) CHECK("FS inst none");
+            else {
+                void *q = NULL;
+                int qn = -1;
+                if (rd((char *)s_fs + 0x68, &q, sizeof(q)) && q) {
+                    rd((char *)q + 0x20, &qn, 4);            // Queue<T>._size
+                }
+                CHECK("FS inst %p queue %p n=%d", s_fs, q, qn);
+            }
+        }
     }
 
     // ---- v91：名字发现（只读元数据：类名 + 字段数，不解引用任何实例）----
@@ -1319,6 +1462,7 @@ static void selfCheck(void) {
 
     // v16：解析 ESP 数据链（实例 → 字典 → 偏移），结果直接进 HUD
     resolveEsp();
+    rfProbe();                       // v93：反射探针（按名字读，不用偏移）
     CHECK("-- esp chain --");
     CHECK("mgr %p vp %p ok %d", g_mgr, g_vpInst, g_vpOk);
     CHECK("cam %p src %d struct %d", g_camInst, g_vpSrc, g_vpIsStruct);
@@ -5333,13 +5477,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v91 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
+            @"ESP v93 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v91\n"];
+    [s appendString:@"ESP v93\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -5576,7 +5720,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v91 booting";
+    l.text = @"ESP v93 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -5616,7 +5760,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v91 esp (fieldmap)");
+    ImGui::Text("build         : v93 esp (reflect)");
     ImGui::Text("DRAW          : on %d  off %d  scan %d", g_boxDrawn, g_offN, g_scanN);
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
