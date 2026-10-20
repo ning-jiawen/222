@@ -1236,7 +1236,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v96 ====");
+    CHECK("==== dump v98 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1247,7 +1247,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v96 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v98 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -4947,6 +4947,15 @@ static void *v96Thunk(void *a0) {
     return r;
 }
 
+// v97：把 addr 所在页改成可写（COPY = 私有复制，不改共享缓存页）
+static int v97MakeWritable(void *addr) {
+    vm_address_t page = (vm_address_t)addr & ~(vm_address_t)(vm_page_size - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page,
+                                  (vm_size_t)vm_page_size, false,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    return kr == KERN_SUCCESS;
+}
+
 static void v96Install(void) {
     if (g_cmdHookState != 0) return;
     g_cmdHookState = -1;
@@ -4970,11 +4979,167 @@ static void v96Install(void) {
         g_fFrameNum = I2.class_get_field_from_name(fc, "_frameNum");
         g_fCmdId   = I2.class_get_field_from_name(fc, "_cmdId");
     }
+    // v97：MethodInfo 常在只读页 —— 必须先解锁，否则写就是 EXC_BAD_ACCESS（上一版闪退点）
+    if (!v97MakeWritable(mi)) {
+        CHECK("CMD hook: mprotect FAILED mi=%p -> skip (not writing)", mi);
+        return;
+    }
     g_fcOrig = orig;
     g_fcMi = mi;
     *(void **)mi = (void *)&v96Thunk;       // 只改 MethodInfo 里的指针，不动 __TEXT
+    __sync_synchronize();
+
+    void *back = *(void **)mi;              // 读回校验
+    if (back != (void *)&v96Thunk) {
+        CHECK("CMD hook: write not effective (back=%p want=%p) -> restore skip", back, (void *)&v96Thunk);
+        *(void **)mi = orig;
+        return;
+    }
     g_cmdHookState = 1;
-    CHECK("CMD hook OK mi=%p orig=%p f(cmdType=%p pid=%p)", mi, orig, g_fCmdType, g_fPlayerID);
+    CHECK("CMD hook OK mi=%p orig=%p new=%p f(cmdType=%p pid=%p)",
+          mi, orig, back, g_fCmdType, g_fPlayerID);
+}
+
+
+// ======================= v98：身份 + 存活 轨迹表（纯读） =======================
+static void *g_lk_fObjID = NULL, *g_lk_fPos = NULL, *g_lk_fLv = NULL, *g_lk_fMv = NULL;
+static void *g_lk_fFn = NULL, *g_lk_fRec = NULL, *g_lk_fMeta = NULL, *g_lk_fMoveComp = NULL;
+static void *g_v98MetaCls = NULL, *g_meta_fPid = NULL, *g_meta_fType = NULL, *g_meta_fCamp = NULL, *g_meta_fCfg = NULL;
+static void *g_v98MvCls = NULL, *g_mv_fRem = NULL, *g_v98PrCls = NULL, *g_pr_fSize = NULL;
+static int   g_v98Ready = 0;
+static int   g_v98Off = 0;
+
+static void v98Init(void) {
+    if (g_v98Ready) return;
+    g_v98Ready = 1;
+    void *lk = findCls("Assets.Scripts.GameLogic", "ActorLinker");
+    if (!lk) { CHECK("V98 lk cls none"); return; }
+    g_lk_fObjID = I2.class_get_field_from_name(lk, "ObjID");
+    g_lk_fPos   = I2.class_get_field_from_name(lk, "position");
+    g_lk_fLv    = I2.class_get_field_from_name(lk, "_logicVisible");
+    g_lk_fMv    = I2.class_get_field_from_name(lk, "_meshVisible");
+    g_lk_fFn    = I2.class_get_field_from_name(lk, "lastPositionXZChangedFrameNum");
+    g_lk_fRec   = I2.class_get_field_from_name(lk, "PositionRecords");
+    g_lk_fMeta  = I2.class_get_field_from_name(lk, "theMeta");
+
+    // meta 类：从字段类型拿
+    if (g_lk_fMeta && I2.field_get_type && I2.class_from_il2cpp_type) {
+        void *t = I2.field_get_type(g_lk_fMeta);
+        if (t) g_v98MetaCls = I2.class_from_il2cpp_type(t);
+    }
+    if (g_v98MetaCls) {
+        g_meta_fPid  = I2.class_get_field_from_name(g_v98MetaCls, "PlayerId");
+        g_meta_fType = I2.class_get_field_from_name(g_v98MetaCls, "ActorType");
+        g_meta_fCamp = I2.class_get_field_from_name(g_v98MetaCls, "ActorCamp");
+        g_meta_fCfg  = I2.class_get_field_from_name(g_v98MetaCls, "ConfigId");
+    }
+
+    // 找 ActorLinker 里类型名以 MoveComponent 结尾的字段
+    {
+        void *it = NULL, *f = NULL; int guard = 0;
+        while ((f = I2.class_get_fields(lk, &it)) && guard++ < 400) {
+            void *ft = I2.field_get_type ? I2.field_get_type(f) : NULL;
+            void *fc = (ft && I2.class_from_il2cpp_type) ? I2.class_from_il2cpp_type(ft) : NULL;
+            const char *cn = (fc && I2.class_get_name) ? I2.class_get_name(fc) : NULL;
+            if (cn && strstr(cn, "MoveComponent")) { g_lk_fMoveComp = f; g_v98MvCls = fc; break; }
+        }
+        if (g_v98MvCls) g_mv_fRem = I2.class_get_field_from_name(g_v98MvCls, "remotePosition");
+    }
+
+    // PositionRecords 的长度字段（List<T> 泛型实例）
+    if (g_lk_fRec && I2.field_get_type && I2.class_from_il2cpp_type) {
+        void *t = I2.field_get_type(g_lk_fRec);
+        if (t) g_v98PrCls = I2.class_from_il2cpp_type(t);
+        if (g_v98PrCls) {
+            g_pr_fSize = I2.class_get_field_from_name(g_v98PrCls, "_size");
+            if (!g_pr_fSize) g_pr_fSize = I2.class_get_field_from_name(g_v98PrCls, "size");
+            if (!g_pr_fSize) g_pr_fSize = I2.class_get_field_from_name(g_v98PrCls, "_count");
+        }
+    }
+    CHECK("V98 init lk=%p meta=%p(%p/%p/%p) mv=%p(%p) pr=%p(%p)",
+          lk, g_v98MetaCls, g_meta_fPid, g_meta_fType, g_meta_fCamp,
+          g_v98MvCls, g_mv_fRem, g_v98PrCls, g_pr_fSize);
+}
+
+// 读一个 actor 的身份/存活，写成一行
+static void v98One(void *o) {
+    if (!o || !I2.field_get_value) return;
+    int id = 0, pid = -1, ty = -1, cp = -1, cfg = -1, fn = -1, lv = -1, mv = -1, pr = -1;
+    float pos[3] = {0,0,0}, rem[3] = {-9999,-9999,-9999};
+
+    if (g_lk_fObjID) I2.field_get_value(o, g_lk_fObjID, &id);
+    if (g_lk_fPos)   I2.field_get_value(o, g_lk_fPos, pos);
+    if (g_lk_fFn)    I2.field_get_value(o, g_lk_fFn, &fn);
+    if (g_lk_fLv)  { unsigned char b = 0; I2.field_get_value(o, g_lk_fLv, &b); lv = b; }
+    if (g_lk_fMv)  { unsigned char b = 0; I2.field_get_value(o, g_lk_fMv, &b); mv = b; }
+
+    if (g_lk_fMeta && g_v98MetaCls) {
+        void *meta = NULL;
+        I2.field_get_value(o, g_lk_fMeta, &meta);
+        if (meta && okptr((uintptr_t)meta)) {
+            if (g_meta_fPid)  I2.field_get_value(meta, g_meta_fPid, &pid);
+            if (g_meta_fType) I2.field_get_value(meta, g_meta_fType, &ty);
+            if (g_meta_fCamp) I2.field_get_value(meta, g_meta_fCamp, &cp);
+            if (g_meta_fCfg)  I2.field_get_value(meta, g_meta_fCfg, &cfg);
+        }
+    }
+    if (g_lk_fMoveComp && g_mv_fRem) {
+        void *mvc = NULL;
+        I2.field_get_value(o, g_lk_fMoveComp, &mvc);
+        if (mvc && okptr((uintptr_t)mvc)) I2.field_get_value(mvc, g_mv_fRem, rem);
+    }
+    if (g_lk_fRec && g_pr_fSize) {
+        void *lst = NULL;
+        I2.field_get_value(o, g_lk_fRec, &lst);
+        if (lst && okptr((uintptr_t)lst)) I2.field_get_value(lst, g_pr_fSize, &pr);
+    }
+    CHECK("A id=%-6d pid=%-6d ty=%-3d camp=%-3d cfg=%-5d lv=%d mv=%d fn=%-7d pos=(%.0f,%.0f) rem=(%.0f,%.0f) pr=%d",
+          id, pid, ty, cp, cfg, lv, mv, fn, pos[0], pos[2], rem[0], rem[2], pr);
+}
+
+static void v98Dump(void *mgr) {
+    v98Init();
+    if (!mgr) return;
+    void *view = NULL;
+    if (!rd((char *)mgr + g_offDict, &view, sizeof(view)) || !view) { CHECK("V98 dict fail"); return; }
+    void *dict = view;
+    if (g_ctxOff > 0) { void *c = NULL; if (rd((char *)view + g_ctxOff, &c, sizeof(c)) && c) dict = c; }
+    else if (g_viewHop > 0) { void *h = NULL; if (rd((char *)view + g_viewHop, &h, sizeof(h)) && h) dict = h; }
+    int cnt = 0; void *ent = NULL;
+    if (!rd((char *)dict + g_offCount, &cnt, sizeof(cnt)) || cnt <= 0 || cnt > 4096) { CHECK("V98 cnt %d", cnt); return; }
+    if (!rd((char *)dict + g_offEntries, &ent, sizeof(ent)) || !ent) { CHECK("V98 ent fail"); return; }
+
+    // 先扫一遍：统计 pid>0 的、以及总数
+    int nPid = 0;
+    for (int i = 0; i < cnt; i++) {
+        void *o = NULL;
+        if (!rd((char *)ent + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr((uintptr_t)o)) continue;
+        if (g_lk_fMeta && g_meta_fPid) {
+            void *meta = NULL; int pid = 0;
+            I2.field_get_value(o, g_lk_fMeta, &meta);
+            if (meta && okptr((uintptr_t)meta)) { I2.field_get_value(meta, g_meta_fPid, &pid); if (pid > 0) nPid++; }
+        }
+    }
+    CHECK("V98 == cnt=%d withPid=%d off=%d ==", cnt, nPid, g_v98Off);
+
+    // 第一批：所有 pid>0 的（最多 8 个）
+    int shown = 0;
+    for (int i = 0; i < cnt && shown < 8; i++) {
+        void *o = NULL;
+        if (!rd((char *)ent + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr((uintptr_t)o)) continue;
+        int pid = 0; void *meta = NULL;
+        if (g_lk_fMeta) I2.field_get_value(o, g_lk_fMeta, &meta);
+        if (meta && okptr((uintptr_t)meta) && g_meta_fPid) I2.field_get_value(meta, g_meta_fPid, &pid);
+        if (pid > 0) { v98One(o); shown++; }
+    }
+    // 第二批：轮转 8 个（不分身份）
+    for (int k = 0; k < 8; k++) {
+        int i = (g_v98Off + k) % cnt;
+        void *o = NULL;
+        if (!rd((char *)ent + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr((uintptr_t)o)) continue;
+        v98One(o);
+    }
+    g_v98Off = (g_v98Off + 8) % (cnt > 0 ? cnt : 1);
 }
 
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
@@ -4982,7 +5147,13 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
     v73Tick();
-    if (g_inMatch) v96Install();   // v96：进对局后装一次（静态方法 hook，只改 MethodInfo 指针）
+    {   // v98：纯读诊断表，每 4 秒一批（先 pid>0 的，再轮转）
+        static double s_v98Next = 0;
+        if (g_inMatch) {
+            double nwr = CACurrentMediaTime();
+            if (nwr >= s_v98Next) { s_v98Next = nwr + 4.0; v98Dump(g_mgr); }
+        }
+    }
     {   // v93：反射探针（每 5 秒一次，进对局后才跑）
         static double s_rfNext = 0;
         if (g_inMatch) {
@@ -5579,13 +5750,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v96 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
+            @"ESP v98 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v96\n"];
+    [s appendString:@"ESP v98\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -5822,7 +5993,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v96 booting";
+    l.text = @"ESP v98 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -5862,7 +6033,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v96 esp (cmdhook)");
+    ImGui::Text("build         : v98 esp (identity)");
     ImGui::Text("DRAW          : on %d  off %d  scan %d", g_boxDrawn, g_offN, g_scanN);
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
