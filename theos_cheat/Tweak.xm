@@ -1192,7 +1192,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v115 ====");
+    CHECK("==== dump v116 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1203,7 +1203,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v115 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v116 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -5518,7 +5518,9 @@ static void v106ScanHeroes(void) {
             void *exc = NULL;
             a = I2.runtime_invoke(mi, g_mgr, p1, &exc);   // 官方 invoke：静态/实例/装箱都由它处理
         } else {
-            a = ((void *(*)(void *, int, void *))fn)(g_mgr, i, mi);
+            // B1（审核）：绝不 raw 强转调用 —— 这正是 v99 崩在 0x20 的实例 getter 形态。
+            // runtime_invoke 是必需项，缺了就直接认输走兜底。
+            g_v106_err = -1; g_v106_n = 0; v112FillFromDict(); return;
         }
         if (!a || !okptr((uintptr_t)a)) continue;
         void *k = NULL;
@@ -6026,7 +6028,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v115 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v116 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6789,6 +6791,9 @@ static void runInit(void) {
 #define A1_MAXHIT 4
 static int  g_a1Done = 0, g_a1Hits = 0, g_a1Seen = 0, g_a1Total = 0, g_a1Cls = 0;
 static int  g_a1AsmOk = 0, g_a1AsmSkip = 0, g_a1AsmOther = 0;   // 程序集：读到 / 读不到 / 不是 CSharp
+static int  g_a1Abort = 0;   // 0 未结束 / 1 缺 API / 2 assemblies 空 / 3 正常扫完
+static int  g_a1Cur = 0;     // 当前 image 的类数（帧预算内的游标边界）
+static char g_a1ImgName[64]; // 当前 image 名（命中时一起打印，便于回查）
 static char g_a1Hit[A1_MAXHIT][160];
 static char g_a1Dump[2][160];
 static int  g_a1DumpN = 0;
@@ -6827,9 +6832,9 @@ static int safeCopyStr(const char *src, char *dst, int cap) {
 
 static void v115ProbeDD(void) {
     if (g_a1Done) return;
-    if (!I2.domain || !I2.domain_get_assemblies || !I2.assembly_get_image ||
-        !I2.image_get_class_count || !I2.image_get_class || !I2.class_get_fields ||
-        !I2.field_get_type || !I2.class_from_il2cpp_type || !I2.class_from_name) { g_a1Done = 1; return; }
+    if (!I2.domain_get_assemblies || !I2.assembly_get_image || !I2.image_get_class_count ||
+        !I2.image_get_class || !I2.class_get_fields || !I2.field_get_type ||
+        !I2.class_from_il2cpp_type || !I2.class_from_name) { g_a1Done = 1; g_a1Abort = 1; return; }
 
     static void **asms = NULL; static size_t nasm = 0, ai = 0, ci = 0;
     static void *img = NULL;
@@ -6839,7 +6844,7 @@ static void v115ProbeDD(void) {
 
     if (!asms) {
         asms = (void **)I2.domain_get_assemblies(I2.domain, &nasm);
-        if (!asms || !nasm) { g_a1Done = 1; return; }
+        if (!asms || !nasm) { g_a1Done = 1; g_a1Abort = 2; return; }
     }
     // ① 先找 DisplayInfoData 类指针（找不到就报 A1 none，绝不再扫）
     if (!ddCls) {
@@ -6856,21 +6861,27 @@ static void v115ProbeDD(void) {
     int budget = 400;
     while (budget > 0) {
         if (!img) {
-            if (ai >= nasm) { g_a1Done = 1; return; }
+            if (ai >= nasm) { g_a1Done = 1; g_a1Abort = 3; return; }
             void *a = asms[ai++];
             img = a ? I2.assembly_get_image(a) : NULL;
             ci = 0;
             if (!img) continue;
-            const char *inm = I2.image_get_name ? I2.image_get_name(img) : NULL;
-            char nb[96];
-            int gotName = safeCopyStr(inm, nb, sizeof(nb));
-            if (!gotName) { g_a1AsmSkip++; img = NULL; continue; }        // 读不到 ≠ 不是它
-            if (!strstr(nb, "Assembly-CSharp")) { g_a1AsmOther++; img = NULL; continue; }
+            // B4（审核）：不再只扫 Assembly-CSharp —— 那只有 16,789/64,094 ≈ 26%，
+            // 持有 DisplayInfoData 的类可能在任何热更程序集里。这里**每个 image 的类全扫**。
+            g_a1Cur = (int)I2.image_get_class_count(img);
+            if (g_a1Cur < 0) g_a1Cur = 0;
+            g_a1Total += g_a1Cur;
             g_a1AsmOk++;
-            g_a1Total = (int)I2.image_get_class_count(img);
+            {
+                const char *inm = I2.image_get_name ? I2.image_get_name(img) : NULL;
+                if (!safeCopyStr(inm, g_a1ImgName, sizeof(g_a1ImgName))) {
+                    g_a1AsmSkip++;                                       // 名字读不到只影响回查，不影响扫描
+                    g_a1ImgName[0] = '-'; g_a1ImgName[1] = 0;
+                }
+            }
             continue;
         }
-        if (ci >= (size_t)g_a1Total) { img = NULL; continue; }
+        if (ci >= (size_t)g_a1Cur) { img = NULL; continue; }
         void *k = I2.image_get_class(img, (int)ci++);
         budget--; g_a1Seen++;
         if (!k) continue;
@@ -6890,9 +6901,12 @@ static void v115ProbeDD(void) {
                     I2.field_static_get_value(f, &obj);
                     if (obj && okptr((uintptr_t)obj)) {
                         // List<T>: _items@+0x10, _size@+0x18 ；数组: max_length@+0x18
-                        int32_t sz = -1; void *items = NULL;
-                        if (rd((char *)obj + 0x18, &sz, 4)) cnt = sz;
-                        if (!rd((char *)obj + 0x10, &items, 8) || !okptr((uintptr_t)items)) items = obj;
+                        // B3（审核）：_items/_size 单读可能读到半更新值 → 双读一致才用。
+                        int32_t sz1 = -1, sz2 = -1; void *it1 = NULL, *it2 = NULL;
+                        if (rd((char *)obj + 0x18, &sz1, 4) && rd((char *)obj + 0x18, &sz2, 4) && sz1 == sz2) cnt = sz1;
+                        if (rd((char *)obj + 0x10, &it1, 8) && rd((char *)obj + 0x10, &it2, 8) &&
+                            it1 == it2 && okptr((uintptr_t)it1)) items = it1;
+                        else items = obj;
                         void *e0 = (char *)items + 0x20;      // 数组数据区起点
                         if (cnt > 0 && cnt < 100000) {
                             rd(e0,      &d0, 4); rd((char*)e0+4,  &d1, 4);
@@ -6903,7 +6917,7 @@ static void v115ProbeDD(void) {
                     }
                 }
                 snprintf(g_a1Hit[g_a1Hits], sizeof(g_a1Hit[0]),
-                         "%s.%s st=%d cnt=%d", kn, fn, isStatic, cnt);
+                         "%s.%s [%s] st=%d cnt=%d", kn, fn, g_a1ImgName, isStatic, cnt);
                 g_a1Hits++;
                 if (cnt > 0 && g_a1DumpN < 2) {
                     snprintf(g_a1Dump[g_a1DumpN], sizeof(g_a1Dump[0]),
@@ -6925,7 +6939,7 @@ static void updateHud(void) {
         // v112r7：收成两行，但**必须**把 P0 那行留住 —— 本包的 ImGui 菜单打不开（g_menuOpen 只在
         // 菜单内部的按钮里切换），drawFixedPanel 永远画不出来，UILabel HUD 是唯一看得见的地方。
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v115 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v116 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100,
@@ -6936,7 +6950,7 @@ static void updateHud(void) {
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v115 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v116 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -6974,37 +6988,13 @@ static void updateHud(void) {
         }
     }
     // ---- v115：连续运行/崩溃计数 + 路径 A 探针进度 ----
-    [s appendFormat:@"RUN %ds crash=%d names_bad=%d  A1 seen=%d/%d hits=%d asm ok=%d skip=%d other=%d%s\n",
-        (int)(CACurrentMediaTime() - g_runStart), g_runCrash, g_namesBad,
+    [s appendFormat:@"RUN %ds crash=%d names_bad=%d  A1 abort=%d seen=%d/%d hits=%d asm ok=%d skip=%d other=%d%s\n",
+        (int)(CACurrentMediaTime() - g_runStart), g_runCrash, g_namesBad, g_a1Abort,
         g_a1Seen, g_a1Total, g_a1Hits,
         g_a1AsmOk, g_a1AsmSkip, g_a1AsmOther, g_a1Done ? " done" : ""];
     for (int i = 0; i < g_a1Hits; i++) [s appendFormat:@"A1 %s\n", g_a1Hit[i]];
     for (int i = 0; i < g_a1DumpN; i++) [s appendFormat:@"A1 %s\n", g_a1Dump[i]];
 
-    // ---- M1：位置节点扫描器（native 层，纯读）----
-    // 判据（评审 B3）：HIT==1 才算通过 —— 站立期 24 字节零变化 + 10 秒位移落在 2~12 m/s。
-    {
-        const char *ph = (g_m1phase == 1) ? "SCAN"  : (g_m1phase == 2) ? "STAND" :
-                         (g_m1phase == 3) ? "WALK"  : (g_m1phase == 4) ? "DONE"  : "IDLE";
-        [s appendFormat:@"M1 %s cand=%d stable=%d hit=%d scan=%.1fMB rng=%d SAT=%d\n",
-            ph, g_m1n, g_m1stable, g_m1hit, g_m1mb, g_m1rn, g_m1sat];
-        if (g_m1rn == 0)
-            [s appendFormat:@"M1 NORANGE (没匹配到 UnityFramework/PxExtFFi 的 __DATA 段)\n"];
-        else if (g_m1n == 0)
-            [s appendFormat:@"M1 NOCAND (扫了 %.1fMB 但没有形状像位置节点的记录)\n", g_m1mb];
-        for (int i = 0; i < g_m1topn; i++) {
-            [s appendFormat:@"M1 N%d 0x%llx i=(%d,%d,%d) d=(%d,%d) L=%d\n", i,
-                (unsigned long long)g_m1top[i],
-                g_m1tv[i][0], g_m1tv[i][1], g_m1tv[i][2],
-                g_m1td[i][0], g_m1td[i][1], g_m1tl[i]];
-        }
-        if (g_m1phase == 4) {
-            const char *v = g_m1sat ? "VOID" : (g_m1hit >= 1 ? "PASS" : "FAIL");
-            [s appendFormat:@"M1 VERDICT %s (SAT=%d hit=%d; PASS needs SAT=0 & hit>=1)\n",
-                v, g_m1sat, g_m1hit];
-            [s appendFormat:@"M1 sort=|L-45000| asc; 自己核 d=(dx,dz) 的方向\n"];
-        }
-    }
     // v28：这 4 行永远在第一屏，不用翻页 —— 现场「没法自主翻页」时这是唯一能拿到数据的地方
     [s appendFormat:@"R %d CAP %d ENT %p\n", g_cntRaw, g_capNow, g_entPtr];
     [s appendFormat:@"D %08x %08x %08x %08x %08x %08x %08x %08x\n", g_dw[0], g_dw[1], g_dw[2], g_dw[3], g_dw[4], g_dw[5], g_dw[6], g_dw[7]];
@@ -7232,7 +7222,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v115 booting";
+    l.text = @"ESP v116 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
