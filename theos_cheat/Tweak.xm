@@ -183,6 +183,7 @@ static void pushLog(const char *fmt, ...) {
 static char g_check[MAXCHECK][CHECKLEN];
 static int  g_checkN = 0;
 static int  g_pinN   = -1;      // v46：前 N 行固定（类 dump / 绑定日志），永不覆盖；-1=未定
+static pthread_mutex_t g_chkMu = PTHREAD_MUTEX_INITIALIZER;  // v117b：环形缓冲写入串行化
 // v47：一次性「事实行」按前缀钉住，永远显示在大 HUD 第一页，不随环形缓冲滚动
 #define PIN_N 10
 static char g_pinBuf[PIN_N][CHECKLEN];
@@ -268,6 +269,7 @@ static void checkLine(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    pthread_mutex_lock(&g_chkMu);              // v117b：与主线程/后台线程的 CHECK 串行化
     for (int i = 0; i < PIN_N; i++) {          // v48：钉住捕获必须在冻结判断之前
         size_t tl = strlen(g_pinTag[i]);
         if (strncmp(buf, g_pinTag[i], tl) == 0) {
@@ -275,23 +277,31 @@ static void checkLine(const char *fmt, ...) {
             break;
         }
     }
-    if (g_freeze) return;                     // 冻结只影响 ring，不影响钉位
+    if (g_freeze) { pthread_mutex_unlock(&g_chkMu); return; }   // 冻结只影响 ring，不影响钉位
     if (g_checkN >= MAXCHECK) {
         // v46：满了丢最旧的一行（但保留固定头），保住最新输出 —— 否则探针行永远进不来
         int pin = (g_pinN < 0) ? 0 : g_pinN;
+        if (pin < 0) pin = 0;
         if (pin > MAXCHECK / 2) pin = MAXCHECK / 2;
-        if (pin < MAXCHECK - 1) {
-            memmove(g_check + (size_t)pin * CHECKLEN,
-                    g_check + (size_t)(pin + 1) * CHECKLEN,
-                    (size_t)(MAXCHECK - pin - 1) * CHECKLEN);
-            snprintf(g_check[MAXCHECK - 1], CHECKLEN, "%s", buf);
-            return;
+        // v117：地址一律用**字节指针 + 显式边界**。旧写法 `g_check + pin*CHECKLEN` 被编译成
+        // base + (pin*112)*112（多乘一次），pin≈380 时偏移 4.7 MB，冲出 85 KB 缓冲落进
+        // ESTCore 受保护页 → SIGBUS（1v1 那两次崩溃的根因）。这里再忙也要自证边界。
+        char *base = &g_check[0][0];
+        size_t total = sizeof(g_check);
+        size_t off   = (size_t)pin * (size_t)CHECKLEN;
+        size_t mov   = ((size_t)(MAXCHECK - pin - 1)) * (size_t)CHECKLEN;
+        if (off + CHECKLEN + mov <= total) {
+            memmove(base + off, base + off + CHECKLEN, mov);
         }
+        snprintf(g_check[MAXCHECK - 1], CHECKLEN, "%s", buf);
+        pthread_mutex_unlock(&g_chkMu);
+        return;
     }
     if (g_checkN < MAXCHECK) {
         snprintf(g_check[g_checkN], sizeof(g_check[0]), "%s", buf);
         g_checkN++;
     }
+    pthread_mutex_unlock(&g_chkMu);
     pushLog("%s", buf);
     bcLine(buf);                    // v70：同时落盘（崩溃也能留下证据）
     rtSendLine(buf);                // v73：同时发 LAN（PC 端 esp_host.py 收）
@@ -1192,7 +1202,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v116 ====");
+    CHECK("==== dump v117 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1203,7 +1213,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v116 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v117 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6028,7 +6038,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v116 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v117 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6848,13 +6858,21 @@ static void v115ProbeDD(void) {
     }
     // ① 先找 DisplayInfoData 类指针（找不到就报 A1 none，绝不再扫）
     if (!ddCls) {
+        // v117：不再猜命名空间 —— 直接按**原始名字指针**在全部程序集里扫 strcmp（0 次 vm_read）。
+        // 上一版用 5 个候选命名空间去 class_from_name，全不中就 abort=0 退出（A 永远拿不到答案）。
         for (size_t i = 0; i < nasm && !ddCls; i++) {
             void *im = asms[i] ? I2.assembly_get_image(asms[i]) : NULL;
             if (!im) continue;
-            for (size_t k = 0; k < sizeof(nss)/sizeof(nss[0]) && !ddCls; k++)
-                ddCls = I2.class_from_name(im, nss[k], "DisplayInfoData");
+            int cc2 = (int)I2.image_get_class_count(im);
+            for (int k = 0; k < cc2; k++) {
+                void *kk = I2.image_get_class(im, k);
+                if (!kk) continue;
+                const char *nm2 = real_class_get_name ? real_class_get_name(kk)
+                                                      : (I2.class_get_name ? I2.class_get_name(kk) : NULL);
+                if (nm2 && strcmp(nm2, "DisplayInfoData") == 0) { ddCls = kk; break; }
+            }
         }
-        if (!ddCls) { g_a1Cls = -1; g_a1Done = 1; return; }
+        if (!ddCls) { g_a1Abort = 4; g_a1Done = 1; return; }   // 全量扫完也没有这个类
         g_a1Cls = 1;
     }
 
@@ -6939,7 +6957,7 @@ static void updateHud(void) {
         // v112r7：收成两行，但**必须**把 P0 那行留住 —— 本包的 ImGui 菜单打不开（g_menuOpen 只在
         // 菜单内部的按钮里切换），drawFixedPanel 永远画不出来，UILabel HUD 是唯一看得见的地方。
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v116 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v117 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100,
@@ -6950,7 +6968,7 @@ static void updateHud(void) {
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v116 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v117 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -7222,7 +7240,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v116 booting";
+    l.text = @"ESP v117 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
