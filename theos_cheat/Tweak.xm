@@ -900,6 +900,8 @@ static int    g_camBadN     = 0;      // camcall bad 次数：有限重试，不
 static int    g_boxDrawn    = 0;      // 本帧真正画出的框数（0 = W2S 没产出可用坐标）
 #define V84_OFFN 32
 static int    g_offN        = 0;      // v84：屏幕外指示数量
+static int    g_sk[8]       = {0};    // v88: 0 rdFail 1 nullObj 2 notLinker 3 noPos 4 zeroPos 5 notHero 6 dup 7 projFail
+static int    g_onscrN      = 0;      // v88：投影成功且在屏幕内的单位数
 static int    g_scanN       = 0;      // v84：本帧扫过的单位数
 static int    g_hudForce    = 0;      // 1 = 强制展开大 HUD（3 指上滑）
 static int    g_hudWasGood  = 0;      // 本局曾经真的画出过框（关掉 ESP 后 HUD 仍然保持收起）
@@ -928,7 +930,7 @@ static void  *g_lastEntries = NULL;
 static int    g_lastCnt     = 0;
 // v35：生命周期字段（全部按名字从元数据取，取不到就是 -1，规则自动降级）
 static int g_offName = -1;      // v67f：name 偏移（按名解析，兜底 0x4B0）
-static unsigned int g_probeMask = 0x01;   // v80：bit0=FT 诊断位（默认开，晚触发保护）；bit8=强制立即跑（默认关）
+static unsigned int g_probeMask = 0x11;   // v85：bit0=FT 诊断 + bit4=CAMP2 原始布局（C2RW）；bit8=强制立即跑（默认关）
 // v71：可见性候选（-2 = 未解析，-1 = 没有这个字段）
 static int g_offVB  = -2;       // bGetVisibleComponent
 static int g_offISP = -2;       // invisibleSpecialComponents
@@ -1215,7 +1217,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v84 ====");
+    CHECK("==== dump v88 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1226,7 +1228,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v84 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v88 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -4729,7 +4731,8 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
     v73Tick();
-    g_boxDrawn = 0; g_offN = 0; g_scanN = 0;       // 每帧先归零
+    g_boxDrawn = 0; g_offN = 0; g_scanN = 0; g_onscrN = 0;   // 每帧先归零
+    for (int zi = 0; zi < 8; zi++) g_sk[zi] = 0;
     if (!I2.domain || !g_mgr || !g_linkerClass) return;
     if (g_offDict < 0 || g_offCount < 0 || g_offEntries < 0) return;
 
@@ -4941,17 +4944,17 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         // v65：不再用 camRefPos 兜底（少一次相机方法调用）；拿不到 rawHostId 就先不显示距离
         (void)hit;
     }
-    for (int i = 0; i < cnt && drawn < 32; i++) {
+    for (int i = 0; i < cnt && drawn < 160; i++) {   // v88：32 太小，可能英雄根本没轮到
         void *obj = NULL;
-        if (!rd((char *)entries + g_arrBase + (size_t)i * 24 + 16, &obj, sizeof(obj))) continue;
-        if (!obj) continue;
+        if (!rd((char *)entries + g_arrBase + (size_t)i * 24 + 16, &obj, sizeof(obj))) { g_sk[0]++; continue; }
+        if (!obj) { g_sk[1]++; continue; }
         void *ok = NULL;
-        if (!rd(obj, &ok, sizeof(ok)) || ok != g_linkerClass) continue;
+        if (!rd(obj, &ok, sizeof(ok)) || ok != g_linkerClass) { g_sk[2]++; continue; }
 
         float pos[3] = {0, 0, 0};
-        if (!rd((char *)obj + 0x4C4, pos, sizeof(pos))) continue;
+        if (!rd((char *)obj + 0x4C4, pos, sizeof(pos))) { g_sk[3]++; continue; }
         // v22：还没生成/雾里的单位坐标就是 (0,0,0)，投影出来是屏幕左下角的假框
-        if (pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f) continue;
+        if (pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f) { g_sk[4]++; continue; }
         unsigned char camp = 0;
         rd((char *)obj + 0x504, &camp, 1);
         unsigned int objId = 0;
@@ -4962,14 +4965,14 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         int aT = 0, aC = 0, cfg = 0, pid = 0, hcfg = 0, rpid = 0;
         readIdentity2(obj, &aT, &aC, &cfg, &pid, &hcfg, &rpid);
         // v34：白名单一旦自证成功，就只画英雄；没自证出来时保持「全画」，不会白跑
-        if (g_heroType >= 0 && aT != g_heroType) { continue; }
+        if (g_heroType >= 0 && aT != g_heroType) { g_sk[5]++; continue; }
 
         // ---- v35 规则1：身份用 ObjID —— 同一帧同一个 ObjID 只画一次
         // （逻辑 actor 与 mesh actor 会各自进列表，不去重就会出现「框特别粗」）
         {
             int dup = 0;
             for (int k = 0; k < g_seenN; k++) if (g_seenId[k] == objId) { dup = 1; break; }
-            if (dup) continue;
+            if (dup) { g_sk[6]++; continue; }
             if (g_seenN < 64) g_seenId[g_seenN++] = objId;
         }
 
@@ -5068,6 +5071,14 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
             for (int k = 0; k < 64; k++) if (g_deadTbl[k].id == objId) { g_deadTbl[k].id = 0; g_deadTbl[k].t = 0; }
         }
 
+        {   // v86：每 2 秒把 DRAW 统计写进环形日志（翻页可见 + LAN 可见）
+            static double s_nextDraw = 0;
+            double nw2 = CACurrentMediaTime();
+            if (nw2 >= s_nextDraw) {
+                s_nextDraw = nw2 + 2.0;
+                CHECK("DRAW on %d off %d scan %d u %d", g_boxDrawn, g_offN, g_scanN, g_unitCount);
+            }
+        }
         if (g_unitDump < 6) {
             void *nm = NULL;
             rd((char *)obj + 0x4B0, &nm, sizeof(nm));
@@ -5104,7 +5115,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         } else {
             Vec3 w = { pos[0], pos[1], pos[2] };
             ImVec2 sp;
-            if (!worldToScreen(w, g_vp, sw, sh, sp)) continue;
+            if (!worldToScreen(w, g_vp, sw, sh, sp)) { g_sk[7]++; continue; }
             sx = sp.x;
             sy = sp.y;
         }
@@ -5121,6 +5132,11 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
             dl->AddText(ImVec2(sx + 8.0f, sy - 6.0f), oc, ob);
             if (g_offN < V84_OFFN) g_offN++;
             continue;
+        }
+
+        g_onscrN++;
+        if (g_showBox) {   // v88：集合内 + 屏幕内 = 空心圈（细、灰白），与"框"区分
+            dl->AddCircle(ImVec2(sx, sy - 45.0f), 10.0f, IM_COL32(235, 235, 235, 110), 18, 1.0f);
         }
 
         // ---- v41：轨迹与外推。视野外客户端拿不到新坐标（位置冻结），
@@ -5248,6 +5264,15 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         CHECK("LFLAG distrust dead %d/%d", g_frameDead, g_frameAll);
     }
     g_boxDrawn = drawn;
+    {   // v88：一屏一行的 skip 直方图（谁被哪个 if 拦下）
+        static double s_nextSk = 0;
+        double nwS = CACurrentMediaTime();
+        if (nwS >= s_nextSk) {
+            s_nextSk = nwS + 1.0;
+            CHECK("SKIP n=%d on=%d drawn=%d | rdF=%d nul=%d notL=%d noP=%d zeroP=%d noHero=%d dup=%d proj=%d off=%d",
+                  cnt, g_onscrN, drawn, g_sk[0], g_sk[1], g_sk[2], g_sk[3], g_sk[4], g_sk[5], g_sk[6], g_sk[7], g_offN);
+        }
+    }
     if (drawn > 0) g_hudWasGood = 1;
     static bool s_w2sLogged = false;
     if (useW2S && !s_w2sLogged && drawn > 0) {
@@ -5279,13 +5304,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v84  u%d r%d b%d p%d in%d d%d c%d  pg%d full%d fz%d pin%d btn%d\n3-finger UP = full hud",
-            g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch, g_boxDrawn, g_camCallState,
-            g_hudPage % 100, g_hudForce, g_freeze, pinCount(), g_btnN];
+            @"ESP v88 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
+            g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
+            g_hudPage % 100];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v84\n"];
+    [s appendString:@"ESP v88\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -5362,7 +5387,7 @@ static void updateHud(void) {
     else if (!CALIB_ENABLE && t % 150 == 20 && g_calRuns < 1) { g_calRuns++; CHECK("CALIB disabled (v69)"); }
     if (PROBES_DEFAULT && t % 150 == 10 && g_unitCount >= 5 && g_rvaRuns < 1) { g_rvaRuns++; probeRVA(); }
     // v82：此处不再调用（已前移到 renderFrame 第一行）
-    if ((g_probeMask & 0x10) && PROBES_DEFAULT && g_unitCount >= 5 && g_c2rRuns < 2 && t % 150 == 5) {
+    if ((g_probeMask & 0x10) && PROBES_DEFAULT && g_unitCount >= 5 && g_c2rRuns < 2 && g_frameStamp > 30) {
         g_c2rRuns++; probeCampRaw();               // v73：CAMP2 元素布局定死
     }
     // v72：按时间采样（3 秒/拍，10 拍 ≈ 30 秒），不受帧率影响
@@ -5522,7 +5547,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v84 booting";
+    l.text = @"ESP v88 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -5562,7 +5587,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v84 esp (offscreen)");
+    ImGui::Text("build         : v88 esp (skipstat)");
     ImGui::Text("DRAW          : on %d  off %d  scan %d", g_boxDrawn, g_offN, g_scanN);
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
