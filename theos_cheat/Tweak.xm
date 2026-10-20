@@ -1236,7 +1236,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v102 ====");
+    CHECK("==== dump v103 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1247,7 +1247,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v102 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v103 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -4995,6 +4995,9 @@ static void v96Install(void) {
 static void *g_lk_fObjID = NULL, *g_lk_fPos = NULL, *g_lk_fLv = NULL, *g_lk_fMv = NULL;
 static void *g_lk_fFn = NULL, *g_lk_fRec = NULL, *g_lk_fMeta = NULL, *g_lk_fMoveComp = NULL;
 static void *g_v98MetaCls = NULL, *g_meta_fPid = NULL, *g_meta_fType = NULL, *g_meta_fCamp = NULL, *g_meta_fCfg = NULL;
+static void *g_meta_fHost = NULL, *g_meta_fRaw = NULL, *g_meta_fMesh = NULL;   // v103
+static int   g_offHost = -1, g_offRaw = -1, g_offMesh = -1;
+static void *g_mv_fCur = NULL;
 static void *g_v98MvCls = NULL, *g_mv_fRem = NULL, *g_v98PrCls = NULL, *g_pr_fSize = NULL;
 static int   g_v98Ready = 0;
 static int   g_metaIsValue = 0;     // v99：theMeta 是否为结构体
@@ -5079,12 +5082,18 @@ static void v98Init(void) {
         g_meta_fType = I2.class_get_field_from_name(g_v98MetaCls, "ActorType");
         g_meta_fCamp = I2.class_get_field_from_name(g_v98MetaCls, "ActorCamp");
         g_meta_fCfg  = I2.class_get_field_from_name(g_v98MetaCls, "ConfigId");
+        g_meta_fHost = I2.class_get_field_from_name(g_v98MetaCls, "HostConfigId");
+        g_meta_fRaw  = I2.class_get_field_from_name(g_v98MetaCls, "RawPlayerId");
+        g_meta_fMesh = I2.class_get_field_from_name(g_v98MetaCls, "MeshPlayerId");
         if (I2.class_is_valuetype) g_metaIsValue = I2.class_is_valuetype(g_v98MetaCls) ? 1 : 0;
         if (g_metaIsValue) {
             if (g_meta_fPid)  g_metaPidOff  = (int)I2.field_get_offset(g_meta_fPid);
             if (g_meta_fType) g_metaTypeOff = (int)I2.field_get_offset(g_meta_fType);
             if (g_meta_fCamp) g_metaCampOff = (int)I2.field_get_offset(g_meta_fCamp);
             if (g_meta_fCfg)  g_metaCfgOff  = (int)I2.field_get_offset(g_meta_fCfg);
+            if (g_meta_fHost) g_offHost     = (int)I2.field_get_offset(g_meta_fHost);
+            if (g_meta_fRaw)  g_offRaw      = (int)I2.field_get_offset(g_meta_fRaw);
+            if (g_meta_fMesh) g_offMesh     = (int)I2.field_get_offset(g_meta_fMesh);
         }
     }
 
@@ -5098,7 +5107,10 @@ static void v98Init(void) {
             const char *cn = (fc && I2.class_get_name) ? I2.class_get_name(fc) : NULL;
             if (cn && strstr(cn, "MoveComponent")) { g_lk_fMoveComp = f; g_v98MvCls = fc; break; }
         }
-        if (g_v98MvCls) g_mv_fRem = I2.class_get_field_from_name(g_v98MvCls, "remotePosition");
+        if (g_v98MvCls) {
+            g_mv_fRem = I2.class_get_field_from_name(g_v98MvCls, "remotePosition");
+            g_mv_fCur = I2.class_get_field_from_name(g_v98MvCls, "curPosition");
+        }
     }
 
     g_bc = 4;
@@ -5112,11 +5124,12 @@ static void v98Init(void) {
             if (!g_pr_fSize) g_pr_fSize = I2.class_get_field_from_name(g_v98PrCls, "_count");
         }
     }
-    CHECK("V99 metaIsValue=%d offs(pid=%d ty=%d camp=%d cfg=%d)", g_metaIsValue, g_metaPidOff, g_metaTypeOff, g_metaCampOff, g_metaCfgOff);
-    CHECK("V98 init lk=%p id=%p pos=%p lv=%p mv=%p fn=%p meta=%p pid=%p ty=%p camp=%p moveComp=%p rem=%p prCls=%p prSize=%p",
-          lk, g_lk_fObjID, g_lk_fPos, g_lk_fLv, g_lk_fMv, g_lk_fFn,
-          g_lk_fMeta, g_meta_fPid, g_meta_fType, g_meta_fCamp,
-          g_lk_fMoveComp, g_mv_fRem, g_v98PrCls, g_pr_fSize);
+    CHECK("V103 metaVT=%d offs(cfg=%d host=%d pid=%d raw=%d mesh=%d ty=%d camp=%d)",
+          g_metaIsValue, g_metaCfgOff, g_offHost, g_metaPidOff, g_offRaw, g_offMesh, g_metaTypeOff, g_metaCampOff);
+    CHECK("V103 lk=%p id=%p pos=%p lv=%p mv=%p fn=%p meta=%p",
+          lk, g_lk_fObjID, g_lk_fPos, g_lk_fLv, g_lk_fMv, g_lk_fFn, g_lk_fMeta);
+    CHECK("V103 move=%p rem=%p cur=%p pr=%p(%p)",
+          g_lk_fMoveComp, g_mv_fRem, g_mv_fCur, g_v98PrCls, g_pr_fSize);
     // 关键字段缺失就不跑表（宁可不报，也不越界）
     if (!lk || !g_lk_fObjID || !g_lk_fPos) {
         g_v98Ready = -1;
@@ -5131,25 +5144,12 @@ static void v98Init(void) {
 // 读一个 actor 的身份/存活，写成一行
 static void v98One(void *o) {
     if (!o || !I2.field_get_value) return;
-    // v99 关键：不是 ActorLinker 一律不碰（v98 就是在这里越界崩的）
     if (!g_linkerClass) return;
     { void *k = NULL; if (!rd(o, &k, sizeof(k)) || k != g_linkerClass) return; }
 
-#if V100_MIN
-    // v100 最小模式：只读 ObjID + position，其余全部跳过
-    {
-        int id0 = 0; float p0[3] = {0,0,0};
-        g_bc = 20;
-        if (g_lk_fObjID) I2.field_get_value(o, g_lk_fObjID, &id0);
-        g_bc = 21;
-        if (g_lk_fPos) I2.field_get_value(o, g_lk_fPos, p0);
-        g_bc = 22;
-        CHECK("A id=%-6d pos=(%.0f,%.0f)", id0, p0[0], p0[2]);
-        return;
-    }
-#endif
-    int id = 0, pid = -1, ty = -1, cp = -1, cfg = -1, fn = -1, lv = -1, mv = -1, pr = -1;
-    float pos[3] = {0,0,0}, rem[3] = {-9999,-9999,-9999};
+    int id = 0, pid = -1, ty = -1, cp = -1, cfg = -1, hcfg = -1, raw = -1, mesh = -1;
+    int fn = -1, lv = -1, mv = -1, pr = -1;
+    float pos[3] = {0,0,0}, cur[3] = {-9999,-9999,-9999}, rem[3] = {-9999,-9999,-9999};
 
     if (g_lk_fObjID) I2.field_get_value(o, g_lk_fObjID, &id);
     if (g_lk_fPos)   I2.field_get_value(o, g_lk_fPos, pos);
@@ -5158,39 +5158,46 @@ static void v98One(void *o) {
     if (g_lk_fMv)  { unsigned char b = 0; I2.field_get_value(o, g_lk_fMv, &b); mv = b; }
 
     if (g_lk_fMeta && g_v98MetaCls) {
+        unsigned char mb[1024];
+        memset(mb, 0, sizeof(mb));
+        I2.field_get_value(o, g_lk_fMeta, mb);
         if (g_metaIsValue) {
-            unsigned char mb[1024];
-            memset(mb, 0, sizeof(mb));
-            I2.field_get_value(o, g_lk_fMeta, mb);          // 整体拷贝结构体，安全
+            v99IntAt(mb, g_metaCfgOff,  &cfg);
+            v99IntAt(mb, g_offHost,     &hcfg);
             v99IntAt(mb, g_metaPidOff,  &pid);
+            v99IntAt(mb, g_offRaw,      &raw);
+            v99IntAt(mb, g_offMesh,     &mesh);
             v99IntAt(mb, g_metaTypeOff, &ty);
             v99IntAt(mb, g_metaCampOff, &cp);
-            v99IntAt(mb, g_metaCfgOff,  &cfg);
         } else {
-            unsigned char mb[1024];
-            memset(mb, 0, sizeof(mb));
-            I2.field_get_value(o, g_lk_fMeta, mb);      // 统一写缓冲，永不溢出
             void *meta = *(void **)mb;
             if (meta && okptr((uintptr_t)meta)) {
+                if (g_meta_fCfg)  I2.field_get_value(meta, g_meta_fCfg, &cfg);
+                if (g_meta_fHost) I2.field_get_value(meta, g_meta_fHost, &hcfg);
                 if (g_meta_fPid)  I2.field_get_value(meta, g_meta_fPid, &pid);
+                if (g_meta_fRaw)  I2.field_get_value(meta, g_meta_fRaw, &raw);
+                if (g_meta_fMesh) I2.field_get_value(meta, g_meta_fMesh, &mesh);
                 if (g_meta_fType) I2.field_get_value(meta, g_meta_fType, &ty);
                 if (g_meta_fCamp) I2.field_get_value(meta, g_meta_fCamp, &cp);
-                if (g_meta_fCfg)  I2.field_get_value(meta, g_meta_fCfg, &cfg);
             }
         }
     }
-    if (g_lk_fMoveComp && g_mv_fRem) {
+    if (g_lk_fMoveComp) {
         void *mvc = NULL;
         I2.field_get_value(o, g_lk_fMoveComp, &mvc);
-        if (mvc && okptr((uintptr_t)mvc)) I2.field_get_value(mvc, g_mv_fRem, rem);
+        if (mvc && okptr((uintptr_t)mvc)) {
+            if (g_mv_fRem) I2.field_get_value(mvc, g_mv_fRem, rem);
+            if (g_mv_fCur) I2.field_get_value(mvc, g_mv_fCur, cur);
+        }
     }
     if (g_lk_fRec && g_pr_fSize) {
         void *lst = NULL;
         I2.field_get_value(o, g_lk_fRec, &lst);
         if (lst && okptr((uintptr_t)lst)) I2.field_get_value(lst, g_pr_fSize, &pr);
     }
-    CHECK("A id=%-6d pid=%-6d ty=%-3d camp=%-3d cfg=%-5d lv=%d mv=%d fn=%-7d pos=(%.0f,%.0f) rem=(%.0f,%.0f) pr=%d",
-          id, pid, ty, cp, cfg, lv, mv, fn, pos[0], pos[2], rem[0], rem[2], pr);
+    int ph = ((pos[0] == 1000.0f && pos[2] == 1000.0f) || (pos[0] == 0.0f && pos[2] == 0.0f)) ? 1 : 0;
+    CHECK("A id=%-5d ty=%-2d camp=%-2d lv=%d mv=%d fn=%-6d cfg=%-5d hc=%-5d pid=%-8d raw=%-8d msh=%-8d ph=%d pos=(%.0f,%.0f) cur=(%.0f,%.0f) rem=(%.0f,%.0f) pr=%d",
+          id, ty, cp, lv, mv, fn, cfg, hcfg, pid, raw, mesh, ph, pos[0], pos[2], cur[0], cur[2], rem[0], rem[2], pr);
 }
 
 static void v98Dump(void *mgr) {
@@ -5234,39 +5241,38 @@ static void v98Dump(void *mgr) {
             if (pid > 0) nPid++;
         }
     }
-    CHECK("V98 == cnt=%d withPid=%d notLinker=%d off=%d ==", cnt, nPid, nOther, g_v98Off);
+    CHECK("V103 == cnt=%d withPid=%d notLinker=%d off=%d ==", cnt, nPid, nOther, g_v98Off);
     g_bc = 15;
 
-    // 第一批：所有 pid>0 的（最多 8 个）
-    int shown = 0;
-    for (int i = 0; i < cnt && shown < 4; i++) {
-        void *o = NULL;
-        if (!rd((char *)ent + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr((uintptr_t)o)) continue;
-        int pid = 0;
-        if (g_lk_fMeta && g_meta_fPid) {
-            if (g_metaIsValue) {
-                unsigned char mb[1024];
-                memset(mb, 0, sizeof(mb));
+    // v103 第一批：ty==0（英雄）优先，最多 6 行
+    {
+        int shown = 0;
+        for (int i2 = 0; i2 < cnt && shown < 6; i2++) {
+            void *o = NULL;
+            if (!rd((char *)ent + g_arrBase + (size_t)i2 * 24 + 16, &o, sizeof(o)) || !okptr((uintptr_t)o)) continue;
+            { void *k = NULL; if (!rd(o, &k, sizeof(k)) || k != g_linkerClass) continue; }
+            int t2 = -1;
+            unsigned char mb[1024];
+            memset(mb, 0, sizeof(mb));
+            if (g_lk_fMeta) {
                 I2.field_get_value(o, g_lk_fMeta, mb);
-                v99IntAt(mb, g_metaPidOff, &pid);
-            } else {
-                unsigned char mb[1024];
-                memset(mb, 0, sizeof(mb));
-                I2.field_get_value(o, g_lk_fMeta, mb);
-                void *meta = *(void **)mb;
-                if (meta && okptr((uintptr_t)meta)) I2.field_get_value(meta, g_meta_fPid, &pid);
+                if (g_metaIsValue) v99IntAt(mb, g_metaTypeOff, &t2);
+                else {
+                    void *meta = *(void **)mb;
+                    if (meta && okptr((uintptr_t)meta) && g_meta_fType) I2.field_get_value(meta, g_meta_fType, &t2);
+                }
             }
+            if (t2 == 0) { v98One(o); shown++; }
         }
-        if (pid > 0) { v98One(o); shown++; }
     }
-    // 第二批：轮转 8 个（不分身份）
-    for (int k = 0; k < 4; k++) {
-        int i = (g_v98Off + k) % cnt;
+    // 第二批：轮转 3 行
+    for (int k = 0; k < 3; k++) {
+        int i3 = (g_v98Off + k) % cnt;
         void *o = NULL;
-        if (!rd((char *)ent + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr((uintptr_t)o)) continue;
+        if (!rd((char *)ent + g_arrBase + (size_t)i3 * 24 + 16, &o, sizeof(o)) || !okptr((uintptr_t)o)) continue;
         v98One(o);
     }
-    g_v98Off = (g_v98Off + 8) % (cnt > 0 ? cnt : 1);
+    g_v98Off = (g_v98Off + 3) % (cnt > 0 ? cnt : 1);
 }
 
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
@@ -5886,13 +5892,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v102 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
+            @"ESP v103 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v102 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v103 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -6129,7 +6135,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v102 booting";
+    l.text = @"ESP v103 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -6169,7 +6175,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v102 esp (retry+deep)");
+    ImGui::Text("build         : v103 esp (heroes-first)");
     ImGui::Text("DRAW          : on %d  off %d  scan %d", g_boxDrawn, g_offN, g_scanN);
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
