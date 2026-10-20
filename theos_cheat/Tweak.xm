@@ -1236,7 +1236,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v101 ====");
+    CHECK("==== dump v102 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1247,7 +1247,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v101 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v102 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -5010,14 +5010,56 @@ static int   g_v98Off = 0;
 static int   g_v98Count = 0;
 static volatile int g_bc = 0;        // v100 面包屑：崩溃前最后执行到哪一步
 static volatile int g_dumpN = 0;     // v100：打表次数
+static double g_v98Reprint = 0;      // v102：init 行重打计时
 #define V100_MIN 0                   // v101：完整读取（崩溃根因已定位到 rfProbe）
 
+// v102：class_from_name 查不到时，全类名扫描兜底（只在失败时跑，最多每 5 秒一次）
+static void *findClsDeep(const char *ns, const char *want) {
+    void *k = findCls(ns, want);
+    if (k) return k;
+    if (!I2.domain_get_assemblies || !I2.assembly_get_image ||
+        !I2.image_get_class_count || !I2.image_get_class ||
+        !I2.class_get_name || !I2.class_get_namespace) return NULL;
+    size_t n = 0;
+    void **asms = I2.domain_get_assemblies(I2.domain, &n);
+    if (!asms) return NULL;
+    for (size_t a = 0; a < n; a++) {
+        void *img = I2.assembly_get_image(asms[a]);
+        if (!img) continue;
+        int cc = I2.image_get_class_count(img);
+        if (cc <= 0 || cc > 20000) continue;
+        for (int i = 0; i < cc; i++) {
+            void *c = I2.image_get_class(img, i);
+            if (!c) continue;
+            const char *cn = I2.class_get_name(c);
+            if (!cn || strcmp(cn, want) != 0) continue;
+            const char *cns = I2.class_get_namespace(c);
+            if (ns && ns[0] && (!cns || strcmp(cns, ns) != 0)) continue;
+            return c;
+        }
+    }
+    return NULL;
+}
+
 static void v98Init(void) {
-    if (g_v98Ready) return;
+    if (g_v98Ready == 1) return;      // 正在初始化中
+    {   // v102：失败重试节流 —— 0.5 秒最多一次（findClsDeep 是全类扫描，不能每帧跑）
+        static double s_lastTry = 0;
+        double nowt = CACurrentMediaTime();
+        if (g_v98Ready == 0 && nowt - s_lastTry < 0.5) return;
+        s_lastTry = nowt;
+    }
     g_v98Ready = 1;
     g_bc = 1;
-    void *lk = findCls("Assets.Scripts.GameLogic", "ActorLinker");
-    if (!lk) { CHECK("V98 lk cls none"); return; }
+    void *lk = findClsDeep("Assets.Scripts.GameLogic", "ActorLinker");
+    if (!lk) {
+        static double s_nextTry = 0;
+        double nw = CACurrentMediaTime();
+        if (nw >= s_nextTry) { s_nextTry = nw + 5.0; CHECK("V98 lk cls none (retry in 5s, BC=1)"); }
+        g_v98Ready = 0;        // v102：不 latch，下次继续试
+        g_bc = 0;
+        return;
+    }
     g_lk_fObjID = I2.class_get_field_from_name(lk, "ObjID");
     g_lk_fPos   = I2.class_get_field_from_name(lk, "position");
     g_lk_fLv    = I2.class_get_field_from_name(lk, "_logicVisible");
@@ -5083,6 +5125,7 @@ static void v98Init(void) {
     }
     g_v98Ready = 2;
     g_bc = 5;
+    g_v98Reprint = 30.0;   // v102：30 秒后重打一次（保证能在最后一页看到）
 }
 
 // 读一个 actor 的身份/存活，写成一行
@@ -5233,6 +5276,10 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     v73Tick();
     // v99：启动即初始化（只做字段解析，不读任何游戏对象）
     if (!g_v98Ready) v98Init();
+    else if (g_v98Ready == 2 && g_v98Reprint > 0) {   // v102：30 秒重打一次 init 明细
+        g_v98Reprint -= 1.0 / 60.0;
+        if (g_v98Reprint <= 0) { g_v98Reprint = 30.0; v98Init(); }
+    }
     g_v98Count++;                     // 诊断：跑到第几帧
     {   // v99：进对局 8 秒后才开始打表，每 4 秒 4 行
         static double s_v98Next = 0;
@@ -5839,13 +5886,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v101 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
+            @"ESP v102 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v101 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v102 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -6082,7 +6129,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v101 booting";
+    l.text = @"ESP v102 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -6122,7 +6169,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v101 esp (no-getter)");
+    ImGui::Text("build         : v102 esp (retry+deep)");
     ImGui::Text("DRAW          : on %d  off %d  scan %d", g_boxDrawn, g_offN, g_scanN);
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
