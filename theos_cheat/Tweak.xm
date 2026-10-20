@@ -5208,7 +5208,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     v73Tick();
     // v99：启动即初始化（只做字段解析，不读任何游戏对象）
     if (!g_v98Ready) v98Init();
-    v98Count++;                       // 诊断：跑到第几帧
+    g_v98Count++;                     // 诊断：跑到第几帧
     {   // v99：进对局 8 秒后才开始打表，每 4 秒 4 行
         static double s_v98Next = 0;
         if (g_inMatch && g_v98Ready == 2) {
