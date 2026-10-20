@@ -100,6 +100,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <unistd.h>
+#include <signal.h>
+#include <stdio.h>
 #include <errno.h>              // v35：sinf 用于隐身灰闪，显式引入避免依赖传递包含
 
 // 不依赖 CydiaSubstrate / ellekit。
@@ -347,13 +350,6 @@ static int  h_raise(int sig) {
 #ifndef VM_PROT_COPY
 #define VM_PROT_COPY 0x10          // 写时复制，改 __DATA_CONST 的 GOT 必须带这个
 #endif
-
-static void page_protect(void *addr, size_t len, vm_prot_t prot) {
-    vm_address_t start = (vm_address_t)addr & ~(vm_address_t)(ESP_PAGE - 1);
-    vm_address_t end   = ((vm_address_t)addr + len + ESP_PAGE - 1) & ~(vm_address_t)(ESP_PAGE - 1);
-    vm_protect(mach_task_self(), start, (vm_size_t)(end - start), FALSE, prot);
-}
-
 // 在一个镜像里把 want 这个符号的 GOT 槽全部指向 repl，返回命中数
 static int hook_sym_in_image(const struct mach_header_64 *mh, intptr_t slide,
                              const char *want, void *repl)
@@ -563,40 +559,6 @@ static kern_return_t (*orig_task_get_exception_ports)(task_t, exception_mask_t,
         exception_mask_array_t, mach_msg_type_number_t *,
         exception_handler_array_t, exception_behavior_array_t,
         exception_flavor_array_t);
-
-static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
-                       void *newp, size_t newlen) {
-    int r = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-    if (r == 0 && name && namelen >= 4 &&
-        name[0] == CTL_KERN && name[1] == KERN_PROC && name[3] == KERN_PROC_PID &&
-        oldp && oldlenp && *oldlenp >= sizeof(struct kinfo_proc)) {
-        struct kinfo_proc *kp = (struct kinfo_proc *)oldp;
-        kp->kp_proc.p_flag &= ~P_TRACED;
-    }
-    return r;
-}
-
-static int hook_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
-                             void *newp, size_t newlen) {
-    int r = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-    if (r == 0 && name && strcmp(name, "kern.proc.pid") == 0 &&
-        oldp && oldlenp && *oldlenp >= sizeof(struct kinfo_proc)) {
-        struct kinfo_proc *kp = (struct kinfo_proc *)oldp;
-        kp->kp_proc.p_flag &= ~P_TRACED;
-    }
-    return r;
-}
-
-static kern_return_t hook_task_get_exception_ports(task_t task,
-        exception_mask_t mask, exception_mask_array_t masks,
-        mach_msg_type_number_t *cnt, exception_handler_array_t handlers,
-        exception_behavior_array_t behaviors, exception_flavor_array_t flavors) {
-    kern_return_t r = orig_task_get_exception_ports(task, mask, masks, cnt,
-                                                    handlers, behaviors, flavors);
-    if (r == KERN_SUCCESS && cnt) *cnt = 0;
-    return r;
-}
-
 static void installAntiDebug(void) {
     // PT_DENY_ATTACH 是 syscall，不需要 inline hook，仍然有效
     ptrace(PT_DENY_ATTACH, 0, 0, 0);
@@ -610,29 +572,6 @@ static void installAntiDebug(void) {
 // ============================================================================
 static uint32_t (*orig_dyld_image_count)(void);
 static const char *(*orig_dyld_get_image_name)(uint32_t);
-
-static uint32_t hook_dyld_image_count(void) { return orig_dyld_image_count(); }
-
-static const char *hook_dyld_get_image_name(uint32_t idx) {
-    const char *n = orig_dyld_get_image_name(idx);
-    if (!n) return n;
-    // 纯 C 实现：dyld 装载期调用时 ObjC 运行时可能尚未就绪，绝不能用 NSString
-    static const char *pats[] = {
-        "cheat", "level121", "libesp", "CydiaSubstrate",
-        "ellekit", "libhooker", "TweakInject"
-    };
-    for (unsigned i = 0; i < sizeof(pats) / sizeof(pats[0]); i++) {
-        if (strstr(n, pats[i])) return "/usr/lib/system/libsystem_platform.dylib";
-    }
-    return n;
-}
-
-static void installSelfHide(void) {
-    // _dyld_image_count / _dyld_get_image_name 的 hook 需要 inline hook，本版不做
-    g_hideOn = false;
-    LOG("self-hide: n/a (objc-only build)");
-}
-
 // ============================================================================
 // 第 4 部分：IL2CPP 运行时绑定
 // ============================================================================
@@ -1244,7 +1183,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v114 ====");
+    CHECK("==== dump v115 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1255,7 +1194,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v114 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v115 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1372,47 +1311,6 @@ static bool worldToScreen(const Vec3 &w, const float vp[16], float sw, float sh,
     out.y = (1.0f - (cy / cw)) * 0.5f * sh;
     return true;
 }
-
-static void drawUnit(ImDrawList *dl, const ImVec2 &head, const ImVec2 &foot,
-                     const char *name, float hp, float hpMax, float dist,
-                     bool enemy, float cd) {
-    float h = foot.y - head.y;
-    if (h < 4) return;
-    float w = h * 0.55f;
-    ImVec2 tl(head.x - w * 0.5f, head.y);
-    ImVec2 br(head.x + w * 0.5f, foot.y);
-    ImU32 col = ImGui::ColorConvertFloat4ToU32(enemy ? g_colEnemy : g_colAlly);
-
-    if (g_showBox) {
-        dl->AddRect(tl, br, col, 0, 0, 1.5f);
-        dl->AddLine(ImVec2(tl.x, tl.y), ImVec2(tl.x + w * 0.3f, tl.y), col, 2.0f);
-        dl->AddLine(ImVec2(br.x - w * 0.3f, br.y), ImVec2(br.x, br.y), col, 2.0f);
-    }
-    if (g_showHp && hpMax > 0.01f) {
-        float r = hp / hpMax;
-        r = r < 0 ? 0 : (r > 1 ? 1 : r);
-        ImVec2 b1(tl.x, tl.y - 6), b2(br.x, tl.y - 2);
-        dl->AddRectFilled(b1, b2, IM_COL32(0, 0, 0, 160));
-        ImVec2 f2(b1.x + (b2.x - b1.x) * r, b2.y);
-        ImU32 hpc = r > 0.5f ? IM_COL32(80, 220, 80, 255)
-                  : r > 0.25f ? IM_COL32(230, 200, 60, 255)
-                              : IM_COL32(230, 70, 70, 255);
-        dl->AddRectFilled(b1, f2, hpc);
-    }
-    if (g_showName && name && name[0]) {
-        ImVec2 ts = ImGui::CalcTextSize(name);
-        dl->AddText(ImVec2(head.x - ts.x * 0.5f, tl.y - 22), IM_COL32_WHITE, name);
-    }
-    if (g_showDist && dist > 0) {
-        char buf[32]; snprintf(buf, sizeof(buf), "%.0fm", dist);
-        dl->AddText(ImVec2(head.x - 12, br.y + 2), IM_COL32(200, 200, 200, 255), buf);
-    }
-    if (g_showCd && cd > 0.05f) {
-        char buf[24]; snprintf(buf, sizeof(buf), "CD %.1f", cd);
-        dl->AddText(ImVec2(head.x - 16, br.y + 16), IM_COL32(120, 200, 255, 255), buf);
-    }
-}
-
 // ============================================================================
 // v16：ESP 数据链（实例 → 字典 → 单位）
 //
@@ -4954,52 +4852,6 @@ static int v97MakeWritable(void *addr) {
                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     return kr == KERN_SUCCESS;
 }
-
-static void v96Install(void) {
-    if (g_cmdHookState != 0) return;
-    g_cmdHookState = -1;
-    if (!I2.class_get_method_from_name || !I2.class_get_field_from_name || !I2.field_get_value) return;
-    void *cls = findCls("Assets.Scripts.Framework", "FrameCommandFactory");
-    if (!cls) { CHECK("CMD hook: factory class none"); return; }
-    void *mi = I2.class_get_method_from_name(cls, "CreateFrameCommand", 1);
-    if (!mi) { CHECK("CMD hook: method none"); return; }
-    // 先核对签名：参数必须是 1 个，否则调用约定不符，第一条命令就会崩
-    if (I2.method_get_param_count) {
-        int pc = I2.method_get_param_count(mi);
-        if (pc != 1) { CHECK("CMD hook: param count=%d (expect 1) -> skip", pc); return; }
-    }
-    void *orig = *(void **)mi;
-    if (!okptr((uintptr_t)orig)) { CHECK("CMD hook: bad methodPointer %p", orig); return; }
-
-    void *fc = findCls("Assets.Scripts.Framework", "FrameCommand");
-    if (fc) {
-        g_fCmdType = I2.class_get_field_from_name(fc, "_cmdType");
-        g_fPlayerID = I2.class_get_field_from_name(fc, "_playerID");
-        g_fFrameNum = I2.class_get_field_from_name(fc, "_frameNum");
-        g_fCmdId   = I2.class_get_field_from_name(fc, "_cmdId");
-    }
-    // v97：MethodInfo 常在只读页 —— 必须先解锁，否则写就是 EXC_BAD_ACCESS（上一版闪退点）
-    if (!v97MakeWritable(mi)) {
-        CHECK("CMD hook: mprotect FAILED mi=%p -> skip (not writing)", mi);
-        return;
-    }
-    g_fcOrig = orig;
-    g_fcMi = mi;
-    *(void **)mi = (void *)&v96Thunk;       // 只改 MethodInfo 里的指针，不动 __TEXT
-    __sync_synchronize();
-
-    void *back = *(void **)mi;              // 读回校验
-    if (back != (void *)&v96Thunk) {
-        CHECK("CMD hook: write not effective (back=%p want=%p) -> restore skip", back, (void *)&v96Thunk);
-        *(void **)mi = orig;
-        return;
-    }
-    g_cmdHookState = 1;
-    CHECK("CMD hook OK mi=%p orig=%p new=%p f(cmdType=%p pid=%p)",
-          mi, orig, back, g_fCmdType, g_fPlayerID);
-}
-
-
 // ======================= v98：身份 + 存活 轨迹表（纯读） =======================
 static void *g_lk_fObjID = NULL, *g_lk_fPos = NULL, *g_lk_fLv = NULL, *g_lk_fMv = NULL;
 static void *g_lk_fFn = NULL, *g_lk_fRec = NULL, *g_lk_fMeta = NULL, *g_lk_fMoveComp = NULL;
@@ -5044,9 +4896,13 @@ static void *findClsDeep(const char *ns, const char *want) {
         for (int i = 0; i < cc; i++) {
             void *c = I2.image_get_class(img, i);
             if (!c) continue;
-            const char *cn = I2.class_get_name(c);
+            // B2：这里用**原始**名字指针直接比对 —— findClsDeep 要扫 64k 个类，
+            // 走安全层会变成 12.8 万次 vm_read（启动卡死）。安全层只用于"打印"。
+            const char *cn = real_class_get_name ? real_class_get_name(c)
+                                                 : (I2.class_get_name ? I2.class_get_name(c) : NULL);
             if (!cn || strcmp(cn, want) != 0) continue;
-            const char *cns = I2.class_get_namespace(c);
+            const char *cns = real_class_get_namespace ? real_class_get_namespace(c)
+                                                       : (I2.class_get_namespace ? I2.class_get_namespace(c) : NULL);
             if (ns && ns[0] && (!cns || strcmp(cns, ns) != 0)) continue;
             return c;
         }
@@ -6161,7 +6017,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v114 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v115 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6254,8 +6110,11 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     }
 }
 
+static void v115ProbeDD(void);   // v115：定义在 updateHud 之前，这里先声明
+
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
-    m1Tick();   // M1：位置节点扫描器（分帧、纯读，与本函数其余逻辑无关）
+    // v115：M1 扫描关闭（v114 因 SAT=1 被 VOID，本版只回答路径 A）
+    if (g_il2cppOk) v115ProbeDD();   // 路径 A 探针：每帧最多 400 个类
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
@@ -6278,7 +6137,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         if (g_inMatch) s_inFrames++; else s_inFrames = 0;
         if (g_inMatch && g_v98Ready == 2 && s_inFrames > 180) {
             double nwr = CACurrentMediaTime();
-            if (nwr >= s_v98Next) { s_v98Next = nwr + 4.0; v104Dump(); v98Dump(g_mgr); }
+            if (0) { }   // v115：v98/v103 转储整段删除（它格式化到 ESTCore 受保护页 -> SIGBUS）
         }
     }
     {   // v93：反射探针（每 5 秒一次，进对局后才跑）
@@ -6867,6 +6726,188 @@ static int            g_hudTick      = 0;
 
 static void renderOverlay(void);
 
+// ============================================================================
+// v115 · 连续运行 / 崩溃计数（审核放行条件：先证明不崩，再证明有货）
+// crash 跨启动：init 读文件里的 "C <sig>" 行；装 SIGBUS/SIGSEGV/SIGTRAP 处理器追加一行再交还系统。
+// ============================================================================
+static int    g_runCrash = 0;
+static double g_runStart = 0;
+
+static const char *runLogPath(void) {
+    static char buf[512];
+    if (!buf[0]) {
+        NSString *f = [NSTemporaryDirectory() stringByAppendingPathComponent:@"esp_run.log"];
+        strncpy(buf, [f fileSystemRepresentation], sizeof(buf) - 1);
+    }
+    return buf;
+}
+
+static void runCrashHandler(int sig) {
+    int fd = open(runLogPath(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        char b[24];
+        int n = snprintf(b, sizeof(b), "C %d\n", sig);
+        if (n > 0) { ssize_t w = write(fd, b, (size_t)n); (void)w; }
+        close(fd);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void runInit(void) {
+    g_runStart = CACurrentMediaTime();
+    FILE *rf = fopen(runLogPath(), "r");
+    if (rf) {
+        char line[64];
+        while (fgets(line, sizeof(line), rf)) if (line[0] == 'C' && line[1] == ' ') g_runCrash++;
+        fclose(rf);
+    }
+    FILE *af = fopen(runLogPath(), "a");
+    if (af) { fprintf(af, "B %.0f\n", (double)[[NSDate date] timeIntervalSince1970]); fclose(af); }
+    signal(SIGBUS,  runCrashHandler);
+    signal(SIGSEGV, runCrashHandler);
+    signal(SIGTRAP, runCrashHandler);
+}
+
+// ============================================================================
+// v115 · 路径 A 探针：找"字段类型 == DisplayInfoData"的类/字段（只跑一次）
+// ----------------------------------------------------------------------------
+// 关键安全点（对应审核 B1）：il2cpp 返回的类名/字段名可能落在被 mprotect 的 metadata 页
+// （v114 崩溃正是 memmove 读到 ESTCore 受保护页）。所以：
+//   ① 匹配用**指针比较**（class_from_il2cpp_type(field_type) == ddCls），不 strstr 字符串；
+//   ② 只有命中的少数几个名字才用 safeCopy（逐字节 vm_read，失败即 "<bad>"）转成本地缓冲再打印。
+// ============================================================================
+#define A1_MAXHIT 4
+static int  g_a1Done = 0, g_a1Hits = 0, g_a1Seen = 0, g_a1Total = 0, g_a1Cls = 0;
+static int  g_a1AsmOk = 0, g_a1AsmSkip = 0, g_a1AsmOther = 0;   // 程序集：读到 / 读不到 / 不是 CSharp
+static char g_a1Hit[A1_MAXHIT][160];
+static char g_a1Dump[2][160];
+static int  g_a1DumpN = 0;
+
+// 逐字节安全拷贝：读失败就不再向下读（避免顺着垃圾指针 strlen）
+static int g_namesBad = 0;   // 名字读失败计数（B3：区分"读不到"与"类不存在"）
+
+// 一次 bulk 读 64 字节（1 次 syscall），只有在"跨页失败"时才退化为逐字节（cap<=16）。
+static int safeCopyStr(const char *src, char *dst, int cap) {
+    if (!src || cap <= 1) return 0;
+    int want = cap < 64 ? cap : 64;
+    if (rd(src, dst, (size_t)want)) {
+        dst[want - 1] = 0;
+        if (memchr(dst, 0, (size_t)want)) return 1;      // bulk 里已含 NUL
+    } else {
+        // B1（审核）：bulk 跨页会整次失败 —— 哪怕名字全在好页里。
+        // 先退到"只读到本页末尾"再试一次，避免把"页边界"误读成"读不到"。
+        size_t pg = 0x1000 - ((uintptr_t)src & 0xFFF);
+        int w2 = (want < (int)pg) ? want : (int)pg;
+        if (w2 > 0 && rd(src, dst, (size_t)w2)) {
+            dst[w2 - 1] = 0;
+            if (memchr(dst, 0, (size_t)w2)) return 1;
+        }
+    }
+    int lim = cap < 16 ? cap : 16;                       // 退化路径：最多 16 字节
+    for (int i = 0; i < lim - 1; i++) {
+        char c = 0;
+        if (!rd(src + i, &c, 1)) { dst[i] = 0; g_namesBad++; return 0; }
+        dst[i] = c;
+        if (!c) return 1;
+    }
+    dst[lim - 1] = 0;
+    g_namesBad++;
+    return 0;
+}
+
+static void v115ProbeDD(void) {
+    if (g_a1Done) return;
+    if (!I2.domain || !I2.domain_get_assemblies || !I2.assembly_get_image ||
+        !I2.image_get_class_count || !I2.image_get_class || !I2.class_get_fields ||
+        !I2.field_get_type || !I2.class_from_il2cpp_type || !I2.class_from_name) { g_a1Done = 1; return; }
+
+    static void **asms = NULL; static size_t nasm = 0, ai = 0, ci = 0;
+    static void *img = NULL;
+    static void *ddCls = NULL;
+    static const char *nss[] = { "", "Assets.Scripts.GameLogic", "Assets.Scripts.Framework",
+                                 "Assets.Scripts.Common", "Assets.Scripts.GameSystem" };
+
+    if (!asms) {
+        asms = (void **)I2.domain_get_assemblies(I2.domain, &nasm);
+        if (!asms || !nasm) { g_a1Done = 1; return; }
+    }
+    // ① 先找 DisplayInfoData 类指针（找不到就报 A1 none，绝不再扫）
+    if (!ddCls) {
+        for (size_t i = 0; i < nasm && !ddCls; i++) {
+            void *im = asms[i] ? I2.assembly_get_image(asms[i]) : NULL;
+            if (!im) continue;
+            for (size_t k = 0; k < sizeof(nss)/sizeof(nss[0]) && !ddCls; k++)
+                ddCls = I2.class_from_name(im, nss[k], "DisplayInfoData");
+        }
+        if (!ddCls) { g_a1Cls = -1; g_a1Done = 1; return; }
+        g_a1Cls = 1;
+    }
+
+    int budget = 400;
+    while (budget > 0) {
+        if (!img) {
+            if (ai >= nasm) { g_a1Done = 1; return; }
+            void *a = asms[ai++];
+            img = a ? I2.assembly_get_image(a) : NULL;
+            ci = 0;
+            if (!img) continue;
+            const char *inm = I2.image_get_name ? I2.image_get_name(img) : NULL;
+            char nb[96];
+            int gotName = safeCopyStr(inm, nb, sizeof(nb));
+            if (!gotName) { g_a1AsmSkip++; img = NULL; continue; }        // 读不到 ≠ 不是它
+            if (!strstr(nb, "Assembly-CSharp")) { g_a1AsmOther++; img = NULL; continue; }
+            g_a1AsmOk++;
+            g_a1Total = (int)I2.image_get_class_count(img);
+            continue;
+        }
+        if (ci >= (size_t)g_a1Total) { img = NULL; continue; }
+        void *k = I2.image_get_class(img, (int)ci++);
+        budget--; g_a1Seen++;
+        if (!k) continue;
+        void *it = NULL, *f = NULL;
+        while ((f = I2.class_get_fields(k, &it)) && f) {
+            void *ft = I2.field_get_type(f);
+            if (!ft || I2.class_from_il2cpp_type(ft) != ddCls) continue;
+            if (g_a1Hits < A1_MAXHIT) {
+                char kn[96] = "?", fn[96] = "?";
+                safeCopyStr(I2.class_get_name ? I2.class_get_name(k) : NULL, kn, sizeof(kn));
+                safeCopyStr(I2.field_get_name ? I2.field_get_name(f) : NULL, fn, sizeof(fn));
+                int isStatic = 0, cnt = -1;
+                unsigned int d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
+                if (I2.field_get_flags) isStatic = (I2.field_get_flags(f) & 0x0010) ? 1 : 0;
+                if (isStatic && I2.field_static_get_value) {
+                    void *obj = NULL;
+                    I2.field_static_get_value(f, &obj);
+                    if (obj && okptr((uintptr_t)obj)) {
+                        // List<T>: _items@+0x10, _size@+0x18 ；数组: max_length@+0x18
+                        int32_t sz = -1; void *items = NULL;
+                        if (rd((char *)obj + 0x18, &sz, 4)) cnt = sz;
+                        if (!rd((char *)obj + 0x10, &items, 8) || !okptr((uintptr_t)items)) items = obj;
+                        void *e0 = (char *)items + 0x20;      // 数组数据区起点
+                        if (cnt > 0 && cnt < 100000) {
+                            rd(e0,      &d0, 4); rd((char*)e0+4,  &d1, 4);
+                            rd((char*)e0+8, &d2, 4); rd((char*)e0+12, &d3, 4);
+                            rd((char*)e0+16,&d4, 4); rd((char*)e0+20, &d5, 4);
+                            rd((char*)e0+24,&d6, 4); rd((char*)e0+28, &d7, 4);
+                        }
+                    }
+                }
+                snprintf(g_a1Hit[g_a1Hits], sizeof(g_a1Hit[0]),
+                         "%s.%s st=%d cnt=%d", kn, fn, isStatic, cnt);
+                g_a1Hits++;
+                if (cnt > 0 && g_a1DumpN < 2) {
+                    snprintf(g_a1Dump[g_a1DumpN], sizeof(g_a1Dump[0]),
+                             "e0 %08x %08x %08x %08x | %08x %08x %08x %08x",
+                             d0, d1, d2, d3, d4, d5, d6, d7);
+                    g_a1DumpN++;
+                }
+            }
+            break;
+        }
+    }
+}
+
 static void updateHud(void) {
     if (!g_hudLabel) return;
     // v22：真的画出框以后自动收成 1 行 —— 实战里 24 行绿字把左半屏挡住是没法打的。
@@ -6875,7 +6916,7 @@ static void updateHud(void) {
         // v112r7：收成两行，但**必须**把 P0 那行留住 —— 本包的 ImGui 菜单打不开（g_menuOpen 只在
         // 菜单内部的按钮里切换），drawFixedPanel 永远画不出来，UILabel HUD 是唯一看得见的地方。
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v114 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v115 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100,
@@ -6886,7 +6927,7 @@ static void updateHud(void) {
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v114 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v115 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -6923,6 +6964,14 @@ static void updateHud(void) {
             [s appendFormat:@"E%d --\n", i];
         }
     }
+    // ---- v115：连续运行/崩溃计数 + 路径 A 探针进度 ----
+    [s appendFormat:@"RUN %ds crash=%d names_bad=%d  A1 seen=%d/%d hits=%d asm ok=%d skip=%d other=%d%s\n",
+        (int)(CACurrentMediaTime() - g_runStart), g_runCrash, g_namesBad,
+        g_a1Seen, g_a1Total, g_a1Hits,
+        g_a1AsmOk, g_a1AsmSkip, g_a1AsmOther, g_a1Done ? " done" : ""];
+    for (int i = 0; i < g_a1Hits; i++) [s appendFormat:@"A1 %s\n", g_a1Hit[i]];
+    for (int i = 0; i < g_a1DumpN; i++) [s appendFormat:@"A1 %s\n", g_a1Dump[i]];
+
     // ---- M1：位置节点扫描器（native 层，纯读）----
     // 判据（评审 B3）：HIT==1 才算通过 —— 站立期 24 字节零变化 + 10 秒位移落在 2~12 m/s。
     {
@@ -7174,7 +7223,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v114 booting";
+    l.text = @"ESP v115 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -7356,11 +7405,6 @@ static void renderOverlay(void) {
 // ============================================================================
 typedef void (*t_present)(void *, id<MTLCommandBuffer>);
 static t_present orig_present = NULL;
-
-static void hook_present(void *self, id<MTLCommandBuffer> cb) {
-    if (orig_present) orig_present(self, cb);
-}
-
 static void installPresentHook(void) {
     // 只做符号探测，不 inline hook。Unity 的 Present 不在关键路径上，
     // 渲染由 overlay 的 CADisplayLink 驱动，探测到符号只用于 HUD 诊断。
@@ -7505,7 +7549,61 @@ static void rescanTick(void) {
     }
 }
 
+// ============================================================================
+// v115 · 名字指针安全收口（审核第 1 条：%s 不能拿到未校验指针）
+// ----------------------------------------------------------------------------
+// il2cpp 的 class/field/image/method 名字指针指向 metadata 映射；ACE 可能把它 mprotect(PROT_NONE)
+// → 任何 %s 顺着它读都会 SIGBUS（v114 崩溃就是这个类）。
+// 做法：在 bind 完成后**把 I2 里的名字获取换成本地安全版本** —— 先逐字节 vm_read 拷进环形缓冲，
+// 读失败返回 "<bad>"。这样全文件 151 处 %s 调用点一行都不用改，且不可能再顺着坏指针读。
+// ============================================================================
+static t_class_get_name      real_class_get_name;
+static t_class_get_namespace real_class_get_namespace;
+static t_field_get_name      real_field_get_name;
+static t_image_get_name      real_image_get_name;
+static t_method_get_name     real_method_get_name;
+
+#define SAFE_RING 16
+#define SAFE_CAP  128
+static char g_safeRing[SAFE_RING][SAFE_CAP];
+static int  g_safeIdx = 0;
+
+static char *safeSlot(void) {
+    g_safeIdx = (g_safeIdx + 1) % SAFE_RING;
+    g_safeRing[g_safeIdx][0] = 0;
+    return g_safeRing[g_safeIdx];
+}
+
+static const char *safeNameFrom(const char *raw) {
+    char *b = safeSlot();
+    if (!safeCopyStr(raw, b, SAFE_CAP)) {
+        if (!b[0]) { b[0] = '<'; b[1] = 'b'; b[2] = 'a'; b[3] = 'd'; b[4] = '>'; b[5] = 0; }
+    }
+    return b;
+}
+
+static const char *safe_class_get_name(void *k)      { return safeNameFrom(real_class_get_name ? real_class_get_name(k) : NULL); }
+static const char *safe_class_get_namespace(void *k) { return safeNameFrom(real_class_get_namespace ? real_class_get_namespace(k) : NULL); }
+static const char *safe_field_get_name(void *f)      { return safeNameFrom(real_field_get_name ? real_field_get_name(f) : NULL); }
+static const char *safe_image_get_name(void *i)      { return safeNameFrom(real_image_get_name ? real_image_get_name(i) : NULL); }
+static const char *safe_method_get_name(void *m)     { return safeNameFrom(real_method_get_name ? real_method_get_name(m) : NULL); }
+
+static void installSafeNames(void) {
+    if (real_class_get_name) return;                 // 只装一次
+    real_class_get_name      = I2.class_get_name;
+    real_class_get_namespace = I2.class_get_namespace;
+    real_field_get_name      = I2.field_get_name;
+    real_image_get_name      = I2.image_get_name;
+    real_method_get_name     = I2.method_get_name;
+    if (real_class_get_name)      I2.class_get_name      = safe_class_get_name;
+    if (real_class_get_namespace) I2.class_get_namespace = safe_class_get_namespace;
+    if (real_field_get_name)      I2.field_get_name      = safe_field_get_name;
+    if (real_image_get_name)      I2.image_get_name      = safe_image_get_name;
+    if (real_method_get_name)     I2.method_get_name     = safe_method_get_name;
+}
 static void onIl2cppReady(void) {
+    installSafeNames();   // v115：名字指针收口（必须先于 selfCheck）
+    runInit();            // v115：挂崩溃计数 + 记启动时刻
     selfCheck();
     installPresentHook();
     updateHud();
