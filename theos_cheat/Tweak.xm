@@ -6482,10 +6482,17 @@ static void updateHud(void) {
     // v22：真的画出框以后自动收成 1 行 —— 实战里 24 行绿字把左半屏挡住是没法打的。
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
+        // v112r7：收成两行，但**必须**把 P0 那行留住 —— 本包的 ImGui 菜单打不开（g_menuOpen 只在
+        // 菜单内部的按钮里切换），drawFixedPanel 永远画不出来，UILabel HUD 是唯一看得见的地方。
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v112 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
+            @"ESP v112 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+             "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
-            g_hudPage % 100];
+            g_hudPage % 100,
+            g_v112_sawA, g_v112_sawAF, g_v112_sawB, g_v112_sawBF,
+            g_v112_hitVis, g_v112_hitInv,
+            g_v112_gone[0] + g_v112_gone[1] + g_v112_gone[2] + g_v112_gone[3],
+            g_v106_n, g_v110_curOff];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
@@ -6499,6 +6506,33 @@ static void updateHud(void) {
         g_il2cppOk ? @"OK" : @"FAIL",
         g_presentOn ? @"OK" : @"FAIL",
         g_vpReady ? @"OK" : @"todo"];
+    // v112r7：P0 与两个槽位的核心数字直接拼进 UILabel HUD（旧 HUD 是本包唯一**真的会显示**的面板）。
+    // 位置：紧跟 il2cpp 诊断行，所以第 1 页就能看到，不用翻页。
+    if (g_v110_curOff <= 0) {
+        [s appendFormat:@"P0 NOSMP curOff=%d remOff=%d enum=%d\n", g_v110_curOff, g_v110_remOff, g_v106_n];
+    } else {
+        [s appendFormat:@"P0 50k=%d(F%d) 55k=%d(F%d) | vis=%d inv=%d | gone=%d enum=%d off=%d\n",
+            g_v112_sawA, g_v112_sawAF, g_v112_sawB, g_v112_sawBF,
+            g_v112_hitVis, g_v112_hitInv,
+            g_v112_gone[0] + g_v112_gone[1] + g_v112_gone[2] + g_v112_gone[3],
+            g_v106_n, g_v110_curOff];
+    }
+    for (int i = 0; i < 2; i++) {
+        if (i < g_v106_n) {
+            int ri[3] = {0, 0, 0};
+            memcpy(ri, g_v106_rem[i], sizeof(ri));
+            [s appendFormat:@"E%d id=%d lv=%d c=(%d,%d) R=(%d,%d) d=%.2f rd=%.2f age=%d rage=%d%s%s\n",
+                i, g_v106_id[i], g_v106_lv[i],
+                g_v110_ci[i][0], g_v110_ci[i][2], ri[0], ri[2],
+                g_v111_d100[i], g_v112_remD[i], g_v109_age[i], g_v112_remAge[i],
+                g_v112_remTorn[i] ? " RT" : "",
+                (g_v104_host > 0 && g_v106_id[i] == g_v104_host) ? " SELF" : ""];
+        } else if (g_v110_id[i] != 0) {
+            [s appendFormat:@"E%d GONE=%d id=%d last\n", i, g_v112_gone[i], g_v110_id[i]];
+        } else {
+            [s appendFormat:@"E%d --\n", i];
+        }
+    }
     // v28：这 4 行永远在第一屏，不用翻页 —— 现场「没法自主翻页」时这是唯一能拿到数据的地方
     [s appendFormat:@"R %d CAP %d ENT %p\n", g_cntRaw, g_capNow, g_entPtr];
     [s appendFormat:@"D %08x %08x %08x %08x %08x %08x %08x %08x\n", g_dw[0], g_dw[1], g_dw[2], g_dw[3], g_dw[4], g_dw[5], g_dw[6], g_dw[7]];
