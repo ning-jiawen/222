@@ -1254,25 +1254,6 @@ static void selfCheck(void) {
         g_clsScanned += I2.image_get_class_count ? I2.image_get_class_count(img) : 0;
     }
 
-    // ---- v92：FrameSynchr.commandQueue 探针（只读 3 个字段，不遍历元素）----
-    if (g_inMatch) {
-        void *fcls = findCls("Assets.Scripts.Framework", "FrameSynchr");
-        if (!fcls) { CHECK("FS cls none"); }
-        else {
-            static void *s_fs = NULL;
-            if (!s_fs) s_fs = findInstanceByStatic(fcls);
-            if (!s_fs) CHECK("FS inst none");
-            else {
-                void *q = NULL;
-                int qn = -1;
-                if (rd((char *)s_fs + 0x68, &q, sizeof(q)) && q) {
-                    rd((char *)q + 0x20, &qn, 4);            // Queue<T>._size
-                }
-                CHECK("FS inst %p queue %p n=%d", s_fs, q, qn);
-            }
-        }
-    }
-
     // ---- v91：名字发现（只读元数据：类名 + 字段数，不解引用任何实例）----
     {
         const char *keys[6] = { "Synchr", "LogicActor", "BeUnit", "BeActor", "Movable", "HeroObj" };
@@ -4819,6 +4800,22 @@ static int rfF3(void *obj, void *cls, const char *name, float out3[3]) {
     return 1;
 }
 
+// 字段声明的类（用于校验对象 klass）
+static void *rfFldCls(void *cls, const char *name) {
+    void *f = rfFld(cls, name);
+    if (!f || !I2.field_get_type || !I2.class_from_il2cpp_type) return NULL;
+    void *t = I2.field_get_type(f);
+    if (!t) return NULL;
+    return I2.class_from_il2cpp_type(t);
+}
+
+// 对象头里的 klass 是否等于期望类（不等就不碰它）
+static int rfKlassIs(void *obj, void *want) {
+    if (!want || !okptr((uintptr_t)obj)) return 0;
+    void *k = *(void **)obj;
+    return okptr((uintptr_t)k) && k == want;
+}
+
 static void *rfPtr(void *obj, void *cls, const char *name) {
     void *f = rfFld(cls, name);
     if (!f || !obj || !I2.field_get_value) return NULL;
@@ -4850,7 +4847,7 @@ static void *rfStaticSelf(void *cls) {
 static int rfContainerCount(void *obj) {
     if (!obj) return -1;
     void *k = *(void **)obj;                     // klass 指针（IL2CPP 对象头）
-    if (!okptr(k)) return -1;
+    if (!okptr((uintptr_t)k)) return -1;
     const char *names[4] = { "_size", "size", "_count", "_countValue" };
     for (int i = 0; i < 4; i++) {
         int v = -1;
@@ -4871,7 +4868,12 @@ static void rfProbe(void) {
         if (!fs) CHECK("RF FS inst none (static self not found)");
         else {
             void *q = rfPtr(fs, fsCls, "commandQueue");
-            int qn = rfContainerCount(q);
+            int qn = -1;
+            {   // 加固：只有 klass 对得上才去读 _size
+                void *qcls = rfFldCls(fsCls, "commandQueue");
+                if (rfKlassIs(q, qcls)) qn = rfContainerCount(q);
+                else if (q) qn = -2;                      // 拿到指针但类型不符：只报不读
+            }
             int cf = -1;
             rfInt(fs, fsCls, "curFrameNum", &cf);
             CHECK("RF FS inst %p q %p n=%d frame=%d", fs, q, qn, cf);
@@ -4880,16 +4882,17 @@ static void rfProbe(void) {
     // ② 反射 vs 偏移：同一个单位的 position 用两种方式读，必须一致
     if (g_mgr && g_arrBase >= 0 && g_unitCount > 0) {
         void *entries = NULL;
-        if (rd((char *)g_mgr + g_offDict, &entries, sizeof(entries)) && okptr(entries)) {
+        if (rd((char *)g_mgr + g_offDict, &entries, sizeof(entries)) && okptr((uintptr_t)entries)) {
             void *dict = entries;
             int cnt = 0;
             if (rd((char *)dict + 0x18, &cnt, 4) && cnt > 0) {
                 for (int i = 0; i < cnt && i < 160; i++) {
                     void *o = NULL;
-                    if (!rd((char *)dict + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr(o)) continue;
+                    if (!rd((char *)dict + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr((uintptr_t)o)) continue;
                     float byName[3] = {0, 0, 0}, byOff[3] = {0, 0, 0};
                     void *lkCls = findCls("Assets.Scripts.GameLogic", "ActorLinker");
-                    if (!lkCls || !rfF3(o, lkCls, "position", byName)) continue;
+                    if (!lkCls || !rfKlassIs(o, lkCls)) continue;   // 加固：klass 必须是 ActorLinker
+                    if (!rfF3(o, lkCls, "position", byName)) continue;
                     if (!rd((char *)o + 0x4C4, byOff, sizeof(byOff))) continue;
                     CHECK("RF LK byname=(%.1f,%.1f) byoff=(%.1f,%.1f) same=%d",
                           byName[0], byName[2], byOff[0], byOff[2],
