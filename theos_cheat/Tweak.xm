@@ -664,6 +664,9 @@ typedef void *(*t_class_get_method_from_name)(void *, const char *, int);
 typedef void *(*t_method_get_return_type)(void *);   // v61：返回 Il2CppType*，用来判 sret
 typedef unsigned int (*t_method_get_param_count)(void *);      // v64：L3b 看参数
 typedef void *(*t_method_get_param)(void *, unsigned int);     // v64：参数类型 Il2CppType*
+// v112r9：按 frida-il2cpp-bridge 的做法走官方 invoke —— 直接 blr methodPointer 是最脆的
+// （抽象/泛型方法 methodPointer 为 0，这正是 enum=-2 的成因）。
+typedef void *(*t_runtime_invoke)(void *method, void *obj, void **params, void **exc);
 
 struct I2C {
     void *h;
@@ -694,6 +697,7 @@ struct I2C {
     t_class_get_method_from_name  class_get_method_from_name;
     t_method_get_return_type      method_get_return_type;   // v61
     t_method_get_param_count      method_get_param_count;   // v64
+    t_runtime_invoke              runtime_invoke;         // v112r9：官方 invoke
     t_method_get_param            method_get_param;         // v64
     void *domain;
     void *image;
@@ -736,6 +740,7 @@ static void bindIl2cpp(void) {
     BINDF(class_get_method_from_name, "il2cpp_class_get_method_from_name");
     BINDF(method_get_return_type,     "il2cpp_method_get_return_type");
     BINDF(method_get_param_count,     "il2cpp_method_get_param_count");
+    BINDF(runtime_invoke,             "il2cpp_runtime_invoke");
     BINDF(method_get_param,           "il2cpp_method_get_param");
 
     if (!I2.domain_get) return;
@@ -1239,7 +1244,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v112 ====");
+    CHECK("==== dump v113 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1250,7 +1255,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v112 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v113 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -5547,9 +5552,52 @@ static void v105Scan(void) {
 // ======================= v106：游戏枚举器（GetHeroActorByIndex）=======================
 static int g_v106_gHero = -1, g_v106_c1 = -1, g_v106_c2 = -1;
 static int g_v106_n = 0;                       // 枚举到的英雄数
+static int g_v106_src = 0;                     // 行的来源：1=枚举器 2=字典兜底
+static int g_v106_err = 0;                     // 枚举器失败码：-1 无方法 / -2 methodPointer 无效 / -3 参数数不对
+static void v112FillFromDict(void);            // v112r8：兜底填行（定义在 v106ScanHeroes 之后）
 static int g_v106_id[4], g_v106_camp[4], g_v106_lv[4], g_v106_ty[4];
 static float g_v106_pos[4][3], g_v106_cur[4][3], g_v106_rem[4][3];
 
+// v112r10（提炼文档 B.2 / G.4）：代码指针判据 —— ARM64 只保证 **4 字节**对齐，
+// 用 okptr 的 8 字节对齐会把 0x…4 / 0x…C 结尾的合法入口判死，表现为"methodPointer 无效"(enum=-2)。
+static int isCodePtr(void *p) {
+    uintptr_t v = (uintptr_t)p;
+    if (v < 0x100000000ULL) return 0;
+    if (v & 3) return 0;
+    Dl_info di;
+    return dladdr(p, &di) && di.dli_fname != NULL;
+}
+
+// MethodInfo 布局（Unity 2021.2+，我们是 2022.3 / metadata v29）：
+//   +0 methodPointer | +8 virtualMethodPointer | +16 invoker_method | +24 name
+// 按文档 B.4 的顺序取可执行入口：methodPointer → virtualMethodPointer → invoker。
+static void *v112MethodCode(void *mi) {
+    if (!mi) return NULL;
+    void *mp = *(void **)mi;
+    if (isCodePtr(mp)) return mp;
+    void *vp = *(void **)((char *)mi + 8);
+    if (isCodePtr(vp)) return vp;
+    void *iv = *(void **)((char *)mi + 16);
+    if (isCodePtr(iv)) return iv;
+    return NULL;
+}
+// v112r9（frida-il2cpp-bridge 的做法）：按名字+参数数枚举方法表挑 MethodInfo，且必须 methodPointer 非空。
+// il2cpp_class_get_method_from_name 只查本类、且会返回抽象/泛型方法（指针为空）——这正是 enum=-2 的成因。
+static void *v112FindMethod(void *klass, const char *name, int pc_want) {
+    if (!klass || !I2.class_get_methods || !I2.method_get_name) return NULL;
+    void *it = NULL, *m = NULL;
+    int seen = 0;
+    while ((m = I2.class_get_methods(klass, &it)) && m && seen < 512) {
+        seen++;
+        const char *mn = I2.method_get_name(m);
+        if (!mn || strcmp(mn, name) != 0) continue;
+        int pc = I2.method_get_param_count ? (int)I2.method_get_param_count(m) : pc_want;
+        if (pc_want >= 0 && pc != pc_want) continue;
+        if (!isCodePtr(*(void **)m)) continue;
+        return m;
+    }
+    return NULL;
+}
 static void v106ScanHeroes(void) {
     if (!g_mgr || !g_mgrClass || !I2.class_get_method_from_name) return;
     void *mk = NULL;
@@ -5564,17 +5612,49 @@ static void v106ScanHeroes(void) {
     if (lim < 0) lim = 0;
     if (lim > 4) lim = 4;
     void *mi = I2.class_get_method_from_name(g_mgrClass, "GetHeroActorByIndex", 1);
+    g_v106_err = 0;
+    if (!mi || !v112MethodCode(mi)) {
+        // v112r8/r9：点查可能拿到抽象/泛型方法（指针空）或方法挂在父类 → 父类点查，且要求指针非空。
+        if (I2.class_get_parent) {
+            void *c = g_mgrClass;
+            for (int d = 0; d < 8; d++) {
+                c = I2.class_get_parent(c);
+                if (!c) break;
+                void *m2 = I2.class_get_method_from_name(c, "GetHeroActorByIndex", 1);
+                if (m2 && v112MethodCode(m2)) { mi = m2; g_v106_err = -4; break; }
+            }
+        }
+    }
+    if (!mi || !v112MethodCode(mi)) {
+        // ② 枚举方法表（本类→父类），按名字+1 参挑且指针非空
+        void *c = g_mgrClass;
+        for (int d = 0; d < 8; d++) {
+            void *m2 = v112FindMethod(c, "GetHeroActorByIndex", 1);
+            if (m2) { mi = m2; g_v106_err = -5; break; }
+            if (!I2.class_get_parent) break;
+            c = I2.class_get_parent(c);
+            if (!c) break;
+        }
+    }
     if (!mi) {
         void *iface = findClsDeep("Assets.Scripts.GameLogic", "IActorManager");
         if (iface) mi = I2.class_get_method_from_name(iface, "GetHeroActorByIndex", 1);
-        if (!mi) { g_v106_n = -1; return; }              // -1 类与接口都没有
     }
-    void *fn = *(void **)mi;
-    if (!okptr((uintptr_t)fn)) { g_v106_n = -2; return; }   // -2 methodPointer 无效
-    if (I2.method_get_param_count && I2.method_get_param_count(mi) != 1) { g_v106_n = -3; return; }
+    void *fn = v112MethodCode(mi);
+    if (!mi) { g_v106_err = -1; g_v106_n = 0; v112FillFromDict(); return; }
+    if (!okptr((uintptr_t)fn)) { g_v106_err = -2; g_v106_n = 0; v112FillFromDict(); return; }
+    if (I2.method_get_param_count && I2.method_get_param_count(mi) != 1) { g_v106_err = -3; g_v106_n = 0; v112FillFromDict(); return; }
+    g_v106_err = 0;
 
     for (int i = 0; i < lim; i++) {
-        void *a = ((void *(*)(void *, int, void *))fn)(g_mgr, i, mi);
+        void *a = NULL;
+        if ((void *)I2.runtime_invoke) {   // 判空形式与 check_tweak[11] 的规则对齐
+            void *p1[1] = { (void *)&i };
+            void *exc = NULL;
+            a = I2.runtime_invoke(mi, g_mgr, p1, &exc);   // 官方 invoke：静态/实例/装箱都由它处理
+        } else {
+            a = ((void *(*)(void *, int, void *))fn)(g_mgr, i, mi);
+        }
         if (!a || !okptr((uintptr_t)a)) continue;
         void *k = NULL;
         if (!rd(a, &k, sizeof(k)) || !v108KlassOk(k)) continue;
@@ -5693,6 +5773,10 @@ static void v106ScanHeroes(void) {
         g_v106_n++;
     }
 
+    // v112r8：枚举器要么给了行，要么退回字典兜底（A 行那条路，已验证能出数据）。
+    if (g_v106_n > 0) g_v106_src = 1;
+    else { g_v106_n = 0; v112FillFromDict(); }
+
     // v110：ObjID 作 key（池复用会换 id）；用整数差分算位移
     double nowT = CACurrentMediaTime();
     double dt = (g_v109_tPrev > 0) ? (nowT - g_v109_tPrev) : 0.2;
@@ -5755,8 +5839,249 @@ static void v106ScanHeroes(void) {
     g_v109_inited = 1;
 }
 
+// v112r8：枚举器不可用时的兜底 —— 走 v98/v103 那条**已经证明能出 A 行**的字典遍历，
+// 只收 ty==0 且 cur 非空槽的 actor（1v1/2 人房里就是"自己 + 敌方"两条），最多 4 条。
+// 注意：这条路单读（没有 cur 的 b1/b2 双读），所以 torn 标志清零，判据只看"值是否精确/是否变化"。
+static void v112FillFromDict(void) {
+    if (!g_mgr || !g_linkerClass || g_offDict < 0 || g_offCount < 0 || g_offEntries < 0) { g_v106_src = 0; return; }
+    void *view = NULL;
+    if (!rd((char *)g_mgr + g_offDict, &view, sizeof(view)) || !view) { g_v106_src = 0; return; }
+    void *dict = view;
+    if (g_ctxOff > 0) { void *c = NULL; if (rd((char *)view + g_ctxOff, &c, sizeof(c)) && c) dict = c; }
+    else if (g_viewHop > 0) { void *h = NULL; if (rd((char *)view + g_viewHop, &h, sizeof(h)) && h) dict = h; }
+    int cnt = 0; void *ent = NULL;
+    if (!rd((char *)dict + g_offCount, &cnt, sizeof(cnt)) || cnt <= 0 || cnt > 4096) { g_v106_src = 0; return; }
+    if (!rd((char *)dict + g_offEntries, &ent, sizeof(ent)) || !ent) { g_v106_src = 0; return; }
+
+    int n = 0;
+    for (int i = 0; i < cnt && n < 4; i++) {
+        void *o = NULL;
+        if (!rd((char *)ent + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr((uintptr_t)o)) continue;
+        { void *k = NULL; if (!rd(o, &k, sizeof(k)) || k != g_linkerClass) continue; }
+
+        int id = 0, ty = -1, lv = -1;
+        if (g_lk_fObjID) I2.field_get_value(o, g_lk_fObjID, &id);
+        if (g_lk_fLv) { unsigned char b = 0; I2.field_get_value(o, g_lk_fLv, &b); lv = b; }
+        if (!g_lk_fMeta) continue;
+        {
+            unsigned char mb[1024];
+            memset(mb, 0, sizeof(mb));
+            I2.field_get_value(o, g_lk_fMeta, mb);
+            if (g_metaIsValue) v99IntAt(mb, g_metaTypeOff, &ty);
+            else { void *meta = *(void **)mb; if (meta && okptr((uintptr_t)meta) && g_meta_fType) I2.field_get_value(meta, g_meta_fType, &ty); }
+        }
+        if (ty != 0) continue;
+
+        void *mvc = NULL;
+        if (!g_lk_fMoveComp) continue;
+        I2.field_get_value(o, g_lk_fMoveComp, &mvc);
+        if (!mvc || !okptr((uintptr_t)mvc)) continue;
+
+        int cx[3] = {0, 0, 0}, rx[3] = {0, 0, 0};
+        if (g_v110_curOff > 0) { if (!rd((char *)mvc + g_v110_curOff, cx, 12)) continue; }
+        else if (g_mv_fCur) { I2.field_get_value(mvc, g_mv_fCur, cx); }
+        else continue;
+        if (cx[0] == 0 && cx[2] == 0) continue;                 // 空槽不占行
+        if (g_v110_remOff > 0) rd((char *)mvc + g_v110_remOff, rx, 12);
+        else if (g_mv_fRem) I2.field_get_value(mvc, g_mv_fRem, rx);
+
+        g_v106_id[n] = id; g_v106_lv[n] = lv; g_v106_ty[n] = ty;
+        memcpy(g_v110_ci[n], cx, 12);
+        memcpy(g_v110_cf[n], cx, 12);
+        memcpy(g_v106_rem[n], rx, 12);
+        g_v110_torn[n] = 0; g_v112_remTorn[n] = 0;
+        v112Tick(n, lv);
+        n++;
+    }
+    // 把"自己"换到第 0 行：2 人房里另一个 ty==0 行就是敌方，读起来更直观。
+    if (g_v104_host > 0) {
+        for (int i = 1; i < n; i++) {
+            if (g_v106_id[i] == g_v104_host) {
+                int ti = g_v106_id[0]; g_v106_id[0] = g_v106_id[i]; g_v106_id[i] = ti;
+                ti = g_v106_lv[0]; g_v106_lv[0] = g_v106_lv[i]; g_v106_lv[i] = ti;
+                ti = g_v106_ty[0]; g_v106_ty[0] = g_v106_ty[i]; g_v106_ty[i] = ti;
+                int tv[3]; memcpy(tv, g_v110_ci[0], 12); memcpy(g_v110_ci[0], g_v110_ci[i], 12); memcpy(g_v110_ci[i], tv, 12);
+                memcpy(g_v110_cf[0], g_v110_ci[0], 12); memcpy(g_v110_cf[i], g_v110_ci[i], 12);
+                float tf[3]; memcpy(tf, g_v106_rem[0], 12); memcpy(g_v106_rem[0], g_v106_rem[i], 12); memcpy(g_v106_rem[i], tf, 12);
+                break;
+            }
+        }
+    }
+    g_v106_n = n;
+    g_v106_src = 2;
+}
+
 
 // ======================= v107：右上角固定面板（不被日志覆盖）=======================
+// ============================================================================
+// 第 6.5 部分：M1 · 位置节点扫描器（native 层，纯读，不碰 IL2CPP）
+// ----------------------------------------------------------------------------
+// 施工图：09-全图透视制作手册-native层.md §7 M1 + §12
+// 只做一件事：在 UnityFramework / PxExtFFi 的 __DATA 段里分帧扫出"像位置节点"的
+// 24 字节记录（int32 X/Y/Z + flags，raw=mm），再用控制组验收：
+//   A 段（4 秒）站住不动 → 记快照；B 段（10 秒）自己走两步 → 复读比较；
+//   只有"跟着自己动"的候选才算命中 —— 这就是 M1 的判据。
+// 铁律：不写内存 / 不改可见性 / 不扫 __TEXT / 不整块扫堆 / 每帧最多 4 MB。
+// ============================================================================
+#define M1_MAX_RANGES   24
+#define M1_MAX_CAND     8192
+#define M1_CHUNK        (1u * 1024u * 1024u)
+#define M1_BUDGET       (1u * 1024u * 1024u)
+#define M1_STAND_SEC    4.0
+#define M1_WALK_SEC     10.0
+
+typedef struct { uintptr_t a; int32_t x, y, z; uint8_t t; } M1Cand;   // t: 0=int32(mm) 1=float(m)
+static M1Cand    g_m1c[M1_MAX_CAND];
+static int       g_m1n = 0;
+static uintptr_t g_m1r[M1_MAX_RANGES][2];
+static int       g_m1rn = 0;
+static int       g_m1ri = 0;
+static uintptr_t g_m1cur = 0;
+static int       g_m1phase = 0;      // 0 未开始 / 1 基线扫描 / 2 等走动 / 3 出结果
+static double    g_m1t = 0;
+static double    g_m1mb = 0;
+static int       g_m1moved = 0;
+static uintptr_t g_m1top[4];
+static int32_t   g_m1tv[4][3], g_m1td[4][2];
+static int       g_m1topn = 0;
+static unsigned char g_m1buf[M1_CHUNK];
+
+// 只收这两个镜像的非执行数据段（施工图 §5：__DATA / __bss）
+static void m1BuildRanges(void) {
+    g_m1rn = 0;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n && g_m1rn < M1_MAX_RANGES; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm) continue;
+        if (!strstr(nm, "UnityFramework") && !strstr(nm, "PxExtFFi")) continue;
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!mh) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        const uint8_t *p = (const uint8_t *)(mh + 1);
+        for (uint32_t k = 0; k < mh->ncmds && g_m1rn < M1_MAX_RANGES; k++) {
+            const struct load_command *lc = (const struct load_command *)p;
+            if (lc->cmdsize < sizeof(struct load_command)) break;
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+                bool want = (!strcmp(sg->segname, "__DATA") || !strcmp(sg->segname, "__DATA_CONST") ||
+                             !strcmp(sg->segname, "__DATA_DIRTY")) && sg->vmsize >= 0x1000;
+                if (want && sg->filesize > 0) {   // filesize==0 的是纯 __bss，运行期才有效，仍可读，但也收
+                    g_m1r[g_m1rn][0] = (uintptr_t)(sg->vmaddr + slide);
+                    g_m1r[g_m1rn][1] = (uintptr_t)(sg->vmaddr + slide + sg->vmsize);
+                    g_m1rn++;
+                } else if (want) {
+                    g_m1r[g_m1rn][0] = (uintptr_t)(sg->vmaddr + slide);
+                    g_m1r[g_m1rn][1] = (uintptr_t)(sg->vmaddr + slide + sg->vmsize);
+                    g_m1rn++;
+                }
+            }
+            p += lc->cmdsize;
+        }
+    }
+}
+
+// 一个 24 字节窗口是不是"像位置节点"（施工图 §12.3 + §5 第一步的校验条件）
+static int m1Match(const unsigned char *b, int32_t *ox, int32_t *oy, int32_t *oz, uint8_t *ot) {
+    int32_t x, y, z; uint32_t fl;
+    memcpy(&x, b, 4); memcpy(&y, b + 4, 4); memcpy(&z, b + 8, 4); memcpy(&fl, b + 12, 4);
+    // ① int32(mm) 形态：|x|,|z| ≤ 20 km，y 合理，flags 是小整数
+    int32_t ax = x < 0 ? -x : x, az = z < 0 ? -z : z;
+    if (ax > 1000 && ax < 20000000 && az > 1000 && az < 20000000 &&
+        y >= 0 && y < 200000 && fl <= 0xFFFF) {
+        *ox = x; *oy = y; *oz = z; *ot = 0; return 1;
+    }
+    // ② float(米) 形态：施工图 §8 的提醒（量级像 792.0 而不是 792000）
+    float fx, fy, fz;
+    memcpy(&fx, b, 4); memcpy(&fy, b + 4, 4); memcpy(&fz, b + 8, 4);
+    if (fx > -20000.0f && fx < 20000.0f && fz > -20000.0f && fz < 20000.0f &&
+        fy > -1000.0f && fy < 2000.0f && fl <= 0xFFFF && (fabsf(fx) + fabsf(fz) > 0.01f)) {
+        *ox = (int32_t)fx; *oy = (int32_t)fy; *oz = (int32_t)fz; *ot = 1; return 1;
+    }
+    return 0;
+}
+
+// 扫一个 2 MB 分块：每 4 字节滑窗（节点可能不按 8 对齐）
+static void m1ScanChunk(uintptr_t base, uintptr_t len) {
+    if (len > M1_CHUNK) len = M1_CHUNK;
+    if (!rd((const void *)base, g_m1buf, len)) return;
+    g_m1mb += len / 1048576.0;
+    for (uintptr_t o = 0; o + 24 <= len; o += 4) {
+        if (g_m1n >= M1_MAX_CAND) return;
+        int32_t x, y, z; uint8_t t;
+        if (!m1Match(g_m1buf + o, &x, &y, &z, &t)) continue;
+        g_m1c[g_m1n].a = base + o;
+        g_m1c[g_m1n].x = x; g_m1c[g_m1n].y = y; g_m1c[g_m1n].z = z;
+        g_m1c[g_m1n].t = t;
+        g_m1n++;
+        o += 20;                 // 命中即跳过该记录（24 字节），避免重叠窗口刷爆候选表
+    }
+}
+
+// 复读比较：跟着自己动的候选才算命中
+static void m1Compare(void) {
+    g_m1moved = 0; g_m1topn = 0;
+    for (int i = 0; i < g_m1n; i++) {
+        unsigned char a[24], b2[24];
+        if (!rd((const void *)g_m1c[i].a, a, 24)) continue;
+        if (!rd((const void *)g_m1c[i].a, b2, 24)) continue;      // 双读比对，防撕裂
+        if (memcmp(a, b2, 24) != 0) continue;
+        int32_t x, y, z; uint8_t t;
+        if (!m1Match(a, &x, &y, &z, &t) || t != g_m1c[i].t) continue;
+        int32_t dx = x - g_m1c[i].x, dz = z - g_m1c[i].z, dy = y - g_m1c[i].y;
+        if (dx == 0 && dz == 0) continue;                          // 没动 → 不是自己的位置
+        int32_t lim = (t == 0) ? 2000000 : 20000;                  // 2 km / 20 km 上限，滤掉噪声
+        if (dx > lim || dx < -lim || dz > lim || dz < -lim) continue;
+        if (dy > 100000 || dy < -100000) continue;                 // 走路不该改变高度太多
+        g_m1moved++;
+        int score = (dx < 0 ? -dx : dx) + (dz < 0 ? -dz : dz);
+        // 取分最高的 4 个
+        for (int k = 0; k < 4; k++) {
+            int prev = (k < g_m1topn) ? ((g_m1td[k][0] < 0 ? -g_m1td[k][0] : g_m1td[k][0]) +
+                                         (g_m1td[k][1] < 0 ? -g_m1td[k][1] : g_m1td[k][1])) : -1;
+            if (score > prev) {
+                for (int j = (g_m1topn < 3 ? g_m1topn : 3); j > k; j--) {
+                    g_m1top[j] = g_m1top[j-1]; memcpy(g_m1tv[j], g_m1tv[j-1], 12); memcpy(g_m1td[j], g_m1td[j-1], 8);
+                }
+                g_m1top[k] = g_m1c[i].a;
+                g_m1tv[k][0] = x; g_m1tv[k][1] = y; g_m1tv[k][2] = z;
+                g_m1td[k][0] = dx; g_m1td[k][1] = dz;
+                if (g_m1topn < 4) g_m1topn++;
+                break;
+            }
+        }
+    }
+}
+
+// 每帧推进（由 renderFrame 调用）
+static void m1Tick(void) {
+    double now = CACurrentMediaTime();
+    if (g_m1phase == 0) {
+        m1BuildRanges();
+        g_m1n = 0; g_m1ri = 0; g_m1cur = 0; g_m1mb = 0; g_m1moved = 0; g_m1topn = 0;
+        g_m1t = now; g_m1phase = 1;
+        return;
+    }
+    if (g_m1phase == 1) {
+        uintptr_t used = 0;
+        while (used < M1_BUDGET && g_m1ri < g_m1rn) {
+            uintptr_t s = g_m1r[g_m1ri][0], e = g_m1r[g_m1ri][1];
+            if (g_m1cur < s) g_m1cur = s;
+            uintptr_t left = (e > g_m1cur) ? (e - g_m1cur) : 0;
+            if (left == 0) { g_m1ri++; g_m1cur = 0; continue; }
+            uintptr_t take = left > M1_CHUNK ? M1_CHUNK : left;
+            m1ScanChunk(g_m1cur, take);
+            g_m1cur += take; used += take;
+        }
+        bool done = (g_m1ri >= g_m1rn) || (g_m1n >= M1_MAX_CAND);
+        if (done || (now - g_m1t) > (M1_STAND_SEC + 20.0)) { g_m1t = now; g_m1phase = 2; }
+        return;
+    }
+    if (g_m1phase == 2) {
+        if ((now - g_m1t) >= M1_WALK_SEC) { m1Compare(); g_m1phase = 3; }
+        return;
+    }
+    if (g_m1phase == 3 && (now - g_m1t) > 60.0) { g_m1phase = 0; }   // 一分钟后自动重来
+}
 static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     if (!dl) return;
     ImFont *f = ImGui::GetFont();
@@ -5772,7 +6097,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v112 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v113 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -5866,6 +6191,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
 }
 
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
+    m1Tick();   // M1：位置节点扫描器（分帧、纯读，与本函数其余逻辑无关）
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
@@ -6485,18 +6811,18 @@ static void updateHud(void) {
         // v112r7：收成两行，但**必须**把 P0 那行留住 —— 本包的 ImGui 菜单打不开（g_menuOpen 只在
         // 菜单内部的按钮里切换），drawFixedPanel 永远画不出来，UILabel HUD 是唯一看得见的地方。
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v112 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
-             "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d off=%d\n",
+            @"ESP v113 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+             "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100,
             g_v112_sawA, g_v112_sawAF, g_v112_sawB, g_v112_sawBF,
             g_v112_hitVis, g_v112_hitInv,
             g_v112_gone[0] + g_v112_gone[1] + g_v112_gone[2] + g_v112_gone[3],
-            g_v106_n, g_v110_curOff];
+            g_v106_n, g_v106_src, g_v106_err, g_v110_curOff];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v112 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v113 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -6511,13 +6837,13 @@ static void updateHud(void) {
     if (g_v110_curOff <= 0) {
         [s appendFormat:@"P0 NOSMP curOff=%d remOff=%d enum=%d\n", g_v110_curOff, g_v110_remOff, g_v106_n];
     } else {
-        [s appendFormat:@"P0 50k=%d(F%d) 55k=%d(F%d) | vis=%d inv=%d | gone=%d enum=%d off=%d\n",
+        [s appendFormat:@"P0 50k=%d(F%d) 55k=%d(F%d) | vis=%d inv=%d | gone=%d enum=%d src=%d err=%d off=%d\n",
             g_v112_sawA, g_v112_sawAF, g_v112_sawB, g_v112_sawBF,
             g_v112_hitVis, g_v112_hitInv,
             g_v112_gone[0] + g_v112_gone[1] + g_v112_gone[2] + g_v112_gone[3],
-            g_v106_n, g_v110_curOff];
+            g_v106_n, g_v106_src, g_v106_err, g_v110_curOff];
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 4; i++) {
         if (i < g_v106_n) {
             int ri[3] = {0, 0, 0};
             memcpy(ri, g_v106_rem[i], sizeof(ri));
@@ -6531,6 +6857,18 @@ static void updateHud(void) {
             [s appendFormat:@"E%d GONE=%d id=%d last\n", i, g_v112_gone[i], g_v110_id[i]];
         } else {
             [s appendFormat:@"E%d --\n", i];
+        }
+    }
+    // ---- M1：位置节点扫描器（native 层，纯读；判据=自己走动时它跟着变）----
+    {
+        const char *ph = (g_m1phase == 1) ? "STAND" : (g_m1phase == 2) ? "WALK" :
+                         (g_m1phase == 3) ? "DONE"  : "IDLE";
+        [s appendFormat:@"M1 %s cand=%d scan=%.1fMB moved=%d rng=%d\n",
+            ph, g_m1n, g_m1mb, g_m1moved, g_m1rn];
+        for (int i = 0; i < g_m1topn; i++) {
+            [s appendFormat:@"M1 N%d 0x%llx i=(%d,%d,%d) d=(%d,%d)\n", i,
+                (unsigned long long)g_m1top[i],
+                g_m1tv[i][0], g_m1tv[i][1], g_m1tv[i][2], g_m1td[i][0], g_m1td[i][1]];
         }
     }
     // v28：这 4 行永远在第一屏，不用翻页 —— 现场「没法自主翻页」时这是唯一能拿到数据的地方
@@ -6760,7 +7098,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v112 booting";
+    l.text = @"ESP v113 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
