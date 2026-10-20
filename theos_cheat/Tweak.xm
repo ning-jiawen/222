@@ -1236,7 +1236,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v104 ====");
+    CHECK("==== dump v106 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1247,7 +1247,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v104 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v106 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -5361,11 +5361,154 @@ static void v104Dump(void) {
     }
 }
 
+
+// ======================= v105：固定 HUD 身份表 =======================
+static int   g_v105_n = 0, g_v105_heroN = 0, g_v105_ready = 0;
+static int   g_v105_hId[4], g_v105_hCamp[4], g_v105_hLv[4];
+static float g_v105_hCur[4][3], g_v105_hRem[4][3], g_v105_hPos[4][3];
+
+static void v105Scan(void) {
+    if (!g_v98Ready || g_v98Ready != 2) return;
+    if (!g_mgr || !g_linkerClass) return;
+    void *mk = NULL;
+    if (!rd(g_mgr, &mk, sizeof(mk)) || mk != g_mgrClass) return;
+
+    void *view = NULL;
+    if (!rd((char *)g_mgr + g_offDict, &view, sizeof(view)) || !view) return;
+    void *dict = view;
+    if (g_ctxOff > 0) { void *c = NULL; if (rd((char *)view + g_ctxOff, &c, sizeof(c)) && c) dict = c; }
+    else if (g_viewHop > 0) { void *h = NULL; if (rd((char *)view + g_viewHop, &h, sizeof(h)) && h) dict = h; }
+    int cnt = 0; void *ent = NULL;
+    if (!rd((char *)dict + g_offCount, &cnt, sizeof(cnt)) || cnt <= 0 || cnt > 4096) return;
+    if (!rd((char *)dict + g_offEntries, &ent, sizeof(ent)) || !ent) return;
+
+    g_v105_n = cnt;
+    g_v105_heroN = 0;
+    for (int i = 0; i < cnt; i++) {
+        void *o = NULL;
+        if (!rd((char *)ent + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr((uintptr_t)o)) continue;
+        { void *k = NULL; if (!rd(o, &k, sizeof(k)) || k != g_linkerClass) continue; }
+
+        int ty = -1;
+        unsigned char mb[1024];
+        memset(mb, 0, sizeof(mb));
+        if (!g_lk_fMeta) continue;
+        I2.field_get_value(o, g_lk_fMeta, mb);
+        if (g_metaIsValue) v99IntAt(mb, g_metaTypeOff, &ty);
+        else {
+            void *meta = *(void **)mb;
+            if (meta && okptr((uintptr_t)meta) && g_meta_fType) I2.field_get_value(meta, g_meta_fType, &ty);
+        }
+        if (ty != 0) continue;
+
+        if (g_v105_heroN < 4) {
+            int idx = g_v105_heroN;
+            g_v105_hId[idx] = 0; g_v105_hCamp[idx] = -1; g_v105_hLv[idx] = -1;
+            g_v105_hCur[idx][0] = g_v105_hCur[idx][2] = -9999;
+            g_v105_hRem[idx][0] = g_v105_hRem[idx][2] = -9999;
+            g_v105_hPos[idx][0] = g_v105_hPos[idx][2] = 0;
+            if (g_lk_fObjID) I2.field_get_value(o, g_lk_fObjID, &g_v105_hId[idx]);
+            if (g_lk_fPos)    I2.field_get_value(o, g_lk_fPos, g_v105_hPos[idx]);
+            if (g_lk_fLv) { unsigned char b = 0; I2.field_get_value(o, g_lk_fLv, &b); g_v105_hLv[idx] = b; }
+            if (g_metaIsValue) v99IntAt(mb, g_metaCampOff, &g_v105_hCamp[idx]);
+            else {
+                void *meta = *(void **)mb;
+                if (meta && okptr((uintptr_t)meta) && g_meta_fCamp) I2.field_get_value(meta, g_meta_fCamp, &g_v105_hCamp[idx]);
+            }
+            if (g_lk_fMoveComp) {
+                void *mvc = NULL;
+                I2.field_get_value(o, g_lk_fMoveComp, &mvc);
+                if (mvc && okptr((uintptr_t)mvc)) {
+                    if (g_mv_fCur) I2.field_get_value(mvc, g_mv_fCur, g_v105_hCur[idx]);
+                    if (g_mv_fRem) I2.field_get_value(mvc, g_mv_fRem, g_v105_hRem[idx]);
+                }
+            }
+        }
+        g_v105_heroN++;
+    }
+    g_v105_ready = 1;
+}
+
+
+// ======================= v106：游戏枚举器（GetHeroActorByIndex）=======================
+static int g_v106_gHero = -1, g_v106_c1 = -1, g_v106_c2 = -1;
+static int g_v106_n = 0;                       // 枚举到的英雄数
+static int g_v106_id[4], g_v106_camp[4], g_v106_lv[4], g_v106_ty[4];
+static float g_v106_pos[4][3], g_v106_cur[4][3], g_v106_rem[4][3];
+
+static void v106ScanHeroes(void) {
+    if (!g_mgr || !g_mgrClass || !I2.class_get_method_from_name) return;
+    void *mk = NULL;
+    if (!rd(g_mgr, &mk, sizeof(mk)) || mk != g_mgrClass) return;   // mgr 悬空就不调
+
+    g_v106_gHero = callInt0(g_mgr, "GetHeroActorCount");
+    g_v106_c1 = callInt1(g_mgr, "GetCampActorCount", 1);
+    g_v106_c2 = callInt1(g_mgr, "GetCampActorCount", 2);
+
+    g_v106_n = 0;
+    int lim = g_v106_gHero;
+    if (lim < 0) lim = 0;
+    if (lim > 4) lim = 4;
+    void *mi = I2.class_get_method_from_name(g_mgrClass, "GetHeroActorByIndex", 1);
+    if (!mi) { g_v106_n = -1; return; }
+    void *fn = *(void **)mi;
+    if (!okptr((uintptr_t)fn)) { g_v106_n = -2; return; }
+    if (I2.method_get_param_count && I2.method_get_param_count(mi) != 1) { g_v106_n = -3; return; }
+
+    for (int i = 0; i < lim; i++) {
+        void *a = ((void *(*)(void *, int, void *))fn)(g_mgr, i, mi);
+        if (!a || !okptr((uintptr_t)a)) continue;
+        void *k = NULL;
+        if (!rd(a, &k, sizeof(k)) || k != g_linkerClass) continue;
+
+        int idx = g_v106_n;
+        if (idx < 0 || idx > 3) break;
+        g_v106_id[idx] = 0; g_v106_camp[idx] = -1; g_v106_lv[idx] = -1; g_v106_ty[idx] = -1;
+        g_v106_pos[idx][0] = g_v106_pos[idx][2] = 0;
+        g_v106_cur[idx][0] = g_v106_cur[idx][2] = -9999;
+        g_v106_rem[idx][0] = g_v106_rem[idx][2] = -9999;
+
+        if (g_lk_fObjID) I2.field_get_value(a, g_lk_fObjID, &g_v106_id[idx]);
+        if (g_lk_fPos)    I2.field_get_value(a, g_lk_fPos, g_v106_pos[idx]);
+        if (g_lk_fLv) { unsigned char b = 0; I2.field_get_value(a, g_lk_fLv, &b); g_v106_lv[idx] = b; }
+
+        if (g_lk_fMeta) {
+            unsigned char mb[1024];
+            memset(mb, 0, sizeof(mb));
+            I2.field_get_value(a, g_lk_fMeta, mb);
+            if (g_metaIsValue) {
+                v99IntAt(mb, g_metaTypeOff, &g_v106_ty[idx]);
+                v99IntAt(mb, g_metaCampOff, &g_v106_camp[idx]);
+            } else {
+                void *meta = *(void **)mb;
+                if (meta && okptr((uintptr_t)meta)) {
+                    if (g_meta_fType) I2.field_get_value(meta, g_meta_fType, &g_v106_ty[idx]);
+                    if (g_meta_fCamp) I2.field_get_value(meta, g_meta_fCamp, &g_v106_camp[idx]);
+                }
+            }
+        }
+        if (g_lk_fMoveComp) {
+            void *mvc = NULL;
+            I2.field_get_value(a, g_lk_fMoveComp, &mvc);
+            if (mvc && okptr((uintptr_t)mvc)) {
+                if (g_mv_fCur) I2.field_get_value(mvc, g_mv_fCur, g_v106_cur[idx]);
+                if (g_mv_fRem) I2.field_get_value(mvc, g_mv_fRem, g_v106_rem[idx]);
+            }
+        }
+        g_v106_n++;
+    }
+}
+
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
     v73Tick();
+    {   // v105：每秒扫一次英雄身份（固定 HUD 用）
+        static double s_next = 0;
+        double nwv = CACurrentMediaTime();
+        if (nwv >= s_next) { s_next = nwv + 1.0; v105Scan(); v106ScanHeroes(); }
+    }
     // v99：启动即初始化（只做字段解析，不读任何游戏对象）
     if (!g_v98Ready) v98Init();
     else if (g_v98Ready == 2 && g_v98Reprint > 0) {   // v102：30 秒重打一次 init 明细
@@ -5937,10 +6080,6 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
         double nwS = CACurrentMediaTime();
         if (nwS >= s_nextSk) {
             s_nextSk = nwS + 1.0;
-            CHECK("CMD n=%d t0..t7=%d/%d/%d/%d/%d/%d/%d/%d p0..p3=%d/%d/%d/%d",
-                  g_cmdN, g_cmdTypeN[0], g_cmdTypeN[1], g_cmdTypeN[2], g_cmdTypeN[3],
-                  g_cmdTypeN[4], g_cmdTypeN[5], g_cmdTypeN[6], g_cmdTypeN[7],
-                  g_cmdPlayer[0], g_cmdPlayer[1], g_cmdPlayer[2], g_cmdPlayer[3]);
             CHECK("SKIP n=%d on=%d drawn=%d | nul=%d noP=%d zeroP=%d noHero=%d dup=%d off=%d | camp %d/%d/%d/%d/%d",
                   cnt, g_onscrN, drawn, g_sk[1], g_sk[3], g_sk[4], g_sk[5], g_sk[6], g_offN,
                   g_campN[0], g_campN[1], g_campN[2], g_campN[3], g_campN[4]);
@@ -5978,13 +6117,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v104 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
+            @"ESP v106 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v104 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v106 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -6221,7 +6360,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v104 booting";
+    l.text = @"ESP v106 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -6261,7 +6400,26 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v104 esp (game-list)");
+    ImGui::Text("build         : v106 esp (3way)");
+    if (g_v105_ready) {
+        ImGui::Text("TBL   cnt=%d ty0=%d gHero=%d c1=%d c2=%d self=%d",
+                    g_v105_n, g_v105_heroN, g_v106_gHero, g_v106_c1, g_v106_c2, g_v104_host);
+        for (int hi = 0; hi < 4 && hi < g_v106_n; hi++) {
+            ImGui::Text("E%d id=%-6d ty=%-2d camp=%-2d lv=%d pos=(%.0f,%.0f) cur=(%.0f,%.0f) rem=(%.0f,%.0f)%s",
+                        hi, g_v106_id[hi], g_v106_ty[hi], g_v106_camp[hi], g_v106_lv[hi],
+                        g_v106_pos[hi][0], g_v106_pos[hi][2],
+                        g_v106_cur[hi][0], g_v106_cur[hi][2],
+                        g_v106_rem[hi][0], g_v106_rem[hi][2],
+                        (g_v104_host > 0 && g_v106_id[hi] == g_v104_host) ? " SELF" : "");
+        }
+        for (int hi = 0; hi < 4 && hi < g_v105_heroN; hi++) {
+            ImGui::Text("H%d id=%-6d camp=%-2d lv=%d pos=(%.0f,%.0f) cur=(%.0f,%.0f) rem=(%.0f,%.0f)",
+                        hi, g_v105_hId[hi], g_v105_hCamp[hi], g_v105_hLv[hi],
+                        g_v105_hPos[hi][0], g_v105_hPos[hi][2],
+                        g_v105_hCur[hi][0], g_v105_hCur[hi][2],
+                        g_v105_hRem[hi][0], g_v105_hRem[hi][2]);
+        }
+    }
     ImGui::Text("DRAW          : on %d  off %d  scan %d", g_boxDrawn, g_offN, g_scanN);
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
