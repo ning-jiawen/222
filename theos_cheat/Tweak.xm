@@ -848,6 +848,12 @@ static void dumpClass(void *klass, const char *label, int cap, int all) {
 static const struct { const char *ns; const char *name; int cap; } g_targets[] = {
     {"Assets.Scripts.GameLogic",  "GuishiCamera",        36},
     {"Assets.Scripts.GameLogic",  "CameraVPFrameCache",   4},
+    // v91：把"逻辑层"的类一并 dump —— 这几张字段表 87 个版本从来没拿到过
+    {"Assets.Scripts.GameLogic",  "ActorLinker",         50},
+    {"Assets.Scripts.Framework", "FrameSynchr",         30},
+    {"Assets.Scripts.GameLogic",  "MoveComponent",       20},
+    {"Assets.Scripts.GameLogic",  "SkillControlIndicator", 20},
+    {"Assets.Scripts.GameLogic",  "ActorManager",        16},
 };
 #define NTARGET ((int)(sizeof(g_targets) / sizeof(g_targets[0])))
 
@@ -1219,7 +1225,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v89 ====");
+    CHECK("==== dump v91 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1230,13 +1236,40 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v89 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v91 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
         void *img = I2.assembly_get_image(asms[a]);
         if (!img) continue;
         g_clsScanned += I2.image_get_class_count ? I2.image_get_class_count(img) : 0;
+    }
+
+    // ---- v91：名字发现（只读元数据：类名 + 字段数，不解引用任何实例）----
+    {
+        const char *keys[6] = { "Synchr", "LogicActor", "BeUnit", "BeActor", "Movable", "HeroObj" };
+        int shown = 0;
+        for (size_t a = 0; a < n && shown < 48; a++) {
+            void *img = I2.assembly_get_image(asms[a]);
+            if (!img || !I2.image_get_class_count || !I2.image_get_class) continue;
+            int cc = I2.image_get_class_count(img);
+            for (int ci = 0; ci < cc && shown < 48; ci++) {
+                void *k = I2.image_get_class(img, ci);
+                if (!k || !I2.class_get_name) continue;
+                const char *cn = I2.class_get_name(k, NULL);
+                if (!cn) continue;
+                int hit = 0;
+                for (int q = 0; q < 6; q++) if (strstr(cn, keys[q])) { hit = 1; break; }
+                if (!hit) continue;
+                int nf = 0;
+                void *it2 = NULL; void *f2 = NULL;
+                if (I2.class_get_fields) while ((f2 = I2.class_get_fields(k, &it2)) && nf < 999) nf++;
+                const char *ns = (I2.class_get_namespace ? I2.class_get_namespace(k) : "");
+                CHECK("C %s.%s nf=%d", (ns && ns[0]) ? ns : "-", cn, nf);
+                shown++;
+            }
+        }
+        if (shown == 0) CHECK("C none (no name hit)");
     }
 
     int foundN = 0;
@@ -5300,13 +5333,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v89 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
+            @"ESP v91 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendString:@"ESP v89\n"];
+    [s appendString:@"ESP v91\n"];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -5543,7 +5576,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v89 booting";
+    l.text = @"ESP v91 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -5583,7 +5616,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v89 esp (nofilter)");
+    ImGui::Text("build         : v91 esp (fieldmap)");
     ImGui::Text("DRAW          : on %d  off %d  scan %d", g_boxDrawn, g_offN, g_scanN);
     ImGui::Text("exit trap     : %s  (%d hit)",
                 g_exitTrapOn ? "ON" : "OFF", g_exitHits);
