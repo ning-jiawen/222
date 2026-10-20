@@ -1244,7 +1244,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v113 ====");
+    CHECK("==== dump v114 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1255,7 +1255,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v113 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v114 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -5929,8 +5929,11 @@ static void v112FillFromDict(void) {
 #define M1_BUDGET       (1u * 1024u * 1024u)
 #define M1_STAND_SEC    4.0
 #define M1_WALK_SEC     10.0
+#define M1_WALK_MIN     20000     // 2 m/s  × 10 s = 20 m = 20000 mm（B2/B4）
+#define M1_WALK_MAX     120000    // 12 m/s × 10 s = 120 m = 120000 mm
+#define M1_WALK_TYPICAL 45000     // 4.5 m/s：排序用它当中心
 
-typedef struct { uintptr_t a; int32_t x, y, z; uint8_t t; } M1Cand;   // t: 0=int32(mm) 1=float(m)
+typedef struct { uintptr_t a; int32_t x, y, z; uint8_t t; unsigned char raw[24]; } M1Cand;   // raw=快照原始字节
 static M1Cand    g_m1c[M1_MAX_CAND];
 static int       g_m1n = 0;
 static uintptr_t g_m1r[M1_MAX_RANGES][2];
@@ -5941,6 +5944,12 @@ static int       g_m1phase = 0;      // 0 未开始 / 1 基线扫描 / 2 等走�
 static double    g_m1t = 0;
 static double    g_m1mb = 0;
 static int       g_m1moved = 0;
+static int       g_m1stable = 0;     // 站立复采后仍完全没变的候选数（手册 §5 校验第 1 条）
+static int       g_m1hit = 0;        // 落在步速窗口内的候选数（B3 的布尔判据）
+static int       g_m1sat = 0;        // 候选表是否饱和（B5：饱和仍继续扫，只是不再收）
+static int32_t   g_m1tl[4];
+static int       g_m1PrevIn = 0;     // 上一帧是否在对局（上升沿 → 整轮复位）
+static int       g_m1InFrames = 0;   // 进对局后的帧数（>180 才开始扫，等人站定）          // 每个 top 候选的 10 秒位移长度（mm）
 static uintptr_t g_m1top[4];
 static int32_t   g_m1tv[4][3], g_m1td[4][2];
 static int       g_m1topn = 0;
@@ -6006,82 +6015,137 @@ static void m1ScanChunk(uintptr_t base, uintptr_t len) {
     if (!rd((const void *)base, g_m1buf, len)) return;
     g_m1mb += len / 1048576.0;
     for (uintptr_t o = 0; o + 24 <= len; o += 4) {
-        if (g_m1n >= M1_MAX_CAND) return;
+        if (g_m1n >= M1_MAX_CAND) { g_m1sat = 1; return; }   // 饱和：只标记，扫描继续由上层推进
         int32_t x, y, z; uint8_t t;
         if (!m1Match(g_m1buf + o, &x, &y, &z, &t)) continue;
         g_m1c[g_m1n].a = base + o;
         g_m1c[g_m1n].x = x; g_m1c[g_m1n].y = y; g_m1c[g_m1n].z = z;
         g_m1c[g_m1n].t = t;
+        memcpy(g_m1c[g_m1n].raw, g_m1buf + o, 24);
         g_m1n++;
         o += 20;                 // 命中即跳过该记录（24 字节），避免重叠窗口刷爆候选表
     }
 }
 
-// 复读比较：跟着自己动的候选才算命中
-static void m1Compare(void) {
-    g_m1moved = 0; g_m1topn = 0;
+// ---- 站立复采：只留"24 字节完全没变"的候选（手册 §5 校验第 1 条；B1）----
+// 这一条剔除 __DATA 里的计时器/帧计数/相机（它们每帧都变），是能不能自动判死的关键。
+static void m1PruneStable(void) {
+    int keep = 0;
     for (int i = 0; i < g_m1n; i++) {
-        unsigned char a[24], b2[24];
+        unsigned char a[24], b[24];
         if (!rd((const void *)g_m1c[i].a, a, 24)) continue;
-        if (!rd((const void *)g_m1c[i].a, b2, 24)) continue;      // 双读比对，防撕裂
-        if (memcmp(a, b2, 24) != 0) continue;
-        int32_t x, y, z; uint8_t t;
-        if (!m1Match(a, &x, &y, &z, &t) || t != g_m1c[i].t) continue;
-        int32_t dx = x - g_m1c[i].x, dz = z - g_m1c[i].z, dy = y - g_m1c[i].y;
-        if (dx == 0 && dz == 0) continue;                          // 没动 → 不是自己的位置
-        int32_t lim = (t == 0) ? 2000000 : 20000;                  // 2 km / 20 km 上限，滤掉噪声
-        if (dx > lim || dx < -lim || dz > lim || dz < -lim) continue;
-        if (dy > 100000 || dy < -100000) continue;                 // 走路不该改变高度太多
-        g_m1moved++;
-        int score = (dx < 0 ? -dx : dx) + (dz < 0 ? -dz : dz);
-        // 取分最高的 4 个
-        for (int k = 0; k < 4; k++) {
-            int prev = (k < g_m1topn) ? ((g_m1td[k][0] < 0 ? -g_m1td[k][0] : g_m1td[k][0]) +
-                                         (g_m1td[k][1] < 0 ? -g_m1td[k][1] : g_m1td[k][1])) : -1;
-            if (score > prev) {
-                for (int j = (g_m1topn < 3 ? g_m1topn : 3); j > k; j--) {
-                    g_m1top[j] = g_m1top[j-1]; memcpy(g_m1tv[j], g_m1tv[j-1], 12); memcpy(g_m1td[j], g_m1td[j-1], 8);
-                }
-                g_m1top[k] = g_m1c[i].a;
-                g_m1tv[k][0] = x; g_m1tv[k][1] = y; g_m1tv[k][2] = z;
-                g_m1td[k][0] = dx; g_m1td[k][1] = dz;
-                if (g_m1topn < 4) g_m1topn++;
-                break;
+        if (!rd((const void *)g_m1c[i].a, b, 24)) continue;
+        if (memcmp(a, b, 24) != 0) continue;                  // B5：撕裂读取不算证据
+        // B2：只比 x(+0x00) 与 z(+0x08)。flags(+0xc) 与 +0x10.. 是邻居记录/下一字段，
+        //     比进来会把"自己那条"误剪掉。
+        if (memcmp(a, g_m1c[i].raw, 4) != 0) continue;
+        if (memcmp(a + 8, g_m1c[i].raw + 8, 4) != 0) continue;
+        g_m1c[keep++] = g_m1c[i];
+    }
+    g_m1n = keep;
+    g_m1stable = keep;
+}
+
+// ---- top4 维护：越接近 4.5 m/s 越像"人走路" ----
+static void m1PushTop(int i, int32_t x, int32_t y, int32_t z, int32_t dx, int32_t dz, int32_t L) {
+    int score = L > M1_WALK_TYPICAL ? L - M1_WALK_TYPICAL : M1_WALK_TYPICAL - L;
+    for (int k = 0; k < 4; k++) {
+        int prev = (k < g_m1topn) ? g_m1tl[k] : 0x7fffffff;
+        int prevScore = (k < g_m1topn) ? (prev > M1_WALK_TYPICAL ? prev - M1_WALK_TYPICAL : M1_WALK_TYPICAL - prev)
+                                       : 0x7fffffff;
+        if (k >= g_m1topn || score < prevScore) {
+            for (int j = (g_m1topn < 3 ? g_m1topn : 3); j > k; j--) {
+                g_m1top[j] = g_m1top[j-1]; g_m1tl[j] = g_m1tl[j-1];
+                memcpy(g_m1tv[j], g_m1tv[j-1], 12); memcpy(g_m1td[j], g_m1td[j-1], 8);
             }
+            g_m1top[k] = g_m1c[i].a; g_m1tl[k] = L;
+            g_m1tv[k][0] = x; g_m1tv[k][1] = y; g_m1tv[k][2] = z;
+            g_m1td[k][0] = dx; g_m1td[k][1] = dz;
+            if (g_m1topn < 4) g_m1topn++;
+            break;
         }
     }
+}
+
+// ---- 走动比较：只认"步速窗口内"的位移（B2/B4）----
+static void m1CompareWalk(void) {
+    g_m1hit = 0; g_m1topn = 0;
+    for (int i = 0; i < g_m1n; i++) {
+        unsigned char a[24], b[24];
+        if (!rd((const void *)g_m1c[i].a, a, 24)) continue;
+        if (!rd((const void *)g_m1c[i].a, b, 24)) continue;   // 双读比对，防撕裂
+        if (memcmp(a, b, 24) != 0) continue;
+        int32_t x, y, z; uint8_t t;
+        if (!m1Match(a, &x, &y, &z, &t) || t != g_m1c[i].t) continue;
+        int32_t dx = x - g_m1c[i].x, dz = z - g_m1c[i].z;
+        if (dx == 0 && dz == 0) continue;
+        double L = sqrt((double)dx * (double)dx + (double)dz * (double)dz);
+        bool ok;
+        if (t == 0) ok = (L >= (double)M1_WALK_MIN && L <= (double)M1_WALK_MAX);   // raw=mm
+        else        ok = (L >= 2.0 && L <= 12.0);                                  // 米形态
+        if (!ok) continue;
+        g_m1hit++;
+        m1PushTop(i, x, y, z, dx, dz, (int32_t)(t == 0 ? L : L * 1000.0));
+    }
+}
+
+// 整轮复位（进场 / 离场都走这里）
+static void g_m1PhaseReset(void) {
+    g_m1phase = 0;
+    g_m1n = 0; g_m1mb = 0; g_m1stable = 0; g_m1hit = 0; g_m1sat = 0; g_m1topn = 0;
+    g_m1ri = 0; g_m1cur = 0;
 }
 
 // 每帧推进（由 renderFrame 调用）
 static void m1Tick(void) {
     double now = CACurrentMediaTime();
+    // B1：大厅/加载页一律不扫 —— 否则 SCAN+STAND+WALK 会在进对局前跑完，必然 FAIL。
+    if (!g_inMatch) {
+        g_m1PhaseReset();
+        g_m1PrevIn = 0; g_m1InFrames = 0;
+        return;
+    }
+    // B2：进对局上升沿 → 整轮复位（一次装机会话可以测任意多局）
+    if (!g_m1PrevIn) {
+        g_m1PrevIn = 1; g_m1InFrames = 0;
+        g_m1PhaseReset();
+    }
+    // B3：进对局 3 秒（≈180 帧）后再开始，此时人已站定，raw 才是"静"的
+    if (g_m1InFrames < 180) { g_m1InFrames++; return; }
     if (g_m1phase == 0) {
         m1BuildRanges();
-        g_m1n = 0; g_m1ri = 0; g_m1cur = 0; g_m1mb = 0; g_m1moved = 0; g_m1topn = 0;
+        g_m1n = 0; g_m1ri = 0; g_m1cur = 0; g_m1mb = 0;
+        g_m1moved = 0; g_m1stable = 0; g_m1hit = 0; g_m1sat = 0; g_m1topn = 0;
         g_m1t = now; g_m1phase = 1;
         return;
     }
-    if (g_m1phase == 1) {
+    if (g_m1phase == 1) {                      // 扫描
         uintptr_t used = 0;
         while (used < M1_BUDGET && g_m1ri < g_m1rn) {
-            uintptr_t s = g_m1r[g_m1ri][0], e = g_m1r[g_m1ri][1];
-            if (g_m1cur < s) g_m1cur = s;
-            uintptr_t left = (e > g_m1cur) ? (e - g_m1cur) : 0;
+            uintptr_t s0 = g_m1r[g_m1ri][0], e0 = g_m1r[g_m1ri][1];
+            if (g_m1cur < s0) g_m1cur = s0;
+            uintptr_t left = (e0 > g_m1cur) ? (e0 - g_m1cur) : 0;
             if (left == 0) { g_m1ri++; g_m1cur = 0; continue; }
             uintptr_t take = left > M1_CHUNK ? M1_CHUNK : left;
             m1ScanChunk(g_m1cur, take);
             g_m1cur += take; used += take;
         }
-        bool done = (g_m1ri >= g_m1rn) || (g_m1n >= M1_MAX_CAND);
-        if (done || (now - g_m1t) > (M1_STAND_SEC + 20.0)) { g_m1t = now; g_m1phase = 2; }
+        bool done = (g_m1ri >= g_m1rn);
+        if (done) { g_m1t = now; g_m1phase = 2; }   // B5：扫完才开始计 4 秒
         return;
     }
-    if (g_m1phase == 2) {
-        if ((now - g_m1t) >= M1_WALK_SEC) { m1Compare(); g_m1phase = 3; }
+    if (g_m1phase == 2) {                      // STAND 4 秒（原地别动）
+        if ((now - g_m1t) >= M1_STAND_SEC) { m1PruneStable(); g_m1t = now; g_m1phase = 3; }
         return;
     }
-    if (g_m1phase == 3 && (now - g_m1t) > 60.0) { g_m1phase = 0; }   // 一分钟后自动重来
+    if (g_m1phase == 3) {                      // WALK 10 秒
+        if ((now - g_m1t) >= M1_WALK_SEC) { m1CompareWalk(); g_m1t = now; g_m1phase = 4; }
+        return;
+    }
+    // B4：phase 4 冻结 —— 绝不自动重来。走完 10 秒再去拍照，撞上第二轮 SCAN 会看到 hit=0 而误判。
+    // 需要重测就重启游戏（或下一版加手势）。
 }
+
 static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     if (!dl) return;
     ImFont *f = ImGui::GetFont();
@@ -6097,7 +6161,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v113 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v114 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6811,7 +6875,7 @@ static void updateHud(void) {
         // v112r7：收成两行，但**必须**把 P0 那行留住 —— 本包的 ImGui 菜单打不开（g_menuOpen 只在
         // 菜单内部的按钮里切换），drawFixedPanel 永远画不出来，UILabel HUD 是唯一看得见的地方。
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v113 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v114 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100,
@@ -6822,7 +6886,7 @@ static void updateHud(void) {
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v113 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v114 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -6859,16 +6923,28 @@ static void updateHud(void) {
             [s appendFormat:@"E%d --\n", i];
         }
     }
-    // ---- M1：位置节点扫描器（native 层，纯读；判据=自己走动时它跟着变）----
+    // ---- M1：位置节点扫描器（native 层，纯读）----
+    // 判据（评审 B3）：HIT==1 才算通过 —— 站立期 24 字节零变化 + 10 秒位移落在 2~12 m/s。
     {
-        const char *ph = (g_m1phase == 1) ? "STAND" : (g_m1phase == 2) ? "WALK" :
-                         (g_m1phase == 3) ? "DONE"  : "IDLE";
-        [s appendFormat:@"M1 %s cand=%d scan=%.1fMB moved=%d rng=%d\n",
-            ph, g_m1n, g_m1mb, g_m1moved, g_m1rn];
+        const char *ph = (g_m1phase == 1) ? "SCAN"  : (g_m1phase == 2) ? "STAND" :
+                         (g_m1phase == 3) ? "WALK"  : (g_m1phase == 4) ? "DONE"  : "IDLE";
+        [s appendFormat:@"M1 %s cand=%d stable=%d hit=%d scan=%.1fMB rng=%d SAT=%d\n",
+            ph, g_m1n, g_m1stable, g_m1hit, g_m1mb, g_m1rn, g_m1sat];
+        if (g_m1rn == 0)
+            [s appendFormat:@"M1 NORANGE (没匹配到 UnityFramework/PxExtFFi 的 __DATA 段)\n"];
+        else if (g_m1n == 0)
+            [s appendFormat:@"M1 NOCAND (扫了 %.1fMB 但没有形状像位置节点的记录)\n", g_m1mb];
         for (int i = 0; i < g_m1topn; i++) {
-            [s appendFormat:@"M1 N%d 0x%llx i=(%d,%d,%d) d=(%d,%d)\n", i,
+            [s appendFormat:@"M1 N%d 0x%llx i=(%d,%d,%d) d=(%d,%d) L=%d\n", i,
                 (unsigned long long)g_m1top[i],
-                g_m1tv[i][0], g_m1tv[i][1], g_m1tv[i][2], g_m1td[i][0], g_m1td[i][1]];
+                g_m1tv[i][0], g_m1tv[i][1], g_m1tv[i][2],
+                g_m1td[i][0], g_m1td[i][1], g_m1tl[i]];
+        }
+        if (g_m1phase == 4) {
+            const char *v = g_m1sat ? "VOID" : (g_m1hit >= 1 ? "PASS" : "FAIL");
+            [s appendFormat:@"M1 VERDICT %s (SAT=%d hit=%d; PASS needs SAT=0 & hit>=1)\n",
+                v, g_m1sat, g_m1hit];
+            [s appendFormat:@"M1 sort=|L-45000| asc; 自己核 d=(dx,dz) 的方向\n"];
         }
     }
     // v28：这 4 行永远在第一屏，不用翻页 —— 现场「没法自主翻页」时这是唯一能拿到数据的地方
@@ -7098,7 +7174,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v113 booting";
+    l.text = @"ESP v114 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
