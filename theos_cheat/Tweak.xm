@@ -1231,7 +1231,7 @@ static void dumpStaticsOf(void *klass, const char *wantType) {
 
 // v93：反射层用到、但定义在后面的符号，先声明
 static int okptr(const void *p);
-extern void *g_linkerClass;
+static bool rd(const void *addr, void *dst, size_t n);
 
 // ======================= v93：il2cpp 反射层（按名字读，不用偏移）=======================
 static void *rfFld(void *cls, const char *name) {
@@ -1332,7 +1332,8 @@ static void rfProbe(void) {
                     void *o = NULL;
                     if (!rd((char *)dict + g_arrBase + (size_t)i * 24 + 16, &o, sizeof(o)) || !okptr(o)) continue;
                     float byName[3] = {0, 0, 0}, byOff[3] = {0, 0, 0};
-                    if (!rfF3(o, g_linkerClass, "position", byName)) continue;
+                    void *lkCls = findCls("Assets.Scripts.GameLogic", "ActorLinker");
+                    if (!lkCls || !rfF3(o, lkCls, "position", byName)) continue;
                     if (!rd((char *)o + 0x4C4, byOff, sizeof(byOff))) continue;
                     CHECK("RF LK byname=(%.1f,%.1f) byoff=(%.1f,%.1f) same=%d",
                           byName[0], byName[2], byOff[0], byOff[2],
