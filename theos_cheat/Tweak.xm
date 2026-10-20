@@ -71,6 +71,9 @@
 // ============================================================================
 
 #import <Foundation/Foundation.h>
+
+// v111：CAM/HOP 诊断日志开关（0 = 不再刷屏，日志页留给身份表）
+#define ESP_CAMLOG 0
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
@@ -1236,7 +1239,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v106 ====");
+    CHECK("==== dump v111 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1247,7 +1250,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v106 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v111 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -1736,7 +1739,7 @@ static void resolveCam(void) {
         void *mc = I2.class_get_method_from_name(g_uCamClass, "get_current", 0);
         if (mc) { void *f2 = *(void **)mc; if (f2) cur = ((void *(*)(void *))f2)(mc); }
         g_camMain = cam; g_camCur = cur;
-        CHECK("Dcam main %p cur %p", cam, cur);
+        if (ESP_CAMLOG) { CHECK("Dcam main %p cur %p", cam, cur); }
     }
     if (!cam) {
         // v30：局内 main 为 null —— 这时才用 allCameras 兜底（每 5 秒最多一次）
@@ -4620,7 +4623,7 @@ static void adoptFromAllCameras(void) {
     if (!fc || !fa) { CHECK("CAM allCameras fn null"); return; }
     int n = ((int (*)(void *))fc)(mc);
     void *arr = ((void *(*)(void *))fa)(ma);
-    CHECK("CAM all n %d arr %p", n, arr);
+    if (ESP_CAMLOG) { CHECK("CAM all n %d arr %p", n, arr); }
     if (n <= 0 || n > 32 || !arr) return;
     void *best = NULL; int bestArea = -1;
     for (int i = 0; i < n; i++) {
@@ -4641,7 +4644,7 @@ static void adoptFromAllCameras(void) {
             if (!g_miW2S) g_miW2S = I2.class_get_method_from_name(kk, "WorldToScreenPoint", 1);
             g_camPxW = camIntProp(best, "get_pixelWidth");
             g_camPxH = camIntProp(best, "get_pixelHeight");
-            CHECK("CAM pick all %p %dx%d", best, g_camPxW, g_camPxH);
+            if (ESP_CAMLOG) { CHECK("CAM pick all %p %dx%d", best, g_camPxW, g_camPxH); }
         }
     }
 }
@@ -4678,7 +4681,7 @@ static void probeViewHop(void) {
         int cnt = -1, cap = -1, m = 0;
         void *ent = NULL;
         int ok = dictLooks(t, &cnt, &ent, &cap, &m);
-        CHECK("H hop %02x p %p ok %d cnt %d cap %d m %d", hop, t, ok, cnt, cap, m);
+        if (ESP_CAMLOG) { CHECK("H hop %02x p %p ok %d cnt %d cap %d m %d", hop, t, ok, cnt, cap, m); }
         if (ok && !picked && soft < 0) soft = hop;      // 形状像 Dictionary 的，先记下来当备选
         if (ok && m && !picked) { g_viewHop = hop; picked = 1; }
     }
@@ -4999,6 +5002,7 @@ static void *g_v98MetaCls = NULL, *g_meta_fPid = NULL, *g_meta_fType = NULL, *g_
 static void *g_meta_fHost = NULL, *g_meta_fRaw = NULL, *g_meta_fMesh = NULL;   // v103
 static int   g_offHost = -1, g_offRaw = -1, g_offMesh = -1;
 static void *g_mv_fCur = NULL;
+static void *g_hk_fHeroCfg = NULL;   // v108：ActorLinker.resHeroCfgInfo
 static void *g_v98MvCls = NULL, *g_mv_fRem = NULL, *g_v98PrCls = NULL, *g_pr_fSize = NULL;
 static int   g_v98Ready = 0;
 static int   g_metaIsValue = 0;     // v99：theMeta 是否为结构体
@@ -5045,6 +5049,15 @@ static void *findClsDeep(const char *ns, const char *want) {
     return NULL;
 }
 
+static int   g_v110_curOff = -1, g_v110_remOff = -1;
+static int   g_v110_id[4], g_v110_torn[4];
+static int   g_v110_ci[4][3], g_v110_pci[4][3];
+static float g_v110_cf[4][3], g_v110_dMax[4];
+static float g_v111_d100[4], g_v111_d1k[4];
+static int   g_v111_tornRun[4];
+static int   g_v110_prN[4], g_v110_prAge[4];
+static double g_v110_tPrev[4];
+
 static void v98Init(void) {
     if (g_v98Ready == 1) return;      // 正在初始化中
     {   // v102：失败重试节流 —— 0.5 秒最多一次（findClsDeep 是全类扫描，不能每帧跑）
@@ -5071,6 +5084,11 @@ static void v98Init(void) {
     g_lk_fFn    = I2.class_get_field_from_name(lk, "lastPositionXZChangedFrameNum");
     g_lk_fRec   = I2.class_get_field_from_name(lk, "PositionRecords");
     g_lk_fMeta  = I2.class_get_field_from_name(lk, "theMeta");
+    g_hk_fHeroCfg = I2.class_get_field_from_name(lk, "resHeroCfgInfo");
+    if (g_v98MvCls && I2.field_get_offset) {
+        if (g_mv_fCur) g_v110_curOff = (int)I2.field_get_offset(g_mv_fCur);
+        if (g_mv_fRem) g_v110_remOff = (int)I2.field_get_offset(g_mv_fRem);
+    }
 
     // meta 类：从字段类型拿
     if (g_lk_fMeta && I2.field_get_type && I2.class_from_il2cpp_type) {
@@ -5363,6 +5381,26 @@ static void v104Dump(void) {
 
 
 // ======================= v105：固定 HUD 身份表 =======================
+static int g_v107_hexOk = 0, g_v107_hexId = 0;
+static int   g_v108_metaOff = -1, g_v108_metaMode = 0;   // 0未知 1内联 2引用
+static unsigned long long g_v108_metaHead = 0;
+static void *g_v108_heroCfg[4] = {0,0,0,0};
+static float g_v109_pCur[4][3];
+static int   g_v109_age[4], g_v109_pr[4], g_v109_inited = 0;
+static float g_v109_move[4];
+static float g_v109_last[4][3];
+static double g_v109_tPrev = 0;
+
+// klass 是否"可赋值"到 ActorLinker（沿父类链，最多 8 层）
+static int v108KlassOk(void *k) {
+    if (!g_linkerClass) return 0;
+    for (int i = 0; i < 8 && k; i++) {
+        if (k == g_linkerClass) return 1;
+        k = I2.class_get_parent ? I2.class_get_parent(k) : NULL;
+    }
+    return 0;
+}
+static unsigned char g_v107_hex[32];
 static int   g_v105_n = 0, g_v105_heroN = 0, g_v105_ready = 0;
 static int   g_v105_hId[4], g_v105_hCamp[4], g_v105_hLv[4];
 static float g_v105_hCur[4][3], g_v105_hRem[4][3], g_v105_hPos[4][3];
@@ -5398,6 +5436,12 @@ static void v105Scan(void) {
         else {
             void *meta = *(void **)mb;
             if (meta && okptr((uintptr_t)meta) && g_meta_fType) I2.field_get_value(meta, g_meta_fType, &ty);
+        }
+        if (ty == 0 && !g_v107_hexOk) {           // v107：抓一个英雄的 meta 原始 32 字节
+            memcpy(g_v107_hex, mb, sizeof(g_v107_hex));
+            g_v107_hexId = 0;
+            if (g_lk_fObjID) I2.field_get_value(o, g_lk_fObjID, &g_v107_hexId);
+            g_v107_hexOk = 1;
         }
         if (ty != 0) continue;
 
@@ -5450,16 +5494,20 @@ static void v106ScanHeroes(void) {
     if (lim < 0) lim = 0;
     if (lim > 4) lim = 4;
     void *mi = I2.class_get_method_from_name(g_mgrClass, "GetHeroActorByIndex", 1);
-    if (!mi) { g_v106_n = -1; return; }
+    if (!mi) {
+        void *iface = findClsDeep("Assets.Scripts.GameLogic", "IActorManager");
+        if (iface) mi = I2.class_get_method_from_name(iface, "GetHeroActorByIndex", 1);
+        if (!mi) { g_v106_n = -1; return; }              // -1 类与接口都没有
+    }
     void *fn = *(void **)mi;
-    if (!okptr((uintptr_t)fn)) { g_v106_n = -2; return; }
+    if (!okptr((uintptr_t)fn)) { g_v106_n = -2; return; }   // -2 methodPointer 无效
     if (I2.method_get_param_count && I2.method_get_param_count(mi) != 1) { g_v106_n = -3; return; }
 
     for (int i = 0; i < lim; i++) {
         void *a = ((void *(*)(void *, int, void *))fn)(g_mgr, i, mi);
         if (!a || !okptr((uintptr_t)a)) continue;
         void *k = NULL;
-        if (!rd(a, &k, sizeof(k)) || k != g_linkerClass) continue;
+        if (!rd(a, &k, sizeof(k)) || !v108KlassOk(k)) continue;
 
         int idx = g_v106_n;
         if (idx < 0 || idx > 3) break;
@@ -5476,6 +5524,23 @@ static void v106ScanHeroes(void) {
             unsigned char mb[1024];
             memset(mb, 0, sizeof(mb));
             I2.field_get_value(a, g_lk_fMeta, mb);
+            if (!g_v107_hexOk) {                       // v108：判定内联/引用后再抓 hex
+                g_v108_metaHead = 0;
+                memcpy(&g_v108_metaHead, mb, 8);
+                if (g_metaIsValue) {
+                    g_v108_metaMode = 1;               // 内联结构体
+                    memcpy(g_v107_hex, mb, sizeof(g_v107_hex));
+                } else {
+                    g_v108_metaMode = 2;               // 引用：head 就是指针
+                    void *mp = *(void **)mb;
+                    if (mp && okptr((uintptr_t)mp))
+                        rd(mp, g_v107_hex, sizeof(g_v107_hex));   // 从 meta 对象读 32 字节
+                    else
+                        memcpy(g_v107_hex, mb, sizeof(g_v107_hex));
+                }
+                g_v107_hexId = g_v106_id[idx];
+                g_v107_hexOk = 2;                      // 2 = 来自枚举器
+            }
             if (g_metaIsValue) {
                 v99IntAt(mb, g_metaTypeOff, &g_v106_ty[idx]);
                 v99IntAt(mb, g_metaCampOff, &g_v106_camp[idx]);
@@ -5487,15 +5552,161 @@ static void v106ScanHeroes(void) {
                 }
             }
         }
+        if (g_hk_fHeroCfg) {                       // v108：英雄配置（不在 meta 里）
+            void *hc = NULL;
+            I2.field_get_value(a, g_hk_fHeroCfg, &hc);
+            g_v108_heroCfg[idx] = hc;
+        }
+        // v110：cur/rem 用偏移直读 + 双读比对（防并行写撕裂）
+        g_v110_torn[idx] = 0;
+        for (int q = 0; q < 3; q++) { g_v110_ci[idx][q] = 0; g_v110_cf[idx][q] = 0; g_v106_cur[idx][q] = 0; g_v106_rem[idx][q] = 0; }
         if (g_lk_fMoveComp) {
             void *mvc = NULL;
             I2.field_get_value(a, g_lk_fMoveComp, &mvc);
             if (mvc && okptr((uintptr_t)mvc)) {
-                if (g_mv_fCur) I2.field_get_value(mvc, g_mv_fCur, g_v106_cur[idx]);
-                if (g_mv_fRem) I2.field_get_value(mvc, g_mv_fRem, g_v106_rem[idx]);
+                if (g_v110_curOff > 0) {
+                    unsigned char b1[12], b2[12];
+                    if (rd((char *)mvc + g_v110_curOff, b1, 12) && rd((char *)mvc + g_v110_curOff, b2, 12)) {
+                        if (memcmp(b1, b2, 12) != 0) g_v110_torn[idx] = 1;
+                        else {
+                            memcpy(g_v110_ci[idx], b1, 12);
+                            memcpy(g_v110_cf[idx], b1, 12);
+                            g_v106_cur[idx][0] = g_v110_cf[idx][0];
+                            g_v106_cur[idx][2] = g_v110_cf[idx][2];
+                        }
+                    }
+                } else if (g_mv_fCur) {
+                    I2.field_get_value(mvc, g_mv_fCur, g_v106_cur[idx]);
+                }
+                if (g_v110_remOff > 0) {
+                    unsigned char b3[12];
+                    if (rd((char *)mvc + g_v110_remOff, b3, 12)) memcpy(g_v106_rem[idx], b3, 12);
+                } else if (g_mv_fRem) {
+                    I2.field_get_value(mvc, g_mv_fRem, g_v106_rem[idx]);
+                }
+            }
+        }
+        // v109：PositionRecords —— 游戏自己在写的记录（最后一个点）
+        g_v109_pr[idx] = -1;
+        g_v109_last[idx][0] = g_v109_last[idx][2] = -9999;
+        if (g_lk_fRec && g_pr_fSize) {
+            void *lst = NULL;
+            I2.field_get_value(a, g_lk_fRec, &lst);
+            if (lst && okptr((uintptr_t)lst)) {
+                int n = -1;
+                I2.field_get_value(lst, g_pr_fSize, &n);
+                g_v109_pr[idx] = n;
+                void *k2 = NULL;
+                if (n > 0 && n < 4096 && rd(lst, &k2, sizeof(k2)) && k2) {
+                    void *fItems = I2.class_get_field_from_name(k2, "_items");
+                    void *items = NULL;
+                    if (fItems) I2.field_get_value(lst, fItems, &items);
+                    if (items && okptr((uintptr_t)items)) {
+                        float v[3] = {0,0,0};
+                        if (rd((char *)items + 0x20 + (size_t)(n - 1) * 12, v, sizeof(v))) {
+                            g_v109_last[idx][0] = v[0];
+                            g_v109_last[idx][2] = v[2];
+                        }
+                    }
+                }
             }
         }
         g_v106_n++;
+    }
+
+    // v110：ObjID 作 key（池复用会换 id）；用整数差分算位移
+    double nowT = CACurrentMediaTime();
+    double dt = (g_v109_tPrev > 0) ? (nowT - g_v109_tPrev) : 0.2;
+    if (dt < 0.001) return;                    // 同帧重复调用，丢弃
+    g_v109_tPrev = nowT;
+    for (int i = 0; i < 4; i++) {
+        if (i >= g_v106_n) { g_v109_age[i] = -1; g_v109_move[i] = -1; g_v110_prAge[i] = -1; continue; }
+        if (g_v110_id[i] != g_v106_id[i]) {    // 换人了：重置这一行
+            g_v110_id[i] = g_v106_id[i];
+            memcpy(g_v110_pci[i], g_v110_ci[i], sizeof(g_v110_ci[i]));
+            g_v109_age[i] = 0; g_v110_dMax[i] = 0; g_v110_tPrev[i] = nowT;
+            g_v109_move[i] = -1;
+            g_v110_prN[i] = g_v109_pr[i];
+            g_v110_prAge[i] = -1;              // v111：首帧不给 0
+            g_v111_tornRun[i] = 0;
+        } else if (g_v110_torn[i]) {
+            g_v111_tornRun[i]++;
+            g_v110_tPrev[i] = nowT;            // 撕裂样本不算 d
+        } else {
+            int dx = g_v110_ci[i][0] - g_v110_pci[i][0];
+            int dz = g_v110_ci[i][2] - g_v110_pci[i][2];
+            float len = sqrtf((float)(dx * dx + dz * dz));
+            g_v111_d100[i] = len / 100.0f;
+            g_v111_d1k[i] = len / 1000.0f;
+            float d = g_v111_d100[i];
+            g_v109_move[i] = d;
+            g_v111_tornRun[i] = 0;
+            if (d > g_v110_dMax[i]) g_v110_dMax[i] = d;
+            if (d > 0.05f) g_v109_age[i] = 0; else if (g_v109_age[i] >= 0) g_v109_age[i] += (int)(dt + 0.5);
+            memcpy(g_v110_pci[i], g_v110_ci[i], sizeof(g_v110_ci[i]));
+            g_v110_tPrev[i] = nowT;
+        }
+        // prAge：距离上次 Count 变化的时间
+        if (g_v110_prN[i] != g_v109_pr[i]) { g_v110_prN[i] = g_v109_pr[i]; g_v110_prAge[i] = 0; }
+        else if (g_v110_prAge[i] >= 0) g_v110_prAge[i] += (int)(dt + 0.5);
+    }
+    g_v109_inited = 1;
+}
+
+
+// ======================= v107：右上角固定面板（不被日志覆盖）=======================
+static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
+    if (!dl) return;
+    ImFont *f = ImGui::GetFont();
+    if (!f) return;
+    const float fs = 15.0f, lh = 18.0f;
+    const float x0 = sw * 0.50f;
+    float y = 8.0f;
+    char buf[256];
+    int lines = 2 + 4 + 4 + 2;
+    dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
+                      IM_COL32(0, 0, 0, 175), 6.0f);
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v111");
+    y += lh;
+
+    snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
+             g_v105_n, g_v105_heroN, g_v106_gHero, g_v106_n, g_v106_c1, g_v106_c2, g_v104_host,
+             g_v108_metaMode, g_v108_metaHead);
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(255, 255, 0, 255), buf);
+    y += lh;
+
+    for (int i = 0; i < 4 && i < g_v106_n; i++) {
+        snprintf(buf, sizeof(buf), "E%d id=%-5d lv=%d cI=(%d,%d,%d) cF=(%.0f,%.0f,%.0f) d=%.2f/%.3f dM=%.2f age=%d prN=%d prAge=%d T=%d%s%s",
+                 i, g_v106_id[i], g_v106_lv[i],
+                 g_v110_ci[i][0], g_v110_ci[i][1], g_v110_ci[i][2],
+                 g_v110_cf[i][0], g_v110_cf[i][1], g_v110_cf[i][2],
+                 g_v111_d100[i], g_v111_d1k[i], g_v110_dMax[i], g_v109_age[i],
+                 g_v109_pr[i], g_v110_prAge[i], g_v110_torn[i],
+                 (g_v111_tornRun[i] >= 3) ? " STALE" : "",
+                 (g_v104_host > 0 && g_v106_id[i] == g_v104_host) ? " SELF" : "");
+        dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(120, 255, 120, 255), buf);
+        y += lh;
+    }
+    for (int i = 0; i < 4 && i < g_v105_heroN; i++) {
+        snprintf(buf, sizeof(buf), "H%d id=%-6d camp=%d lv=%d cur=(%.0f,%.0f) rem=(%.0f,%.0f)",
+                 i, g_v105_hId[i], g_v105_hCamp[i], g_v105_hLv[i],
+                 g_v105_hCur[i][0], g_v105_hCur[i][2],
+                 g_v105_hRem[i][0], g_v105_hRem[i][2]);
+        dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(120, 200, 255, 255), buf);
+        y += lh;
+    }
+    if (g_v107_hexOk) {
+        for (int r = 0; r < 2; r++) {
+            int p = 0;
+            for (int k = 0; k < 16; k++)
+                p += snprintf(buf + p, sizeof(buf) - p, "%02x", g_v107_hex[r * 16 + k]);
+            snprintf(buf + p, sizeof(buf) - p, "  %s id=%d src=%s", r == 0 ? "meta+0 " : "meta+16",
+                     g_v107_hexId, g_v107_hexOk == 2 ? "enum" : "dict");
+            dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(255, 180, 120, 255), buf);
+            y += lh;
+        }
+    } else {
+        dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(255, 120, 120, 255), "meta hex: (no ty0 yet)");
     }
 }
 
@@ -5507,7 +5718,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     {   // v105：每秒扫一次英雄身份（固定 HUD 用）
         static double s_next = 0;
         double nwv = CACurrentMediaTime();
-        if (nwv >= s_next) { s_next = nwv + 1.0; v105Scan(); v106ScanHeroes(); }
+        if (nwv >= s_next) { s_next = nwv + 0.2; v105Scan(); v106ScanHeroes(); }   // v110：5Hz
     }
     // v99：启动即初始化（只做字段解析，不读任何游戏对象）
     if (!g_v98Ready) v98Init();
@@ -6117,13 +6328,13 @@ static void updateHud(void) {
     // 想看完整诊断：3 指上滑（g_hudForce）。出框失败时永远保持完整 HUD。
     if (!g_hudForce && (g_boxDrawn > 0 || g_hudWasGood)) {
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v106 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
+            @"ESP v111 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100];
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v106 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v111 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -6360,7 +6571,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v106 booting";
+    l.text = @"ESP v111 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -6400,7 +6611,7 @@ static void setupImGui(void) {
 }
 
 static void drawDiag(void) {
-    ImGui::Text("build         : v106 esp (3way)");
+    ImGui::Text("build         : v111 esp (quiet)");
     if (g_v105_ready) {
         ImGui::Text("TBL   cnt=%d ty0=%d gHero=%d c1=%d c2=%d self=%d",
                     g_v105_n, g_v105_heroN, g_v106_gHero, g_v106_c1, g_v106_c2, g_v104_host);
@@ -6482,6 +6693,7 @@ static void drawMenu(void) {
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Status", ImGuiTreeNodeFlags_DefaultOpen))
         drawDiag();
+    drawFixedPanel(dl, sw, sh);   // v107：右上角固定面板
 
     ImGui::Separator();
     drawLogPane();
