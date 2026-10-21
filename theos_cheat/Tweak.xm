@@ -1202,7 +1202,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v117 ====");
+    CHECK("==== dump v118 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1213,7 +1213,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v117 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v118 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6038,7 +6038,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v117 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v118 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6795,10 +6795,10 @@ static void runInit(void) {
 // ----------------------------------------------------------------------------
 // 关键安全点（对应审核 B1）：il2cpp 返回的类名/字段名可能落在被 mprotect 的 metadata 页
 // （v114 崩溃正是 memmove 读到 ESTCore 受保护页）。所以：
-//   ① 匹配用**指针比较**（class_from_il2cpp_type(field_type) == ddCls），不 strstr 字符串；
+//   ① v118：匹配用**字段类型名的子串 "DisplayInfo"**（覆盖 DisplayInfoData 与 DisplayInfoData[]）；
 //   ② 只有命中的少数几个名字才用 safeCopy（逐字节 vm_read，失败即 "<bad>"）转成本地缓冲再打印。
 // ============================================================================
-#define A1_MAXHIT 4
+#define A1_MAXHIT 8
 static int  g_a1Done = 0, g_a1Hits = 0, g_a1Seen = 0, g_a1Total = 0, g_a1Cls = 0;
 static int  g_a1AsmOk = 0, g_a1AsmSkip = 0, g_a1AsmOther = 0;   // 程序集：读到 / 读不到 / 不是 CSharp
 static int  g_a1Abort = 0;   // 0 未结束 / 1 缺 API / 2 assemblies 空 / 3 正常扫完
@@ -6840,6 +6840,25 @@ static int safeCopyStr(const char *src, char *dst, int cap) {
     return 0;
 }
 
+// v118b（审核 B1）：klass → 是否"类型名含 DisplayInfo" 的记忆表。
+// 探针不调 type_get_name（那个会 malloc），但每字段取 class_get_name 也是 64 万次；
+// 记忆化后降到"每个不同类型一次"，同时避免重复 strstr。
+#define A1_MEMO 4096
+static void  *g_a1MemoCls[A1_MEMO];
+static signed char g_a1MemoRes[A1_MEMO];   // 1 命中 / -1 不命中
+
+static int a1TypeIsDisplayInfo(void *ftc) {
+    if (!ftc) return 0;
+    uintptr_t h = ((uintptr_t)ftc >> 4) & (A1_MEMO - 1);
+    if (g_a1MemoCls[h] == ftc) return g_a1MemoRes[h] > 0;
+    const char *nm = real_class_get_name ? real_class_get_name(ftc)
+                                         : (I2.class_get_name ? I2.class_get_name(ftc) : NULL);
+    int hit = (nm && strstr(nm, "DisplayInfo")) ? 1 : 0;
+    g_a1MemoCls[h] = ftc;
+    g_a1MemoRes[h] = hit ? 1 : -1;
+    return hit;
+}
+
 static void v115ProbeDD(void) {
     if (g_a1Done) return;
     if (!I2.domain_get_assemblies || !I2.assembly_get_image || !I2.image_get_class_count ||
@@ -6848,33 +6867,13 @@ static void v115ProbeDD(void) {
 
     static void **asms = NULL; static size_t nasm = 0, ai = 0, ci = 0;
     static void *img = NULL;
-    static void *ddCls = NULL;
-    static const char *nss[] = { "", "Assets.Scripts.GameLogic", "Assets.Scripts.Framework",
-                                 "Assets.Scripts.Common", "Assets.Scripts.GameSystem" };
 
     if (!asms) {
         asms = (void **)I2.domain_get_assemblies(I2.domain, &nasm);
         if (!asms || !nasm) { g_a1Done = 1; g_a1Abort = 2; return; }
     }
-    // ① 先找 DisplayInfoData 类指针（找不到就报 A1 none，绝不再扫）
-    if (!ddCls) {
-        // v117：不再猜命名空间 —— 直接按**原始名字指针**在全部程序集里扫 strcmp（0 次 vm_read）。
-        // 上一版用 5 个候选命名空间去 class_from_name，全不中就 abort=0 退出（A 永远拿不到答案）。
-        for (size_t i = 0; i < nasm && !ddCls; i++) {
-            void *im = asms[i] ? I2.assembly_get_image(asms[i]) : NULL;
-            if (!im) continue;
-            int cc2 = (int)I2.image_get_class_count(im);
-            for (int k = 0; k < cc2; k++) {
-                void *kk = I2.image_get_class(im, k);
-                if (!kk) continue;
-                const char *nm2 = real_class_get_name ? real_class_get_name(kk)
-                                                      : (I2.class_get_name ? I2.class_get_name(kk) : NULL);
-                if (nm2 && strcmp(nm2, "DisplayInfoData") == 0) { ddCls = kk; break; }
-            }
-        }
-        if (!ddCls) { g_a1Abort = 4; g_a1Done = 1; return; }   // 全量扫完也没有这个类
-        g_a1Cls = 1;
-    }
+    // v118：不再先定位 DisplayInfoData 类 —— 直接按**类型名子串 "DisplayInfo"** 匹配，
+    // 这样 DisplayInfoData[]（数组）与其它 *DisplayInfo* 变体都能命中。
 
     int budget = 400;
     while (budget > 0) {
@@ -6906,11 +6905,16 @@ static void v115ProbeDD(void) {
         void *it = NULL, *f = NULL;
         while ((f = I2.class_get_fields(k, &it)) && f) {
             void *ft = I2.field_get_type(f);
-            if (!ft || I2.class_from_il2cpp_type(ft) != ddCls) continue;
+            if (!ft) continue;
+            void *ftc = I2.class_from_il2cpp_type(ft);
+            if (!a1TypeIsDisplayInfo(ftc)) continue;   // 记忆化：每类型只判一次
+            const char *tn3 = real_class_get_name ? real_class_get_name(ftc)
+                                                  : (I2.class_get_name ? I2.class_get_name(ftc) : NULL);
             if (g_a1Hits < A1_MAXHIT) {
-                char kn[96] = "?", fn[96] = "?";
+                char kn[96] = "?", fn[96] = "?", ty[96] = "?";
                 safeCopyStr(I2.class_get_name ? I2.class_get_name(k) : NULL, kn, sizeof(kn));
                 safeCopyStr(I2.field_get_name ? I2.field_get_name(f) : NULL, fn, sizeof(fn));
+                safeCopyStr(tn3, ty, sizeof(ty));
                 int isStatic = 0, cnt = -1;
                 unsigned int d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, d5 = 0, d6 = 0, d7 = 0;
                 if (I2.field_get_flags) isStatic = (I2.field_get_flags(f) & 0x0010) ? 1 : 0;
@@ -6935,7 +6939,7 @@ static void v115ProbeDD(void) {
                     }
                 }
                 snprintf(g_a1Hit[g_a1Hits], sizeof(g_a1Hit[0]),
-                         "%s.%s [%s] st=%d cnt=%d", kn, fn, g_a1ImgName, isStatic, cnt);
+                         "%s.%s [%s] t=%s st=%d cnt=%d", kn, fn, g_a1ImgName, ty, isStatic, cnt);
                 g_a1Hits++;
                 if (cnt > 0 && g_a1DumpN < 2) {
                     snprintf(g_a1Dump[g_a1DumpN], sizeof(g_a1Dump[0]),
@@ -6957,7 +6961,7 @@ static void updateHud(void) {
         // v112r7：收成两行，但**必须**把 P0 那行留住 —— 本包的 ImGui 菜单打不开（g_menuOpen 只在
         // 菜单内部的按钮里切换），drawFixedPanel 永远画不出来，UILabel HUD 是唯一看得见的地方。
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v117 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v118 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100,
@@ -6968,7 +6972,7 @@ static void updateHud(void) {
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v117 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v118 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -7240,7 +7244,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v117 booting";
+    l.text = @"ESP v118 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
