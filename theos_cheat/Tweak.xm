@@ -1219,7 +1219,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v157 ====");
+    CHECK("==== dump v158 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1230,7 +1230,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v157 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v158 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6055,7 +6055,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v157 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v158 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -8702,12 +8702,20 @@ static int a18ShapeOk(const float *p, float yRef) {
     return 1;
 }
 
+// v158：self 统一 —— rawHostId 有效就用它，否则退回 A20 的「屏幕中心最近」兜底。
+//       之前只认 rawHostId，它失效时直接 -1 → ok 永远置不上位（v157 首屏 selfv=-1 就是这原因）。
+static unsigned a18SelfIdNow(void) {
+    if (g_rawOk && g_rawHostId > 0) return (unsigned)g_rawHostId;
+    return g_a20SelfId;
+}
+
 // 自己的两个副本必须重合 —— 这是唯一一条「已知答案」的对照，用来否决假偏移
 static int a18SelfAgree(int cand) {
-    if (!(g_rawOk && g_rawHostId > 0)) return -1;
+    unsigned sid = a18SelfIdNow();
+    if (!sid) return -1;
     if (cand <= 0) return -1;
     for (int i = 0; i < g_a19N; i++) {
-        if (g_a19Id[i] != (unsigned)g_rawHostId) continue;
+        if (g_a19Id[i] != sid) continue;
         float a[3];
         float b[3];
         a[0] = 0; a[1] = 0; a[2] = 0;
@@ -9047,8 +9055,10 @@ static void a20Draw(ImDrawList *dl, float sw, float sh, float sc) {
         if (!obj || !id) continue;
         if (selfId && id == selfId) continue;
         if (camp != 0 && g_myCamp != 0 && camp == g_myCamp) continue;   // 队友不画
-        // v154：类型闸 —— g_heroType 已知时只画英雄；类型未知(0)一律照画（宁多勿漏）
-        if (g_heroType >= 0 && g_a19Type[i] != 0 && g_a19Type[i] != g_heroType) { g_a20NonHero++; continue; }
+        // v158：判据 `>= 0` → `> 0`。g_heroType 是运行时赋值的（-1=未知，0=探针选出来的类型0），
+        //       写成 `>= 0` 时 0 会被当成"已知"，把 type!=0 的真英雄全拒掉 —— v157 首屏
+        //       box=0 / nh=27 就是这么来的。改成 `> 0` 后：heroType 未就绪时闸自动失效。
+        if (g_heroType > 0 && g_a19Type[i] != 0 && g_a19Type[i] != g_heroType) { g_a20NonHero++; continue; }
         // v156：不再读 A10 的列表（列表现在是 A20 自己的），去重逻辑整段删除
         float p[3];
         p[0] = 0; p[1] = 0; p[2] = 0;
@@ -9633,7 +9643,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v157 S=%d u%d d%d on%d off%d scan%d c%d in%d pg%d src=0x%X a20=%d 3-finger UP\n"
+            @"ESP v158 S=%d u%d d%d on%d off%d scan%d c%d in%d pg%d src=0x%X a20=%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_stage, g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -9646,7 +9656,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v157 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v158 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -9662,9 +9672,9 @@ static void updateHud(void) {
         g_frozenN, g_frozenTot, g_huntRuns, (g_huntNext > 0) ? (g_huntNext - CACurrentMediaTime()) : 0.0];
     for (int i = 0; i < g_a16N; i++) [s appendFormat:@"%s\n", g_a16[i]];
     // v154：验收顺序反过来 —— A20（出框，立刻可验收）在前，A18（逻辑副本，第二台阶）在后
-    [s appendFormat:@"A20 box=%d edge=%d far=%d stale=%d seen=%d bad=%d self=%u src=0x%X nh=%d cap=%d\n",
+    [s appendFormat:@"A20 box=%d edge=%d far=%d stale=%d seen=%d bad=%d self=%u src=0x%X nh=%d cap=%d ht=%d mc=%d\n",
         g_a20Drawn, g_a20Edge, g_a20Far, g_a20Stale, g_a20Seen, g_a20Bad, g_a20Self, g_posOff,
-        g_a20NonHero, g_a20Cap];
+        g_a20NonHero, g_a20Cap, g_heroType, g_myCamp];
     for (int i = 0; i < g_a19Ln; i++) [s appendFormat:@"%s\n", g_a19L[i]];
     for (int i = 0; i < g_a17Ln; i++) [s appendFormat:@"%s\n", g_a17L[i]];
     for (int i = 0; i < g_a18Ln; i++) [s appendFormat:@"%s\n", g_a18L[i]];
@@ -9955,7 +9965,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v157 booting";
+    l.text = @"ESP v158 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
