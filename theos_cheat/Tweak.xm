@@ -1205,7 +1205,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v123 ====");
+    CHECK("==== dump v124 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1216,7 +1216,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v123 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v124 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6041,7 +6041,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v123 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v124 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -7051,15 +7051,23 @@ static void a2DumpObj(const char *tag, void *obj) {
 // B2（审核）：距离改用 g_w0（米制世界坐标）；g_selfOk 来自老 ActorLinker 路径，d=0 时不可靠。
 // B3（审核）：四元数全 0 的候选接受但**降级**（qok=0），排序时排在合格候选之后。
 // ============================================================================
-#define A3_MAX   10
+#define A3_MAX   12
 #define A3_CAND  60
 #define A3_DDSTR 60
-#define A3_NODE  600
+#define A3_NODE  2000
 
 typedef struct { float d; int qok; char s[170]; } A3CandT;
 static int   g_a3Done = 0, g_a3N = 0, g_a3CN = 0, g_a3Drop = 0, g_a3Wait = 0, g_a3Nodes = 0;
 static float g_a3sx = 0, g_a3sz = 0;   // B2：实际用于算距离的那对坐标（自证单位用）
 static int   g_a3SkipC = 0;           // B1：因严格探针不过被跳过的容器数
+static int   g_a3Zero = 0, g_a3Dup = 0, g_a3Nz = 0;   // v124：空槽 / 重复地址 / 非零位置
+static unsigned long g_a3Seen[4096];                   // v124b（审核 B3）：512 → 4096，避免哈希冲突误判已访问
+static int   a3Seen(unsigned long a) {                 // 返回 1 = 已见过
+    unsigned h = (unsigned)((a >> 4) & 4095);
+    if (g_a3Seen[h] == a) return 1;
+    g_a3Seen[h] = a;
+    return 0;
+}
 static char  g_a3[A3_MAX][170];
 static char  g_a3Msg[3][170];
 static int   g_a3MsgN = 0;
@@ -7156,16 +7164,30 @@ static void a3ScanContainer(void *obj, const char *src) {
     // 任一条严格通过（非 q0）就展开；全不过才跳过，并计入 skipc。
     {
         int okAny = 0;
+        unsigned idq[4] = {0,0,0,0}; float pq[4][3] = {{0}}; int qq[4] = {0,0,0,0};
         for (int q = 0; q < 4; q++) {
-            unsigned idq = 0; float pq[3] = {0}; int qq = 0;
-            if (a3IsDD(data + (size_t)q * A3_DDSTR, &idq, pq, &qq) && qq == 1) { okAny = 1; break; }
+            a3IsDD(data + (size_t)q * A3_DDSTR, &idq[q], pq[q], &qq[q]);
+            if (qq[q] == 1) okAny = 1;
         }
-        if (!okAny) { g_a3SkipC++; return; }
+        if (!okAny) {
+            g_a3SkipC++;
+            // v124：把"为什么被挡"逐槽打出来 —— stride 错还是元素本来就空，一屏可分
+            const char *cnS = a3ClsOf(obj);
+            char nb[40] = "?";
+            safeCopyStr(cnS, nb, sizeof(nb));
+            a3Msg("s %s n=%d e0=%u/%.0f,%.0f/q%d e1=%u/%.0f,%.0f/q%d",
+                  nb, (int)n, idq[0], pq[0][0], pq[0][2], qq[0],
+                  idq[1], pq[1][0], pq[1][2], qq[1]);
+            return;
+        }
     }
     for (int i = 0; i < n && i < 32 && g_a3CN < A3_CAND; i++) {
         void *e = (void *)(data + (size_t)i * A3_DDSTR);
         unsigned id = 0; float pos[3] = {0}; int qok = 0;
         if (!a3IsDD(e, &id, pos, &qok)) continue;
+        if (a3Seen((unsigned long)e)) { g_a3Dup++; continue; }
+        if (pos[0] == 0.0f && pos[2] == 0.0f) { g_a3Zero++; continue; }   // 空槽
+        g_a3Nz++;
         float d = a3SelfDist(pos);
         a3Cand(d, qok, "%s[%d] a=%p id=%u d=%.1f%s (%.1f,%.1f,%.1f)",
                src, i, e, id, d, qok ? "" : " q0", pos[0], pos[1], pos[2]);
@@ -7192,10 +7214,13 @@ static void a3Probe(const char *src, void *base, int hop) {
         if (!rd((char *)base + k * 8, &v, sizeof(v))) continue;
         if (!v || !okptr((uintptr_t)v)) continue;
         g_a3Nodes++;
+        if (a3Seen((unsigned long)v)) { g_a3Dup++; continue; }   // v124：同一对象多路径到达
         unsigned id = 0;
         float p[3] = {0};
         int qok = 0;
         if (a3IsDD(v, &id, p, &qok)) {
+            if (p[0] == 0.0f && p[2] == 0.0f) { g_a3Zero++; continue; }   // v124：空槽不占池
+            g_a3Nz++;
             float d = a3SelfDist(p);
             a3Cand(d, qok, "%s h%d +%d a=%p id=%u d=%.1f%s (%.1f,%.1f,%.1f)",
                    src, hop, k * 8, v, id, d, qok ? "" : " q0", p[0], p[1], p[2]);
@@ -7221,6 +7246,8 @@ static void v122DDScan(void) {
     s_lastCnt = g_cntRaw;
     g_a3Done = 1; g_a3Wait = 0;
     g_a3N = 0; g_a3CN = 0; g_a3Drop = 0; g_a3MsgN = 0; g_a3Nodes = 0; g_a3SkipC = 0;
+    g_a3Zero = 0; g_a3Dup = 0; g_a3Nz = 0;
+    for (int i = 0; i < 4096; i++) g_a3Seen[i] = 0;
 
     if (g_lastEntries) {
         for (int i = 0; i < 32 && g_a3CN < A3_CAND && g_a3Nodes < A3_NODE; i++) {
@@ -7250,14 +7277,16 @@ static void v122DDScan(void) {
         }
         g_a3c[j + 1] = t;
     }
-    for (int i = 0; i < g_a3CN && g_a3N < A3_MAX - 1; i++)
+    // v124b（审核 B1/B4）：候选 ≤6、跳过诊断 ≤2、统计 1 行
+    for (int i = 0; i < g_a3CN && i < 6; i++)
         snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "%s", g_a3c[i].s);
     if (g_a3N == 0 && g_a3CN == 0) a3Msg("g A3 none");
-    for (int i = 0; i < g_a3MsgN && g_a3N < A3_MAX - 1; i++)
+    for (int i = 0; i < g_a3MsgN && i < 2; i++)
         snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "%s", g_a3Msg[i]);
+    if (g_a3MsgN > 2) snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "s +%d more", g_a3MsgN - 2);
     snprintf(g_a3[g_a3N++], sizeof(g_a3[0]),
-             "drop=%d pool=%d nodes=%d skipc=%d self=%d sx=%.0f sz=%.0f",
-             g_a3Drop, g_a3CN, g_a3Nodes, g_a3SkipC,
+             "pool=%d nz=%d zero=%d dup=%d skipc=%d nodes=%d self=%d %.0f/%.0f",
+             g_a3CN, g_a3Nz, g_a3Zero, g_a3Dup, g_a3SkipC, g_a3Nodes,
              (g_selfOk || g_w0[0] != 0.0f) ? 1 : 0, g_a3sx, g_a3sz);
 }
 static void v119FrameGraph(void) {
@@ -7428,7 +7457,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v123 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v124 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -7440,16 +7469,15 @@ static void updateHud(void) {
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v123 BC=%d dn=%d\n", g_bc, g_dumpN];
+    // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
+    [s appendFormat:@"ESP v124 R=%d CAP=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+        g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
-    [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
-        g_imgCount, g_clsScanned, g_found, g_unitCount, g_cntRaw, g_arrBase, g_posOk, g_inMatch,
-        g_camCallState, g_boxDrawn, g_il2cppOk ? "" : " WAIT"];
-    [s appendFormat:@"il2cpp %@ present %@ mx %@\n",
-        g_il2cppOk ? @"OK" : @"FAIL",
-        g_presentOn ? @"OK" : @"FAIL",
-        g_vpReady ? @"OK" : @"todo"];
+    [s appendFormat:@"imgs %d cls %zu hits %d il2cpp %@ present %@ mx %@%s\n",
+        g_imgCount, g_clsScanned, g_found,
+        g_il2cppOk ? @"OK" : @"FAIL", g_presentOn ? @"OK" : @"FAIL", g_vpReady ? @"OK" : @"todo",
+        g_il2cppOk ? "" : " WAIT"];
     // v112r7：P0 与两个槽位的核心数字直接拼进 UILabel HUD（旧 HUD 是本包唯一**真的会显示**的面板）。
     // 位置：紧跟 il2cpp 诊断行，所以第 1 页就能看到，不用翻页。
     if (g_v110_curOff <= 0) {
@@ -7461,21 +7489,23 @@ static void updateHud(void) {
             g_v112_gone[0] + g_v112_gone[1] + g_v112_gone[2] + g_v112_gone[3],
             g_v106_n, g_v106_src, g_v106_err, g_v110_curOff];
     }
-    for (int i = 0; i < 4; i++) {
-        if (i < g_v106_n) {
-            int ri[3] = {0, 0, 0};
-            memcpy(ri, g_v106_rem[i], sizeof(ri));
-            [s appendFormat:@"E%d id=%d lv=%d c=(%d,%d) R=(%d,%d) d=%.2f rd=%.2f age=%d rage=%d%s%s\n",
-                i, g_v106_id[i], g_v106_lv[i],
-                g_v110_ci[i][0], g_v110_ci[i][2], ri[0], ri[2],
-                g_v111_d100[i], g_v112_remD[i], g_v109_age[i], g_v112_remAge[i],
-                g_v112_remTorn[i] ? " RT" : "",
-                (g_v104_host > 0 && g_v106_id[i] == g_v104_host) ? " SELF" : ""];
-        } else if (g_v110_id[i] != 0) {
-            [s appendFormat:@"E%d GONE=%d id=%d last\n", i, g_v112_gone[i], g_v110_id[i]];
-        } else {
-            [s appendFormat:@"E%d --\n", i];
+    // v124b（审核 B1）：E 行合并 —— 4 行 "--" 换成 1 行，把行留给 A3 / W0
+    {
+        NSMutableString *e = [NSMutableString stringWithString:@"E "];
+        for (int i = 0; i < 4; i++) {
+            if (i < g_v106_n) {
+                int ri[3] = {0,0,0};
+                memcpy(ri, g_v106_rem[i], sizeof(ri));
+                (void)ri;
+                [e appendFormat:@"%d:(%d,%d)", i, g_v110_ci[i][0], g_v110_ci[i][2]];
+            } else if (g_v110_id[i] != 0) {
+                [e appendFormat:@"%d:G%d", i, g_v112_gone[i]];
+            } else {
+                [e appendFormat:@"%d:-", i];
+            }
+            if (i < 3) [e appendString:@","];
         }
+        [s appendFormat:@"%@\n", e];
     }
     // ---- v115：连续运行/崩溃计数 + 路径 A 探针进度 ----
     [s appendFormat:@"RUN %ds crash=%d names_bad=%d  A1 abort=%d seen=%d/%d hits=%d asm ok=%d skip=%d other=%d%s\n",
@@ -7488,15 +7518,20 @@ static void updateHud(void) {
     } else if (g_a3Wait) {
         [s appendFormat:@"A3 wait cnt=%d fs=%d\n", g_cntRaw, g_il2cppOk ? 1 : 0];
     }
-    for (int i = 0; i < g_a1Hits && i < 3; i++) [s appendFormat:@"A1 %s\n", g_a1Hit[i]];
-    for (int i = 0; i < g_a2N; i++) {
-        const char *ln = g_a2[i];
-        if (strstr(ln, "fs=") || strstr(ln, "displayInfoDatas") || strstr(ln, "position"))
-            [s appendFormat:@"A2 %s\n", ln];
+    // v124b（审核 B1）：A1 只留 1 行 —— abort/seen/hits 已在 RUN 行，命中明细已定案
+    if (g_a1Hits > 0) [s appendFormat:@"A1 hits=%d (detail off)\n", g_a1Hits];
+    {
+        int shown2 = 2;   // v124b：A2 不再占行（fs/position/off 已定案，结论在 A1/A3）
+        for (int i = 0; i < g_a2N && shown2 < 2; i++) {
+            const char *ln = g_a2[i];
+            if (strstr(ln, "fs=") || strstr(ln, "displayInfoDatas") || strstr(ln, "position")) {
+                [s appendFormat:@"A2 %s\n", ln];
+                shown2++;
+            }
+        }
     }
 
     // v28：这 4 行永远在第一屏，不用翻页 —— 现场「没法自主翻页」时这是唯一能拿到数据的地方
-    [s appendFormat:@"R %d CAP %d ENT %p\n", g_cntRaw, g_capNow, g_entPtr];
     [s appendFormat:@"D %08x %08x %08x %08x %08x %08x %08x %08x\n", g_dw[0], g_dw[1], g_dw[2], g_dw[3], g_dw[4], g_dw[5], g_dw[6], g_dw[7]];
     [s appendFormat:@"M %08x %08x %08x %08x %08x %08x %08x %08x\n", g_mw[0], g_mw[1], g_mw[2], g_mw[3], g_mw[4], g_mw[5], g_mw[6], g_mw[7]];
     [s appendFormat:@"W0 %.0f %.0f %.0f MAIN %p CUR %p\n",
@@ -7722,7 +7757,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v123 booting";
+    l.text = @"ESP v124 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
