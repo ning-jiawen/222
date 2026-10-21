@@ -7141,6 +7141,20 @@ static int a3IsDD(void *p, unsigned *outId, float *outPos, int *outQok) {
     return 1;
 }
 
+// v124c（崩溃修复）：类名一律先拷进本地缓冲再 strstr。
+// 崩溃现场：SIGSEGV at 0x11，_platform_strstr ← a3Probe ← a3ClsOf 的原始名字指针。
+// 说明"klass 看起来合法"并不代表 class_get_name 返回的是有效字符串。
+static int a3ClsNameSafe(void *obj, char *out, int cap) {
+    if (!out || cap < 2) return 0;
+    out[0] = 0;
+    void *k = NULL;
+    if (!obj || !rd(obj, &k, sizeof(k)) || !k || !okptr((uintptr_t)k)) return 0;
+    const char *nm = real_class_get_name ? real_class_get_name(k)
+                                         : (I2.class_get_name ? I2.class_get_name(k) : NULL);
+    if (!nm) return 0;
+    return safeCopyStr(nm, out, cap);
+}
+
 static const char *a3ClsOf(void *obj) {
     void *k = NULL;
     if (!obj || !rd(obj, &k, sizeof(k)) || !k || !okptr((uintptr_t)k)) return NULL;
@@ -7172,9 +7186,8 @@ static void a3ScanContainer(void *obj, const char *src) {
         if (!okAny) {
             g_a3SkipC++;
             // v124：把"为什么被挡"逐槽打出来 —— stride 错还是元素本来就空，一屏可分
-            const char *cnS = a3ClsOf(obj);
             char nb[40] = "?";
-            safeCopyStr(cnS, nb, sizeof(nb));
+            a3ClsNameSafe(obj, nb, sizeof(nb));
             a3Msg("s %s n=%d e0=%u/%.0f,%.0f/q%d e1=%u/%.0f,%.0f/q%d",
                   nb, (int)n, idq[0], pq[0][0], pq[0][2], qq[0],
                   idq[1], pq[1][0], pq[1][2], qq[1]);
@@ -7226,10 +7239,11 @@ static void a3Probe(const char *src, void *base, int hop) {
                    src, hop, k * 8, v, id, d, qok ? "" : " q0", p[0], p[1], p[2]);
             continue;
         }
-        const char *cn = a3ClsOf(v);
-        if (cn && (strstr(cn, "List") || strstr(cn, "[]") || strstr(cn, "Queue") || strstr(cn, "HashSet")))
+        char cnb[64] = "";
+        if (!a3ClsNameSafe(v, cnb, sizeof(cnb))) continue;   // 读不到类名就跳过（不 strstr 原始指针）
+        if (strstr(cnb, "List") || strstr(cnb, "[]") || strstr(cnb, "Queue") || strstr(cnb, "HashSet"))
             a3ScanContainer(v, src);        // B1：容器就地展开
-        if (hop < 4 && a3Traversable(cn)) a3Probe(src, v, hop + 1);
+        if (hop < 4 && a3Traversable(cnb)) a3Probe(src, v, hop + 1);
     }
 }
 
@@ -7470,7 +7484,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v124 R=%d CAP=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v124 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
