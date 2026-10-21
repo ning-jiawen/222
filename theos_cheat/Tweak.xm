@@ -1205,7 +1205,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v134 ====");
+    CHECK("==== dump v135 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1216,7 +1216,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v134 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v135 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6041,7 +6041,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v134 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v135 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6145,6 +6145,7 @@ static void v129WorldScan(void);    // v129：世界量级扫描 + 投影验证
 static void v130StructScan(void);   // v130：ActorLinker 1-2 跳 int32 三值扫描
 static void v131GetPos(void);       // v131：直接调 get_Position 等 getter
 static void v132PosProj(void);      // v132：get_Position 投影自证 + 反查字段偏移
+static void v135Diff(void);         // v135：差分扫描，找视野外仍在更新的偏移
 
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v115：M1 扫描关闭（v114 因 SAT=1 被 VOID，本版只回答路径 A）
@@ -6158,6 +6159,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // if (g_il2cppOk) v130StructScan();
     // if (g_il2cppOk) v131GetPos();   // v131：已被 v132 取代（getter 只作校准）
     if (g_il2cppOk) v132PosProj();    // v132：投影自证 + P 反查偏移
+    if (g_il2cppOk) v135Diff();       // v135：差分扫描（找逻辑真值）
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
@@ -8019,6 +8021,145 @@ static void drawBoxesAll(ImDrawList *dl, float sw, float sh) {
 
 
 
+// ============================================================================
+// v135 · A11：差分扫描 —— 找出"无视野时仍在更新"的偏移
+//   已确认事实：+0x4C4（= get_Position）在敌人离开视野后**冻结**，是 view 层。
+//   做法：盯一个 camp==2 的敌人，每 2 秒把 actor 本体的 float 全量与上次比对，
+//         打印"发生变化的偏移"。视野外 0x4C4 不动、而某条偏移仍在动 → 那就是逻辑真值。
+// ============================================================================
+#define A11_LINES 10
+#define A11_MAXF  2048
+#define A11_PXN   4
+#define A11_PXF   256
+typedef struct { char src[20]; int off; float ov, nv, d; } A11C;
+static char  g_a11[A11_LINES][200];
+static int   g_a11N = 0;
+static float g_a11prev[A11_MAXF];
+static int   g_a11prevN = 0, g_a11Valid = 0, g_a11Frozen = 0;
+static unsigned g_a11id = 0;
+static float g_a11px[A11_PXN][A11_PXF];
+static void *g_a11pxObj[A11_PXN];
+static int   g_a11pxN = 0;
+static A11C  g_a11c[24];
+static int   g_a11cN = 0;
+
+// v135b（审核 B1）：合理性过滤 —— 排除指针/整数跳变与头部噪声
+static void a11Push(const char *src, int off, float ov, float nv) {
+    float d = nv - ov;
+    if (!(fabsf(d) > 0.05f && fabsf(d) < 200.0f)) return;
+    if (fabsf(ov) > 2000.0f || fabsf(nv) > 2000.0f) return;
+    if (g_a11cN >= 24) return;
+    snprintf(g_a11c[g_a11cN].src, sizeof(g_a11c[g_a11cN].src), "%s", src ? src : "?");
+    g_a11c[g_a11cN].off = off; g_a11c[g_a11cN].ov = ov;
+    g_a11c[g_a11cN].nv = nv;   g_a11c[g_a11cN].d = d;
+    g_a11cN++;
+}
+
+static void v135Diff(void) {
+    if (!g_a1Done || !g_inMatch || !g_lastEntries || g_lastCnt <= 0) return;
+    static double s11Next = 0;
+    static int    s11Valid = 0;
+    double now11 = CACurrentMediaTime();
+    if (s11Valid && now11 < s11Next) return;
+    s11Next = now11 + 2.0;
+    s11Valid = 1;
+    g_a11N = 0; g_a11cN = 0;
+
+    void *tgt = NULL; unsigned tid = 0;
+    int total = g_lastCnt > 200 ? 200 : g_lastCnt;
+    for (int i = 0; i < total && !tgt; i++) {
+        void *v = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        void *k = NULL;
+        if (!rd(v, &k, sizeof(k)) || !k || k != g_linkerClass) continue;
+        unsigned id = 0;
+        if (!rd((char *)v + 0x4AC, &id, 4) || !id) continue;
+        unsigned char c8 = 0; rd((char *)v + 0x504, &c8, 1);
+        if (c8 != 2) continue;
+        if (g_a11id && id != g_a11id) continue;
+        tgt = v; tid = id;
+    }
+    if (!tgt) { snprintf(g_a11[g_a11N++], sizeof(g_a11[0]), "A11 no enemy"); return; }
+    if (tid != g_a11id) { g_a11id = tid; g_a11Valid = 0; g_a11prevN = 0; g_a11pxN = 0; }
+    int sz = (I2.class_instance_size && g_linkerClass) ? (int)I2.class_instance_size(g_linkerClass) : 0;
+    if (sz <= 0 || sz > 0x4000) sz = 0x2000;
+    int nf = sz / 4; if (nf > A11_MAXF) nf = A11_MAXF;
+
+    float p4[3] = {0, 0, 0};
+    rd((char *)tgt + 0x4C4, p4, sizeof(p4));
+
+    // 收集 1 跳代理（最多 4 个）
+    void *pxObj[A11_PXN]; int pxNum = 0;
+    {
+        void *it = NULL, *f = NULL; int gidx = 0;
+        while (I2.class_get_fields && (f = I2.class_get_fields(g_linkerClass, &it)) && f && gidx++ < 24 && pxNum < A11_PXN) {
+            int off = I2.field_get_offset ? (int)I2.field_get_offset(f) : -1;
+            if (off < 0) continue;
+            void *pv = NULL;
+            if (!rd((char *)tgt + off, &pv, sizeof(pv)) || !pv || !okptr((uintptr_t)pv)) continue;
+            void *pk = NULL;
+            if (!rd(pv, &pk, sizeof(pk)) || !pk || !okptr((uintptr_t)pk)) continue;
+            pxObj[pxNum++] = pv;
+        }
+    }
+
+    if (!g_a11Valid) {
+        for (int i = 0; i < nf; i++) { float fv = 0; rd((char *)tgt + i * 4, &fv, 4); g_a11prev[i] = fv; }
+        g_a11prevN = nf;
+        for (int q = 0; q < pxNum; q++) {
+            g_a11pxObj[q] = pxObj[q];
+            for (int i = 0; i < A11_PXF; i++) { float fv = 0; rd((char *)pxObj[q] + 0x100 + i * 4, &fv, 4); g_a11px[q][i] = fv; }
+        }
+        g_a11pxN = pxNum;
+        g_a11Valid = 1; g_a11Frozen = 0;
+        snprintf(g_a11[g_a11N++], sizeof(g_a11[0]), "A11 id=%u init size=%d px=%d p4=%.2f,%.2f", tid, sz, pxNum, p4[0], p4[2]);
+        return;
+    }
+
+    // 本体差分（跳过 0x0–0xFF 的状态机/计时器噪声）
+    int moved = 0;
+    for (int i = 0x100 / 4; i < nf && i < g_a11prevN; i++) {
+        float fv = 0;
+        if (!rd((char *)tgt + i * 4, &fv, 4)) continue;
+        float d = fv - g_a11prev[i];
+        if (!(fabsf(d) > 0.05f)) continue;
+        moved++;
+        a11Push("self", i * 4, g_a11prev[i], fv);
+    }
+    // 1 跳差分（0x100…0x400）
+    for (int q = 0; q < g_a11pxN && q < pxNum; q++) {
+        if (g_a11pxObj[q] != pxObj[q]) continue;
+        for (int i = 0; i < A11_PXF; i++) {
+            float fv = 0;
+            if (!rd((char *)pxObj[q] + 0x100 + i * 4, &fv, 4)) continue;
+            float d = fv - g_a11px[q][i];
+            if (!(fabsf(d) > 0.05f)) continue;
+            moved++;
+            char tag[20];
+            snprintf(tag, sizeof(tag), "px%d", q);
+            a11Push(tag, 0x100 + i * 4, g_a11px[q][i], fv);
+            g_a11px[q][i] = fv;
+        }
+    }
+
+    int p4frozen = (fabsf(p4[0] - g_a11prev[0x4C4 / 4]) < 0.001f &&
+                    fabsf(p4[2] - g_a11prev[0x4C4 / 4 + 2]) < 0.001f);
+    g_a11Frozen = p4frozen ? g_a11Frozen + 1 : 0;
+    for (int i = 0; i < nf; i++) { float fv = 0; if (rd((char *)tgt + i * 4, &fv, 4)) g_a11prev[i] = fv; }
+
+    // v135b（审核 B1）：按变化量降序取前 6 —— 位置变化量通常明显大于状态量
+    for (int i = 1; i < g_a11cN; i++) {
+        A11C t = g_a11c[i]; float tw = fabsf(t.d); int j = i - 1;
+        while (j >= 0 && fabsf(g_a11c[j].d) < tw) { g_a11c[j + 1] = g_a11c[j]; j--; }
+        g_a11c[j + 1] = t;
+    }
+    for (int i = 0; i < g_a11cN && i < 6 && g_a11N < A11_LINES - 1; i++)
+        snprintf(g_a11[g_a11N++], sizeof(g_a11[0]), "A11 chg src=%s off=0x%X %.2f->%.2f",
+                 g_a11c[i].src, g_a11c[i].off, g_a11c[i].ov, g_a11c[i].nv);
+    snprintf(g_a11[g_a11N++], sizeof(g_a11[0]), "A11 id=%u moved=%d fz=%d p4=%.2f,%.2f px=%d",
+             tid, moved, g_a11Frozen, p4[0], p4[2], g_a11pxN);
+}
+
 static void v132PosProj(void) {
     if (!g_a1Done || !g_inMatch || !g_lastEntries || g_lastCnt <= 0) return;
     if (!g_camObj || !g_miW2S) return;
@@ -8422,7 +8563,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v134 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v135 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -8435,7 +8576,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v134 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v135 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -8489,6 +8630,7 @@ static void updateHud(void) {
     for (int i = 0; i < g_a5N; i++) [s appendFormat:@"%s\n", g_a5[i]];
     for (int i = 0; i < g_a6N; i++) [s appendFormat:@"%s\n", g_a6[i]];
     for (int i = 0; i < g_a9N; i++) [s appendFormat:@"%s\n", g_a9[i]];
+    for (int i = 0; i < g_a11N; i++) [s appendFormat:@"%s\n", g_a11[i]];
     [s appendFormat:@"A10 d=%d sc=%.2f sk=%d/%d/%d/%d px=%d\n", g_a10Drawn,
         (g_camPxW > 0 && g_scrW > 1.0f) ? ((float)g_camPxW / g_scrW) : 0.0f,
         g_a10Skip[0], g_a10Skip[1], g_a10Skip[2], g_a10Skip[3], g_camPxW];
@@ -8731,7 +8873,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v134 booting";
+    l.text = @"ESP v135 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
