@@ -257,7 +257,9 @@ static int scanActors(void) {
     g_actN = 0;
     if (!g_linkerClass) return 0;
 
-    mach_vm_address_t addr = 0x10000000ULL;
+    // vm_region_64 的第二/三个参数是 vm_address_t* / vm_size_t*（不是 mach_vm_*），
+    // 传 mach_vm_address_t* 会报 "no matching function"。
+    vm_address_t addr = (vm_address_t)0x10000000ULL;
     int found = 0;
     unsigned total = 0;
     double t0 = CFAbsoluteTimeGetCurrent();
@@ -265,11 +267,11 @@ static int scanActors(void) {
     uint8_t *buf = (uint8_t *)malloc(chunk);
     if (!buf) return 0;
 
-    mach_vm_address_t limit = 0x10000000ULL + (mach_vm_address_t)GATE_SCAN_MB * 1024ULL * 1024ULL;
+    vm_address_t limit = (vm_address_t)(0x10000000ULL + (unsigned long long)GATE_SCAN_MB * 1024ULL * 1024ULL);
 
     // 全区间扫描 + 轮转采样：不因为"前 N 个"就提前停（否则可能全是小兵/塔）
     while (addr < limit) {
-        mach_vm_size_t sz = 0;
+        vm_size_t sz = 0;
         // iOS SDK 没有 VM_REGION_SUBMAP_INFO_64，vm_region_basic_info_data_64_t 也没有
         // is_submap 成员（v147 踩过）。这里只用 basic-info，非 RW 区由 protection 过滤掉。
         vm_region_basic_info_data_64_t ri;
@@ -280,11 +282,11 @@ static int scanActors(void) {
         int rw = (ri.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE);
         if (!rw || sz < 4096) { addr += sz; continue; }
 
-        for (mach_vm_size_t off = 0; off + 8 <= sz; off += chunk) {
-            mach_vm_size_t len = sz - off;
-            if (len > chunk) len = chunk;
+        for (vm_size_t off = 0; off + 8 <= sz; off += chunk) {
+            vm_size_t len = (vm_size_t)(sz - off);
+            if (len > chunk) len = (vm_size_t)chunk;
             vm_size_t got = 0;
-            if (vm_read_overwrite(mach_task_self(), addr + off, (vm_size_t)len,
+            if (vm_read_overwrite(mach_task_self(), (vm_address_t)(addr + off), len,
                                   (vm_address_t)buf, &got) != KERN_SUCCESS) break;
             uintptr_t *sl = (uintptr_t *)buf;
             size_t n = (size_t)got / sizeof(uintptr_t);
