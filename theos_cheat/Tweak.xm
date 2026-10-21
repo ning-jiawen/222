@@ -22,6 +22,7 @@
 #import <AVFoundation/AVFoundation.h>
 #include <dispatch/dispatch.h>
 #include <mach/mach.h>
+#include <mach/vm_map.h>
 #include <mach/vm_region.h>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -244,8 +245,8 @@ static void dumpFields(void *klass, const char *tag) {
 // ============================================================================
 // S2  actor 扫描（不依赖字典：直接找 klass == ActorLinker 的对象头）
 // ============================================================================
-#define GATE_MAXOBJ   16
-#define GATE_SCAN_MB  768
+#define GATE_MAXOBJ   24
+#define GATE_SCAN_MB  1536
 
 static void     *g_linkerClass = NULL;
 static uintptr_t g_act[GATE_MAXOBJ];
@@ -258,20 +259,24 @@ static int scanActors(void) {
 
     mach_vm_address_t addr = 0x10000000ULL;
     int found = 0;
+    unsigned total = 0;
+    double t0 = CFAbsoluteTimeGetCurrent();
     size_t chunk = 4u << 20;
     uint8_t *buf = (uint8_t *)malloc(chunk);
     if (!buf) return 0;
 
     mach_vm_address_t limit = 0x10000000ULL + (mach_vm_address_t)GATE_SCAN_MB * 1024ULL * 1024ULL;
 
-    while (addr < limit && g_actN < GATE_MAXOBJ) {
+    // 全区间扫描 + 轮转采样：不因为"前 N 个"就提前停（否则可能全是小兵/塔）
+    while (addr < limit) {
         mach_vm_size_t sz = 0;
-        unsigned int depth = 0;
-        vm_region_submap_info_data_64_t ri;
-        mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
-        if (vm_region_64(mach_task_self(), &addr, &sz, VM_REGION_SUBMAP_INFO_64,
+        // iOS SDK 没有 VM_REGION_SUBMAP_INFO_64，vm_region_basic_info_data_64_t 也没有
+        // is_submap 成员（v147 踩过）。这里只用 basic-info，非 RW 区由 protection 过滤掉。
+        vm_region_basic_info_data_64_t ri;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        if (vm_region_64(mach_task_self(), &addr, &sz, VM_REGION_BASIC_INFO_64,
                          (vm_region_info_t)&ri, &cnt, NULL) != KERN_SUCCESS) break;
-        if (ri.is_submap) { addr += sz; continue; }
+        if (sz == 0) break;                       // 防死循环
         int rw = (ri.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE);
         if (!rw || sz < 4096) { addr += sz; continue; }
 
@@ -292,15 +297,28 @@ static int scanActors(void) {
                 int dup = 0;
                 for (int q = 0; q < found; q++) if (g_act[q] == o) { dup = 1; break; }
                 if (dup) continue;
-                g_act[found] = o; g_actId[found] = aid; found++;
-                if (found >= GATE_MAXOBJ) break;
+                if (found < GATE_MAXOBJ) {
+                    g_act[found] = o; g_actId[found] = aid; found++;
+                } else {
+                    int slot = (int)(total % (unsigned)GATE_MAXOBJ);   // 轮转覆盖，样本分散
+                    g_act[slot] = o; g_actId[slot] = aid;
+                }
+                total++;
             }
-            if (found >= GATE_MAXOBJ) break;
         }
         addr += sz;
     }
     free(buf);
-    g_actN = found;
+
+    // 轮转覆盖可能留下重复，收尾去重
+    int w = 0;
+    for (int i = 0; i < found; i++) {
+        int dup = 0;
+        for (int j = 0; j < w; j++) if (g_act[j] == g_act[i]) { dup = 1; break; }
+        if (!dup) { g_act[w] = g_act[i]; g_actId[w] = g_actId[i]; w++; }
+    }
+    g_actN = w;
+    GL("scan: %u matches, kept %d, %.1fs", total, g_actN, CFAbsoluteTimeGetCurrent() - t0);
     return g_actN;
 }
 
