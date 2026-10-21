@@ -1219,7 +1219,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v158 ====");
+    CHECK("==== dump v159 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1230,7 +1230,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v158 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v159 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6055,7 +6055,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v158 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v159 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -8405,6 +8405,8 @@ static int       g_a18Tot[A18_MAXCAND];
 static float     g_a18Dx[A18_MAXCAND];
 static float     g_a18Pv[A18_MAXCAND][A19_MAXOBJ][3];
 static float     g_a18Live[A19_MAXOBJ][3];
+static uintptr_t g_a18Key[A19_MAXOBJ];   // v159：槽位绑定的对象指针（列表会重排，不能按下标认人）
+static int       g_a18Rekey = 0;         // v159：本拍重绑了几个槽
 static int       g_a18Seed = 0;
 static int       g_a18Runs = 0;
 static int       g_a18Frozen = 0;
@@ -8438,6 +8440,7 @@ static int       g_a20Stale = 0;
 static int       g_a20Bad = 0;
 static int       g_a20Seen = 0;
 static int       g_a20NonHero = 0;
+static int       g_a20Rot = 0;         // v159：本帧列表起点（轮转，防止尾部单位永远轮不到）
 static int       g_a20Cap = 0;         // v154：被每帧预算挡掉的数
 static int       g_a20SelfScan = 0;    // v154：自动找 self 的倒计时（帧）
 static uintptr_t g_a20SelfObj = 0;
@@ -8780,6 +8783,7 @@ static void a18Step(void) {
 
     int frozenIdx[A19_MAXOBJ];
     int frozenN = 0;
+    g_a18Rekey = 0;
     float live[A19_MAXOBJ][3];
     int vok[A19_MAXOBJ];
     for (int i = 0; i < n; i++) {
@@ -8791,6 +8795,22 @@ static void a18Step(void) {
         if (!isfinite(p[0]) || !isfinite(p[2])) continue;
         vok[i] = 1;
         live[i][0] = p[0]; live[i][1] = p[1]; live[i][2] = p[2];
+        // v159：a19Enum 每 5s 会按 (camp/lv/type/id) 重排列表 ⇒ 下标不再代表同一个对象。
+        //       槽位换了对象就重播该槽的基线，本拍不参与 frozen 判定（否则全是错位噪声）。
+        if (g_a18Key[i] != g_a19[i]) {
+            g_a18Key[i] = g_a19[i];
+            g_a18Rekey++;
+            for (int c = 0; c < g_a18CandN; c++) {
+                float qq[3];
+                qq[0] = 0; qq[1] = 0; qq[2] = 0;
+                if (rd((void *)(g_a19[i] + (uintptr_t)g_a18Cand[c]), qq, 12)) {
+                    g_a18Pv[c][i][0] = qq[0];
+                    g_a18Pv[c][i][1] = qq[1];
+                    g_a18Pv[c][i][2] = qq[2];
+                }
+            }
+            continue;
+        }
         if (g_a18Seed) {
             float d = fabsf(p[0] - g_a18Live[i][0]) + fabsf(p[2] - g_a18Live[i][2]);
             if (d < 0.01f) frozenIdx[frozenN++] = i;
@@ -8884,9 +8904,14 @@ static void a18Step(void) {
     if (wmv >= 2 && wbest == g_a18wLast) g_a18wStreak++;
     else { g_a18wLast = wbest; g_a18wStreak = (wmv >= 2) ? 1 : 0; }
     g_a18Scan = frozenN;
-    if (wmv >= 2 && wmv > g_a18BestMv) {
+    // v159：best/mv 改成「本拍赢家」，不再只增不减
+    //       （v158 首屏一直显示历史最大值 0x4C4/mv=4，看着像"赢家一直是它"，其实不是）
+    if (wmv >= 2) {
         g_a18Best = wbest * 4;
         g_a18BestMv = wmv;
+    } else {
+        g_a18Best = g_posOffOk ? (int)g_posOff : 0;
+        g_a18BestMv = 0;
     }
     if (!g_posOffOk) {
         int cand = -1;
@@ -8929,8 +8954,9 @@ static void a18Step(void) {
     g_a18Runs++;
 
     snprintf(g_a18L[g_a18Ln++], sizeof(g_a18L[0]),
-             "A18n runs=%d frz=%d/%d cand=%d src=0x%X ok=%d",
-             g_a18Runs, g_a18Frozen, n, g_a18CandN, g_posOff, g_posOffOk);
+             "A18n runs=%d frz=%d/%d cand=%d src=0x%X ok=%d rk=%d sid=%u",
+             g_a18Runs, g_a18Frozen, n, g_a18CandN, g_posOff, g_posOffOk,
+             g_a18Rekey, a18SelfIdNow());
     snprintf(g_a18L[g_a18Ln++], sizeof(g_a18L[0]),
              "A18 best=0x%X mv=%d dx=%d scan=%d selfv=%d rej=%d stk=%d yrej=%d",
              g_a18Best, g_a18BestMv, g_a18BestDx, g_a18Scan, g_a18SelfV, g_a18Rej,
@@ -9048,7 +9074,11 @@ static void a20Draw(ImDrawList *dl, float sw, float sh, float sc) {
     if (!(my > 8.0f)) my = 8.0f;
 
     int wcap = 0;                      // v154（D）：本帧托管调用预算，超了就不再调 w2sPx
-    for (int i = 0; i < n; i++) {
+    // v159：起点每帧轮转。预算固定时若总从 0 开始，排在 48 之后的单位永远轮不到
+    //       → 敌人在尾部时就"人在脸上也丢框"（v158 首屏 cap=24766 正是这件事）
+    if (n > 0) g_a20Rot = (g_a20Rot + 1) % n;
+    for (int oi = 0; oi < n; oi++) {
+        int i = (g_a20Rot + oi) % n;
         uintptr_t obj = g_a19[i];
         unsigned id = g_a19Id[i];
         int camp = g_a19Camp[i];
@@ -9643,7 +9673,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v158 S=%d u%d d%d on%d off%d scan%d c%d in%d pg%d src=0x%X a20=%d 3-finger UP\n"
+            @"ESP v159 S=%d u%d d%d on%d off%d scan%d c%d in%d pg%d src=0x%X a20=%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_stage, g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -9656,7 +9686,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v158 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v159 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -9965,7 +9995,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v158 booting";
+    l.text = @"ESP v159 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
