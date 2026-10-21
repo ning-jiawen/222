@@ -593,6 +593,7 @@ typedef size_t (*t_image_get_class_count)(void *);
 typedef void *(*t_image_get_class)(void *, size_t);
 typedef const char *(*t_class_get_name)(void *);
 typedef const char *(*t_class_get_namespace)(void *);
+typedef int (*t_class_instance_size)(void *);   // v120：struct 步长来源
 typedef void *(*t_class_get_parent)(void *);
 typedef void *(*t_class_from_name)(void *, const char *, const char *);
 typedef void *(*t_class_from_il2cpp_type)(void *);          // v16：泛型实例化类型 → 真实类（偏移才对）
@@ -627,6 +628,7 @@ struct I2C {
     t_image_get_class             image_get_class;
     t_class_get_name              class_get_name;
     t_class_get_namespace         class_get_namespace;
+    t_class_instance_size         class_instance_size;
     t_class_get_parent            class_get_parent;
     t_class_from_name             class_from_name;
     t_class_from_il2cpp_type      class_from_il2cpp_type;
@@ -670,6 +672,7 @@ static void bindIl2cpp(void) {
     BINDF(image_get_class,            "il2cpp_image_get_class");
     BINDF(class_get_name,             "il2cpp_class_get_name");
     BINDF(class_get_namespace,        "il2cpp_class_get_namespace");
+    BINDF(class_instance_size,        "il2cpp_class_instance_size");
     BINDF(class_get_parent,           "il2cpp_class_get_parent");
     BINDF(class_from_name,            "il2cpp_class_from_name");
     BINDF(class_from_il2cpp_type,     "il2cpp_class_from_il2cpp_type");
@@ -1202,7 +1205,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v119 ====");
+    CHECK("==== dump v120 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1213,7 +1216,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v119 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v120 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6038,7 +6041,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v119 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v120 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6967,7 +6970,7 @@ static void v115ProbeDD(void) {
 // 做法：按原始名字找 FrameSynchr / FrameRecord 类 → findInstanceByStatic 取单例 →
 //       只打印"类型名含 Frame/Record/List/[]"的字段，并对其读一次指针看真实类名。
 // ============================================================================
-#define A2_MAXLINE 14
+#define A2_MAXLINE 18
 static int  g_a2Done = 0, g_a2N = 0, g_a2Fs = 0, g_a2Fr = 0, g_a2Inst = 0;
 static char g_a2[A2_MAXLINE][150];
 
@@ -7002,6 +7005,23 @@ static void *a2FindClassByName(const char *want) {
 
 
 // v119b（审核 B2）：拿到对象就顺手把 cnt 与首条 8 个 dword 打出来，省一版装机。
+static int a3CIContains(const char *hay, const char *needle) {
+    if (!hay || !needle || !*needle) return 0;
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i]) {
+            char a = p[i], b = needle[i];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) break;
+            i++;
+        }
+        if (i == nl) return 1;
+    }
+    return 0;
+}
+
 static void a2DumpObj(const char *tag, void *obj) {
     if (!obj || !okptr((uintptr_t)obj)) { a2Add("%s obj=bad", tag); return; }
     int32_t s1 = -1, s2 = -2;
@@ -7024,6 +7044,7 @@ static void a2DumpObj(const char *tag, void *obj) {
 static void v119FrameGraph(void) {
     if (g_a2Done || !g_a1Done) return;
     g_a2Done = 1;
+    if (!I2.class_instance_size) a2Add("g no instance_size");   // dlsym 失败时明示，不静默
     if (!I2.class_get_fields || !I2.field_get_offset || !I2.class_from_il2cpp_type) return;
 
     void *fs = a2FindClassByName("FrameSynchr");
@@ -7111,6 +7132,112 @@ static void v119FrameGraph(void) {
         }
         a2Add("f %s t=%s off=%d -> %s", fn, tyn, off, vkb);
     }
+    // ========================================================================
+    // v120 · 三路找帧记录容器（v119 已排除：静态字段、FrameSynchr 自身字段）
+    //   ① 打 FrameRecord 自身字段表 → 拿 displayInfoDatas 的偏移（拿到记录就能直接读）
+    //   ② FrameSynchr **父类链**上的容器字段（List/[]/Queue/Dict/HashSet）
+    //   ③ 全局按**字段名**启发式（名字含 frame/record + 类型是容器）—— 绕开 List`1 不含元素名的问题
+    // ========================================================================
+    // ① FrameRecord 结构体：size（=步长）+ 前 3 个字段偏移（B2）
+    if (fr) {
+        int rsize = I2.class_instance_size ? I2.class_instance_size(fr) : -1;
+        a2Add("r size=%d vt=%d", rsize, I2.class_is_valuetype ? I2.class_is_valuetype(fr) : -1);
+        void *it = NULL, *f = NULL;
+        int g = 0;
+        while ((f = I2.class_get_fields(fr, &it)) && f && g++ < 3 && g_a2N < A2_MAXLINE) {
+            char fn[48] = "?", ty[48] = "?";
+            safeCopyStr(I2.field_get_name ? I2.field_get_name(f) : NULL, fn, sizeof(fn));
+            void *ft = I2.field_get_type(f);
+            void *fc = ft ? I2.class_from_il2cpp_type(ft) : NULL;
+            const char *tn = fc ? (real_class_get_name ? real_class_get_name(fc)
+                                                       : (I2.class_get_name ? I2.class_get_name(fc) : NULL)) : NULL;
+            safeCopyStr(tn, ty, sizeof(ty));
+            a2Add("r %s t=%s off=%d", fn, ty, I2.field_get_offset ? I2.field_get_offset(f) : -1);
+        }
+    }
+
+    // ② FrameSynchr 父类链上的容器字段 —— 实例在手，**直接 inst+off 读内容**（B1）
+    if (fs && I2.class_get_parent) {
+        void *k = fs;
+        int nC = 0;
+        for (int d = 0; k && d < 6 && nC < 6 && g_a2N < A2_MAXLINE; d++) {
+            void *it = NULL, *f = NULL;
+            int g = 0;
+            while ((f = I2.class_get_fields(k, &it)) && f && g++ < 200 && nC < 6 && g_a2N < A2_MAXLINE) {
+                void *ft = I2.field_get_type(f);
+                void *fc = ft ? I2.class_from_il2cpp_type(ft) : NULL;
+                const char *tn = fc ? (real_class_get_name ? real_class_get_name(fc)
+                                                           : (I2.class_get_name ? I2.class_get_name(fc) : NULL)) : NULL;
+                if (!tn) continue;
+                if (!strstr(tn, "List") && !strstr(tn, "[]") && !strstr(tn, "Queue") &&
+                    !strstr(tn, "Dict") && !strstr(tn, "Hash") && !strstr(tn, "Array")) continue;
+                char fn[48] = "?", ty[48] = "?", cn[48] = "?";
+                safeCopyStr(I2.field_get_name ? I2.field_get_name(f) : NULL, fn, sizeof(fn));
+                safeCopyStr(tn, ty, sizeof(ty));
+                safeCopyStr(real_class_get_name ? real_class_get_name(k)
+                                                : (I2.class_get_name ? I2.class_get_name(k) : NULL), cn, sizeof(cn));
+                int off = I2.field_get_offset ? I2.field_get_offset(f) : -1;
+                int st  = (I2.field_get_flags && (I2.field_get_flags(f) & 0x10)) ? 1 : 0;
+                char tag[120];
+                snprintf(tag, sizeof(tag), "c %s.%s t=%s", cn, fn, ty);
+                if (!st && off >= 0) {
+                    void *val = NULL;
+                    if (rd((char *)inst + off, &val, sizeof(val))) a2DumpObj(tag, val);
+                    else a2Add("%s off=%d rd=fail", tag, off);
+                } else {
+                    a2Add("%s off=%d st=%d", tag, off, st);
+                }
+                nC++;
+            }
+            k = I2.class_get_parent(k);
+        }
+        if (nC == 0) a2Add("g parentCont hits=0");
+    }
+
+    // ③ 全局名字启发式（大小写不敏感）
+    {
+        size_t n3 = 0;
+        void **a3 = (void **)I2.domain_get_assemblies(I2.domain, &n3);
+        int hits3 = 0, fv3 = 0;
+        for (size_t i3 = 0; a3 && i3 < n3 && hits3 < 8 && fv3 < 150000 && g_a2N < A2_MAXLINE; i3++) {
+            void *im3 = a3[i3] ? I2.assembly_get_image(a3[i3]) : NULL;
+            if (!im3) continue;
+            int cc3 = (int)I2.image_get_class_count(im3);
+            for (int k3 = 0; k3 < cc3 && hits3 < 8 && fv3 < 150000 && g_a2N < A2_MAXLINE; k3++) {
+                void *c3 = I2.image_get_class(im3, k3);
+                if (!c3) continue;
+                void *it3 = NULL, *f3 = NULL;
+                int g3 = 0;
+                while ((f3 = I2.class_get_fields(c3, &it3)) && f3 && g3++ < 200 && fv3++ < 150000) {
+                    char fn3[64] = "?";
+                    safeCopyStr(I2.field_get_name ? I2.field_get_name(f3) : NULL, fn3, sizeof(fn3));
+                    if (!a3CIContains(fn3, "frame") && !a3CIContains(fn3, "record")) continue;
+                    void *ft3 = I2.field_get_type(f3);
+                    void *fc3 = ft3 ? I2.class_from_il2cpp_type(ft3) : NULL;
+                    const char *tn3b = fc3 ? (real_class_get_name ? real_class_get_name(fc3)
+                                                                  : (I2.class_get_name ? I2.class_get_name(fc3) : NULL)) : NULL;
+                    if (!tn3b) continue;
+                    if (!strstr(tn3b, "List") && !strstr(tn3b, "[]") && !strstr(tn3b, "Queue") &&
+                        !strstr(tn3b, "Dict") && !strstr(tn3b, "Hash") && !strstr(tn3b, "Array")) continue;
+                    char cn3[64] = "?", ty3[48] = "?", tag[130];
+                    safeCopyStr(real_class_get_name ? real_class_get_name(c3)
+                                                    : (I2.class_get_name ? I2.class_get_name(c3) : NULL), cn3, sizeof(cn3));
+                    safeCopyStr(tn3b, ty3, sizeof(ty3));
+                    int st3 = (I2.field_get_flags && (I2.field_get_flags(f3) & 0x10)) ? 1 : 0;
+                    snprintf(tag, sizeof(tag), "n %s.%s t=%s st=%d", cn3, fn3, ty3, st3);
+                    if (st3) {
+                        void *v3 = NULL;
+                        I2.field_static_get_value(f3, &v3);
+                        a2DumpObj(tag, v3);
+                    } else {
+                        a2Add("%s", tag);
+                    }
+                    hits3++;
+                }
+            }
+        }
+        if (hits3 == 0) a2Add("g nameScan hits=0");
+    }
 }
 
 static void updateHud(void) {
@@ -7121,7 +7248,7 @@ static void updateHud(void) {
         // v112r7：收成两行，但**必须**把 P0 那行留住 —— 本包的 ImGui 菜单打不开（g_menuOpen 只在
         // 菜单内部的按钮里切换），drawFixedPanel 永远画不出来，UILabel HUD 是唯一看得见的地方。
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v119 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v120 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100,
@@ -7132,7 +7259,7 @@ static void updateHud(void) {
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v119 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v120 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -7405,7 +7532,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v119 booting";
+    l.text = @"ESP v120 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
