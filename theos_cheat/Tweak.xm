@@ -1205,7 +1205,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v125 ====");
+    CHECK("==== dump v128 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1216,7 +1216,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v125 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v128 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6041,7 +6041,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v125 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v128 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6139,12 +6139,16 @@ static void v115ProbeDD(void);   // v115：定义在 updateHud 之前，这里�
 
 static void v119FrameGraph(void);   // v119：定义在 updateHud 之前
 static void v122DDScan(void);       // v122：DD 指纹扫描（对局内一次性）
+static void v127Keys(void);         // v127：字典 key 纯打印（v128 native 搜的输入）
+static void v128AllHeroes(void);    // v128：全 actor 无过滤位置对照（评审①）
 
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v115：M1 扫描关闭（v114 因 SAT=1 被 VOID，本版只回答路径 A）
     if (g_il2cppOk) v115ProbeDD();   // 路径 A 探针：每帧最多 400 个类
     if (g_il2cppOk) v119FrameGraph(); // A1 完成后一次性：顺 FrameSynchr 找 FrameRecord
     if (g_il2cppOk) v122DDScan();     // v122：对局内一次性，用 DD 指纹认记录
+    if (g_il2cppOk) v127Keys();       // v127：只打 key 列表，不搜索
+    if (g_il2cppOk) v128AllHeroes();  // v128：全 actor 位置对照
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
@@ -7168,6 +7172,8 @@ static int a3IsDD(void *p, unsigned *outId, float *outPos, int *outQok) {
 // 崩溃现场 SIGSEGV at 0x74000000dc030010，栈顶就是 il2cpp_class_get_name。
 // okptr 只保证地址可读，不代表它是 Il2CppClass。这里按布局直读 klass+16 的 name，
 // 并校验首字符是标识符，双闸都过才认。
+static int  g_a3KSTried = 0, g_a3KSok = 0;   // v126：**枚举类**的取名成功/尝试（只有它才是偏移证据）
+static int  g_a3KWTried = 0, g_a3KWok = 0;   // v126：walk 节点的取名成功/尝试（多半是垃圾指针，必然失败）
 static int a3KlassName(void *k, char *out, int cap) {
     if (!out || cap < 2) return 0;
     out[0] = 0;
@@ -7186,7 +7192,10 @@ static int a3ClsNameSafe(void *obj, char *out, int cap) {
     out[0] = 0;
     void *k = NULL;
     if (!obj || !rd(obj, &k, sizeof(k))) return 0;
-    return a3KlassName(k, out, cap);      // 走直读 + 校验，不调 il2cpp_class_get_name
+    g_a3KWTried++;                                   // v126：walk 节点计数
+    if (!a3KlassName(k, out, cap)) return 0;         // 走直读 + 校验，不调 il2cpp_class_get_name
+    g_a3KWok++;
+    return 1;
 }
 
 // v125h：`a3ClsOf()` 已删除 —— 它把 rd 出来的指针直接交给 real_class_get_name。
@@ -7285,7 +7294,6 @@ static void a3Probe(const char *src, void *base, int hop) {
 #define A3_C2MAX 4
 static char g_a3c2[A3_C2MAX][170];
 static int  g_a3c2N = 0, g_a3Sc = 0, g_a3Ic = 0, g_a3ValSkip = 0, g_a3Cls5 = 0;   // v125
-static int  g_a3KTried = 0, g_a3KOkN = 0;   // v125e：klass 取名成功/尝试 比例（替代单样本判定）
 
 static int a3TryDDContainer(const char *tag, void *obj) {
     if (!obj || !okptr((uintptr_t)obj) || g_a3c2N >= A3_C2MAX) return 0;
@@ -7315,9 +7323,149 @@ static int a3TryDDContainer(const char *tag, void *obj) {
     return 1;
 }
 
+// ============================================================================
+// v127 · A4：只把字典 key 打出来（纯读，不搜索、不加钩子、不新增崩溃面）
+//   A4 行1：n=<cnt> k0=… k1=… … （最多 16 个 u32）
+//   A4 行2：ptr ok=<n>/<m> + 阵营直方图 T<type>=<cnt>
+// 目的：为 v128 的 native 定点搜（RW 区 memmem 稀有 ID）准备"已知 ID 集合"。
+// ============================================================================
+#define A4_MAXK   16
+#define A4_LINES  2
+static char g_a4[A4_LINES][200];
+static int  g_a4N = 0;
+
+static void a4Add(const char *fmt, ...) {
+    if (g_a4N >= A4_LINES) return;
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(g_a4[g_a4N], sizeof(g_a4[0]), fmt, ap);
+    va_end(ap);
+    g_a4N++;
+}
+
+static void v127Keys(void) {
+    if (!g_a1Done || !g_inMatch) return;
+    // v127b（审核 B1）：不能"有 1 条就打印并锁死" —— 那会拿 1 个 ID 去做 v128 的 memmem，必空。
+    // 门限与 A3 一致：cnt>=20；并允许刷新（30 秒或条数增长 >20%）。
+    if (g_cntRaw < 20) return;
+    static double s4Next = 0;
+    static int    s4LastN = 0;
+    double now4 = CACurrentMediaTime();
+    int need4 = (g_a4N == 0) || (now4 >= s4Next) || (s4LastN > 0 && g_lastCnt > s4LastN * 6 / 5);
+    if (!need4) return;
+    s4Next = now4 + 30.0;
+    s4LastN = g_lastCnt;
+    g_a4N = 0;                                   // 重打前清空
+    if (!g_lastEntries || g_lastCnt <= 0) return;
+    // v127c（审核 M1）：**遍历全部** entry，只统计 min/max/步长众数，再打 8 个样本。
+    // 理由：字典顺序 != ID 顺序，只看前 16 个无法判断这个 ID 在内存里稀有还是烂大街 ——
+    // 而锚点稀有度直接决定 v128 的 memmem 是否可用。
+    int total = g_lastCnt;
+    if (total > 512) total = 512;                  // 安全上限（字典不会这么大，防异常值）
+    unsigned minK = 0xffffffffu, maxK = 0;
+    unsigned dval[16]; int dcnt[16]; int dn = 0;
+    unsigned samp[8]; int sn = 0;
+    int okPtr = 0, gotK = 0;
+    unsigned prevK = 0; int havePrev = 0;
+    for (int i = 0; i < total; i++) {
+        unsigned key = 0; void *val = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 8, &key, 4)) continue;
+        gotK++;
+        if (key < minK) minK = key;
+        if (key > maxK) maxK = key;
+        if (sn < 8 && (i % (total > 8 ? (total / 8 + 1) : 1)) == 0) samp[sn++] = key;
+        if (havePrev && key > prevK) {
+            unsigned d = key - prevK;
+            int f = -1;
+            for (int q = 0; q < dn; q++) if (dval[q] == d) { f = q; break; }
+            if (f >= 0) dcnt[f]++;
+            else if (dn < 16) { dval[dn] = d; dcnt[dn] = 1; dn++; }
+        }
+        prevK = key; havePrev = 1;
+        if (rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &val, sizeof(val)) &&
+            val && okptr((uintptr_t)val)) okPtr++;
+    }
+    int mi = -1, mc = 0;
+    for (int q = 0; q < dn; q++) if (dcnt[q] > mc) { mc = dcnt[q]; mi = q; }
+    char kbuf[150]; int kp = 0;
+    kbuf[0] = 0;
+    if (mi >= 0)
+        kp += snprintf(kbuf + kp, sizeof(kbuf) - kp, "d=%u(x%d) ", dval[mi], mc);
+    for (int q = 0; q < sn && kp < 120; q++)
+        kp += snprintf(kbuf + kp, sizeof(kbuf) - kp, "%u,", samp[q]);
+    a4Add("A4n n=%d got=%d min=%u max=%u %s", total, gotK, minK, maxK, kbuf);
+
+    char cbuf[120]; int cp = 0;
+    cbuf[0] = 0;
+    for (int i = 0; i < g_thC && i < 12 && cp < 100; i++)
+        cp += snprintf(cbuf + cp, sizeof(cbuf) - cp, " T%d=%d", g_thT[i], g_thN[i]);
+    a4Add("A4c ptr ok=%d/%d %s", okPtr, total, cbuf);
+}
+
+// ============================================================================
+// v128 · A5：零成本对照实验（评审①）—— 字典里**全部** actor，逐个读 ActorLinker+0x4C4，
+//       不做阵营过滤、不做可见过滤，直接打 id / camp / (x,z)。
+// 目的：把一个敌人放进雾里，对比前后两屏 —— 坐标不变 = 真值一直在（省 2-3 版）。
+// 偏移全部沿用既有代码：id@0x4AC、pos@0x4C4、camp@0x504。
+// ============================================================================
+#define A5_LINES 6
+static char g_a5[A5_LINES][200];
+static int  g_a5N = 0;
+
+static void v128AllHeroes(void) {
+    if (!g_a1Done || !g_inMatch || !g_lastEntries || g_lastCnt <= 0) return;
+    if (g_cntRaw < 20) return;
+    // v128b（审核 B1）：时间门必须**独立于是否打印出内容**。
+    // 原写法在"一条都没打出来"时 g_a5N 恒 0 → 每帧重扫 200 条 entry ≈ 800 次 vm_read/帧（60fps 约 4.8 万次/秒），会拖帧。
+    static double s5Next = 0;
+    static int    s5Valid = 0;
+    double now5 = CACurrentMediaTime();
+    if (s5Valid && now5 < s5Next) return;
+    s5Next = now5 + 15.0;                      // 15 秒刷新一次，方便"进雾前后"各拍一张
+    s5Valid = 1;
+    g_a5N = 0;
+
+    int total = g_lastCnt > 200 ? 200 : g_lastCnt;
+    int shown = 0, zero = 0, nonZero = 0;
+    char line[200]; int lp = 0;
+    line[0] = 0;
+    for (int i = 0; i < total && g_a5N < A5_LINES - 1; i++) {
+        void *v = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v))) continue;
+        if (!v || !okptr((uintptr_t)v)) continue;
+        void *k = NULL;
+        if (!rd(v, &k, sizeof(k)) || !k || k != g_linkerClass) continue;   // 只认 ActorLinker
+        unsigned int id = 0;
+        if (!rd((char *)v + 0x4AC, &id, 4) || !id) continue;
+        int T = 0, C = 0, cfg = 0, pid = 0;
+        readIdentity2(v, &T, &C, &cfg, &pid, NULL, NULL);
+        float pp[3] = {0, 0, 0};
+        if (!rd((char *)v + 0x4C4, pp, sizeof(pp))) continue;
+        unsigned char camp8 = 0;
+        rd((char *)v + 0x504, &camp8, 1);
+        int isZero = (pp[0] == 0.0f && pp[2] == 0.0f);
+        if (isZero) zero++; else nonZero++;
+        // 只打英雄量级（cfg>0 或 T 与英雄类型一致），但仍不做阵营/可见过滤
+        if (!(cfg > 0 || (g_heroType >= 0 && T == g_heroType))) continue;
+        if (lp > 120) {
+            snprintf(g_a5[g_a5N++], sizeof(g_a5[0]), "A5 %s", line);
+            lp = 0; line[0] = 0;
+        }
+        lp += snprintf(line + lp, sizeof(line) - lp, "%sid=%u c%d(%d) %.1f,%.1f%s ",
+                       lp ? "| " : "", id, (int)camp8, C, pp[0], pp[2],
+                       (g_rawHostId > 0 && id == (unsigned int)g_rawHostId) ? "*" : "");
+        shown++;
+    }
+    if (lp > 0) snprintf(g_a5[g_a5N++], sizeof(g_a5[0]), "A5 %s", line);
+    if (g_a5N < A5_LINES)
+        snprintf(g_a5[g_a5N++], sizeof(g_a5[0]),
+                 "A5n shown=%d zero=%d nz=%d cnt=%d", shown, zero, nonZero, g_lastCnt);
+}
+
 static void v122DDScan(void) {
     if (!g_a1Done || !g_inMatch) return;
     if (g_cntRaw < 20) { g_a3Wait = 1; return; }
+    // v126（审核）：w0 为空说明相机/自位置没就绪 —— 这时扫出来的 d 全失效，白扫一版
+    if (g_w0[0] == 0.0f && g_w0[2] == 0.0f) { g_a3Wait = 2; return; }
     static double s_next = 0;
     static int    s_lastCnt = 0;
     double now2 = CACurrentMediaTime();
@@ -7328,7 +7476,7 @@ static void v122DDScan(void) {
     s_lastCnt = g_cntRaw;
     g_a3Done = 1; g_a3Wait = 0;
     g_a3N = 0; g_a3CN = 0; g_a3Drop = 0; g_a3MsgN = 0; g_a3Nodes = 0; g_a3SkipC = 0;
-    g_a3Zero = 0; g_a3Dup = 0; g_a3Nz = 0; g_a3Nz0 = 0; g_a3X0 = 0; g_a3X0w = 0; g_a3KTried = 0; g_a3KOkN = 0; g_a3c2N = 0; g_a3Sc = 0; g_a3Ic = 0; g_a3ValSkip = 0; g_a3Cls5 = 0;
+    g_a3Zero = 0; g_a3Dup = 0; g_a3Nz = 0; g_a3Nz0 = 0; g_a3X0 = 0; g_a3X0w = 0; g_a3KSTried = 0; g_a3KSok = 0; g_a3KWTried = 0; g_a3KWok = 0; g_a3c2N = 0; g_a3Sc = 0; g_a3Ic = 0; g_a3ValSkip = 0; g_a3Cls5 = 0;
     for (int i = 0; i < 4096; i++) g_a3Seen[i] = 0;
 
     if (g_lastEntries) {
@@ -7361,9 +7509,9 @@ static void v122DDScan(void) {
                 // B2（审核）：不再扫全部 64k 类 —— 对每个类调 field_static_get_value 会触发它的 cctor，
                 // 这正是 v17/v19 定位过的崩溃源。只扫名字命中的类（Frame/Record/Synchr/Manager/Data/System）。
                 char cn5[48] = "";
-                g_a3KTried++;
-                if (!a3KlassName(c5, cn5, sizeof(cn5))) continue;   // c5 是 Il2CppClass*
-                g_a3KOkN++;
+                g_a3KSTried++;                                        // v126：枚举类计数
+                if (!a3KlassName(c5, cn5, sizeof(cn5))) continue;     // c5 是 Il2CppClass*
+                g_a3KSok++;
                 if (!strstr(cn5, "Frame") && !strstr(cn5, "Record") && !strstr(cn5, "Synchr") &&
                     !strstr(cn5, "Manager") && !strstr(cn5, "Data") && !strstr(cn5, "System")) continue;
                 cls5++;
@@ -7443,9 +7591,13 @@ static void v122DDScan(void) {
     for (int i = 0; i < g_a3MsgN && i < 2; i++)
         snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "%s", g_a3Msg[i]);
     if (g_a3MsgN > 2) snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "s +%d more", g_a3MsgN - 2);
+    // v126（审核 B1）：拆两行 —— kS 才是偏移证据，kW 只是 walk 垃圾占比
     snprintf(g_a3[g_a3N++], sizeof(g_a3[0]),
-             "pool=%d nz=%d nz0=%d x0=%d x0w=%d zero=%d dup=%d skipc=%d nodes=%d sc=%d ic=%d vs=%d c5=%d k=%d/%d w0=%.0f/%.0f alt=%.0f/%.0f",
-             g_a3CN, g_a3Nz, g_a3Nz0, g_a3X0, g_a3X0w, g_a3Zero, g_a3Dup, g_a3SkipC, g_a3Nodes, g_a3Sc, g_a3Ic, g_a3ValSkip, g_a3Cls5, g_a3KOkN, g_a3KTried,
+             "pool=%d nz=%d nz0=%d x0=%d x0w=%d zero=%d dup=%d skipc=%d nodes=%d",
+             g_a3CN, g_a3Nz, g_a3Nz0, g_a3X0, g_a3X0w, g_a3Zero, g_a3Dup, g_a3SkipC, g_a3Nodes);
+    snprintf(g_a3[g_a3N++], sizeof(g_a3[0]),
+             "sc=%d ic=%d vs=%d c5=%d kS=%d/%d kW=%d/%d w0=%.0f/%.0f alt=%.0f/%.0f",
+             g_a3Sc, g_a3Ic, g_a3ValSkip, g_a3Cls5, g_a3KSok, g_a3KSTried, g_a3KWok, g_a3KWTried,
              g_a3sx, g_a3sz, g_selfOk ? g_selfX : 0.0f, g_selfOk ? g_selfZ : 0.0f);
 }
 static void v119FrameGraph(void) {
@@ -7616,7 +7768,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v125 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v128 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -7629,7 +7781,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v125 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v128 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -7675,8 +7827,12 @@ static void updateHud(void) {
     if (g_a3N > 0) {
         for (int i = 0; i < g_a3N; i++) [s appendFormat:@"A3 %s\n", g_a3[i]];
     } else if (g_a3Wait) {
-        [s appendFormat:@"A3 wait cnt=%d fs=%d\n", g_cntRaw, g_il2cppOk ? 1 : 0];
+        [s appendFormat:@"A3 wait %s cnt=%d w0=%.0f/%.0f\n",
+            (g_a3Wait == 2) ? "w0" : "cnt", g_cntRaw, g_w0[0], g_w0[2]];
     }
+    // v127c（审核 M2）：A4 独立打印 —— 不能挂在 A3 分支里，否则 A3 一条不出时 A4 跟着消失
+    for (int i = 0; i < g_a4N; i++) [s appendFormat:@"%s\n", g_a4[i]];
+    for (int i = 0; i < g_a5N; i++) [s appendFormat:@"%s\n", g_a5[i]];
     // v124b（审核 B1）：A1 只留 1 行 —— abort/seen/hits 已在 RUN 行，命中明细已定案
     if (g_a1Hits > 0) [s appendFormat:@"A1 hits=%d (detail off)\n", g_a1Hits];
     {
@@ -7916,7 +8072,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v125 booting";
+    l.text = @"ESP v128 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
