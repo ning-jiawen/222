@@ -1202,7 +1202,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v118 ====");
+    CHECK("==== dump v119 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1213,7 +1213,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v118 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v119 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6038,7 +6038,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v118 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v119 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6133,9 +6133,13 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
 
 static void v115ProbeDD(void);   // v115：定义在 updateHud 之前，这里先声明
 
+
+static void v119FrameGraph(void);   // v119：定义在 updateHud 之前
+
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v115：M1 扫描关闭（v114 因 SAT=1 被 VOID，本版只回答路径 A）
     if (g_il2cppOk) v115ProbeDD();   // 路径 A 探针：每帧最多 400 个类
+    if (g_il2cppOk) v119FrameGraph(); // A1 完成后一次性：顺 FrameSynchr 找 FrameRecord
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
@@ -6953,6 +6957,162 @@ static void v115ProbeDD(void) {
     }
 }
 
+// ============================================================================
+// v119 · A2：顺着 FrameSynchr 找 FrameRecord 实例（A1 已证明 DD 数组在两个实例字段上）
+// ----------------------------------------------------------------------------
+// A1 的确定事实（v118 装机）：全游戏 6 个"含 DisplayInfo"的字段，其中两个是数组：
+//   DisplayDataRsp.datas        : DisplayInfoData[]   (Scripts.Base)
+//   FrameRecord.displayInfoDatas: DisplayInfoData[]   (Scripts.Base)   ← 帧同步的每帧显示数据
+// 二者都是**实例字段**（st=0），所以本版只问一件事：能不能拿到 FrameRecord / 它的容器实例。
+// 做法：按原始名字找 FrameSynchr / FrameRecord 类 → findInstanceByStatic 取单例 →
+//       只打印"类型名含 Frame/Record/List/[]"的字段，并对其读一次指针看真实类名。
+// ============================================================================
+#define A2_MAXLINE 14
+static int  g_a2Done = 0, g_a2N = 0, g_a2Fs = 0, g_a2Fr = 0, g_a2Inst = 0;
+static char g_a2[A2_MAXLINE][150];
+
+static void a2Add(const char *fmt, ...) {
+    if (g_a2N >= A2_MAXLINE) return;
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(g_a2[g_a2N], sizeof(g_a2[0]), fmt, ap);
+    va_end(ap);
+    g_a2N++;
+}
+
+static void *a2FindClassByName(const char *want) {
+    if (!I2.domain_get_assemblies || !I2.assembly_get_image ||
+        !I2.image_get_class_count || !I2.image_get_class) return NULL;
+    size_t n = 0;
+    void **asms = (void **)I2.domain_get_assemblies(I2.domain, &n);
+    if (!asms) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        void *im = asms[i] ? I2.assembly_get_image(asms[i]) : NULL;
+        if (!im) continue;
+        int cc = (int)I2.image_get_class_count(im);
+        for (int k = 0; k < cc; k++) {
+            void *kk = I2.image_get_class(im, k);
+            if (!kk) continue;
+            const char *nm = real_class_get_name ? real_class_get_name(kk)
+                                                 : (I2.class_get_name ? I2.class_get_name(kk) : NULL);
+            if (nm && strcmp(nm, want) == 0) return kk;
+        }
+    }
+    return NULL;
+}
+
+
+// v119b（审核 B2）：拿到对象就顺手把 cnt 与首条 8 个 dword 打出来，省一版装机。
+static void a2DumpObj(const char *tag, void *obj) {
+    if (!obj || !okptr((uintptr_t)obj)) { a2Add("%s obj=bad", tag); return; }
+    int32_t s1 = -1, s2 = -2;
+    if (!(rd((char *)obj + 0x18, &s1, 4) && rd((char *)obj + 0x18, &s2, 4) && s1 == s2)) s1 = -1;
+    void *i1 = NULL, *i2 = NULL;
+    void *data = (char *)obj + 0x20;                     // 数组数据区
+    if (rd((char *)obj + 0x10, &i1, 8) && rd((char *)obj + 0x10, &i2, 8) &&
+        i1 == i2 && okptr((uintptr_t)i1)) data = (char *)i1 + 0x20;   // List<_items>
+    unsigned d0=0,d1=0,d2=0,d3=0,d4=0,d5=0,d6=0,d7=0;
+    if (s1 > 0 && s1 < 100000) {
+        rd(data, &d0, 4); rd((char*)data+4, &d1, 4);
+        rd((char*)data+8, &d2, 4); rd((char*)data+12, &d3, 4);
+        rd((char*)data+16, &d4, 4); rd((char*)data+20, &d5, 4);
+        rd((char*)data+24, &d6, 4); rd((char*)data+28, &d7, 4);
+    }
+    a2Add("%s cnt=%d %08x %08x %08x %08x %08x %08x %08x %08x",
+          tag, s1, d0, d1, d2, d3, d4, d5, d6, d7);
+}
+
+static void v119FrameGraph(void) {
+    if (g_a2Done || !g_a1Done) return;
+    g_a2Done = 1;
+    if (!I2.class_get_fields || !I2.field_get_offset || !I2.class_from_il2cpp_type) return;
+
+    void *fs = a2FindClassByName("FrameSynchr");
+    void *fr = a2FindClassByName("FrameRecord");
+    g_a2Fs = fs ? 1 : 0;
+    g_a2Fr = fr ? 1 : 0;
+    a2Add("g fs=%d fr=%d vt=%d", g_a2Fs, g_a2Fr,
+          (fr && I2.class_is_valuetype) ? I2.class_is_valuetype(fr) : -1);
+
+    void *inst = fs ? findInstanceByStatic(fs) : NULL;
+    g_a2Inst = inst ? 1 : 0;
+    a2Add("g fsInst=%d", g_a2Inst);
+    if (!inst) return;
+
+    // ---- B1（审核）：FrameRecord 若是 struct，容器就在**别处的静态字段**上 ----
+    // 全类扫一遍静态字段：类型名含 FrameRecord（数组/直接）→ 命中；
+    // 另外对类名含 Frame 的类，把类型含 List / [] 的静态字段也打出来（List`1 不含元素名）。
+    {
+        size_t n2 = 0;
+        void **a2a = (void **)I2.domain_get_assemblies(I2.domain, &n2);
+        int hits2 = 0, fvisit = 0;                 // 全量预算：字段访问总数上限
+        for (size_t i2 = 0; a2a && i2 < n2 && hits2 < 10 && fvisit < 150000 && g_a2N < A2_MAXLINE; i2++) {
+            void *im2 = a2a[i2] ? I2.assembly_get_image(a2a[i2]) : NULL;
+            if (!im2) continue;
+            int cc2 = (int)I2.image_get_class_count(im2);
+            for (int k2 = 0; k2 < cc2 && hits2 < 10 && fvisit < 150000 && g_a2N < A2_MAXLINE; k2++) {
+                void *c2 = I2.image_get_class(im2, k2);
+                if (!c2) continue;
+                const char *cn2 = real_class_get_name ? real_class_get_name(c2)
+                                                      : (I2.class_get_name ? I2.class_get_name(c2) : NULL);
+                int clsIsFrame = (cn2 && (strstr(cn2, "Frame") || strstr(cn2, "Record"))) ? 1 : 0;
+                void *it2 = NULL, *f2 = NULL;
+                int g2 = 0;
+                while ((f2 = I2.class_get_fields(c2, &it2)) && f2 && g2++ < 200 && fvisit++ < 150000) {
+                    if (!(I2.field_get_flags(f2) & 0x10)) continue;        // 只看 static
+                    void *ft2 = I2.field_get_type(f2);
+                    void *fc2 = ft2 ? I2.class_from_il2cpp_type(ft2) : NULL;
+                    const char *tn2 = fc2 ? (real_class_get_name ? real_class_get_name(fc2)
+                                                                 : (I2.class_get_name ? I2.class_get_name(fc2) : NULL)) : NULL;
+                    if (!tn2) continue;
+                    int hit2 = strstr(tn2, "FrameRecord") ? 1 : 0;
+                    if (!hit2 && clsIsFrame && (strstr(tn2, "List") || strstr(tn2, "[]"))) hit2 = 2;
+                    if (!hit2) continue;
+                    char fn2[48] = "?", ty2[48] = "?", tag[110];
+                    safeCopyStr(I2.field_get_name ? I2.field_get_name(f2) : NULL, fn2, sizeof(fn2));
+                    safeCopyStr(tn2, ty2, sizeof(ty2));
+                    snprintf(tag, sizeof(tag), "s %s.%s t=%s", cn2 ? cn2 : "?", fn2, ty2);
+                    void *val2 = NULL;
+                    I2.field_static_get_value(f2, &val2);
+                    a2DumpObj(tag, val2);
+                    hits2++;
+                }
+            }
+        }
+        if (hits2 == 0) a2Add("g static FrameRecord hits=0");
+    }
+
+    void *it = NULL, *f = NULL;
+    int guard = 0;
+    while ((f = I2.class_get_fields(fs, &it)) && f && guard++ < 200) {
+        void *ft = I2.field_get_type(f);
+        void *ftc = ft ? I2.class_from_il2cpp_type(ft) : NULL;
+        const char *tn = ftc ? (real_class_get_name ? real_class_get_name(ftc)
+                                                    : (I2.class_get_name ? I2.class_get_name(ftc) : NULL)) : NULL;
+        if (!tn) continue;
+        if (!strstr(tn, "Frame") && !strstr(tn, "Record") && !strstr(tn, "List") && !strstr(tn, "[]")) continue;
+        int off = I2.field_get_offset ? I2.field_get_offset(f) : -1;
+        int isStatic = (I2.field_get_flags && (I2.field_get_flags(f) & 0x10)) ? 1 : 0;
+        char fn[64] = "?";
+        safeCopyStr(I2.field_get_name ? I2.field_get_name(f) : NULL, fn, sizeof(fn));
+        char tyn[64] = "?";
+        safeCopyStr(tn, tyn, sizeof(tyn));
+        if (isStatic || off < 0) { a2Add("f %s t=%s off=%d st=%d", fn, tyn, off, isStatic); continue; }
+        // 实例字段：读一次指针，看它真实指向什么类
+        void *val = NULL;
+        const char *vkn = "-";
+        char vkb[48] = "-";
+        if (rd((char *)inst + off, &val, sizeof(val)) && val && okptr((uintptr_t)val)) {
+            void *vk = NULL;
+            if (rd(val, &vk, sizeof(vk)) && vk && okptr((uintptr_t)vk)) {
+                vkn = real_class_get_name ? real_class_get_name(vk)
+                                          : (I2.class_get_name ? I2.class_get_name(vk) : NULL);
+                if (vkn) safeCopyStr(vkn, vkb, sizeof(vkb));
+            }
+        }
+        a2Add("f %s t=%s off=%d -> %s", fn, tyn, off, vkb);
+    }
+}
+
 static void updateHud(void) {
     if (!g_hudLabel) return;
     // v22：真的画出框以后自动收成 1 行 —— 实战里 24 行绿字把左半屏挡住是没法打的。
@@ -6961,7 +7121,7 @@ static void updateHud(void) {
         // v112r7：收成两行，但**必须**把 P0 那行留住 —— 本包的 ImGui 菜单打不开（g_menuOpen 只在
         // 菜单内部的按钮里切换），drawFixedPanel 永远画不出来，UILabel HUD 是唯一看得见的地方。
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v118 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v119 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
             g_hudPage % 100,
@@ -6972,7 +7132,7 @@ static void updateHud(void) {
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v118 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v119 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -7016,6 +7176,7 @@ static void updateHud(void) {
         g_a1AsmOk, g_a1AsmSkip, g_a1AsmOther, g_a1Done ? " done" : ""];
     for (int i = 0; i < g_a1Hits; i++) [s appendFormat:@"A1 %s\n", g_a1Hit[i]];
     for (int i = 0; i < g_a1DumpN; i++) [s appendFormat:@"A1 %s\n", g_a1Dump[i]];
+    for (int i = 0; i < g_a2N; i++) [s appendFormat:@"A2 %s\n", g_a2[i]];
 
     // v28：这 4 行永远在第一屏，不用翻页 —— 现场「没法自主翻页」时这是唯一能拿到数据的地方
     [s appendFormat:@"R %d CAP %d ENT %p\n", g_cntRaw, g_capNow, g_entPtr];
@@ -7244,7 +7405,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v118 booting";
+    l.text = @"ESP v119 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
