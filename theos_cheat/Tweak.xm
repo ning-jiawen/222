@@ -1205,7 +1205,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v129 ====");
+    CHECK("==== dump v130 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1216,7 +1216,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v129 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v130 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6041,7 +6041,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v129 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v130 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6142,6 +6142,7 @@ static void v122DDScan(void);       // v122：DD 指纹扫描（对局内一次�
 static void v127Keys(void);         // v127：字典 key 纯打印（v128 native 搜的输入）
 static void v128AllHeroes(void);    // v128：全 actor 无过滤位置对照（评审①）
 static void v129WorldScan(void);    // v129：世界量级扫描 + 投影验证
+static void v130StructScan(void);   // v130：ActorLinker 1-2 跳 int32 三值扫描
 
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v115：M1 扫描关闭（v114 因 SAT=1 被 VOID，本版只回答路径 A）
@@ -6151,6 +6152,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     if (g_il2cppOk) v127Keys();       // v127：只打 key 列表，不搜索
     if (g_il2cppOk) v128AllHeroes();  // v128：全 actor 位置对照
     if (g_il2cppOk) v129WorldScan();  // v129：世界量级 + 投影验证
+    if (g_il2cppOk) v130StructScan(); // v130：1-2 跳 int32 坐标扫描
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
@@ -7591,6 +7593,158 @@ static void v129WorldScan(void) {
         snprintf(g_a6[g_a6N++], sizeof(g_a6[0]), "A6n cand=%d size=%d scr=%.0fx%.0f", g_a6cN, sz, sw, sh);
 }
 
+// ============================================================================
+// v130 · A7：ActorLinker 的 1–2 跳结构扫描（只读、不钩、不扫堆）
+//   审核补充已纳入：
+//    ① 2 跳（1 跳未命中时，对前 8 个指针各再扫一层）——手册的 Android 链是两跳
+//    ② 双档下界（tier0: >=0.1 m；tier1: >=1 m）
+//    ③ 三段判据（静立不变 / 走动变化 / 投影跟人）
+//   预算：总读上限 60000，W2S 调用上限 16；20 秒一轮。
+// ============================================================================
+#define A7_LINES  9
+#define A7_CAP    32
+#define A7_WCAP   60000
+typedef struct { char fn[26]; int foff; int hop; int sub; int v[3]; int tier; int on; float sx, sy; } A7C;
+static char g_a7[A7_LINES][200];
+static int  g_a7N = 0, g_a7W = 0, g_a7W2 = 0, g_a7Fld = 0;
+static A7C  g_a7s[A7_CAP], g_a7e[A7_CAP];
+static int  g_a7sN = 0, g_a7eN = 0;
+
+static void a7Scan(const char *fn, int foff, int hop, void *base, int span, A7C *arr, int *n) {
+    if (!base) return;
+    for (int k = 0; k + 12 <= span && *n < A7_CAP && g_a7W < A7_WCAP; k += 4) {
+        unsigned b[3] = {0, 0, 0};
+        g_a7W++;
+        if (!rd((char *)base + k, b, sizeof(b))) continue;
+        int x = (int)b[0], y = (int)b[1], z = (int)b[2];
+        int ax = x < 0 ? -x : x, az = z < 0 ? -z : z, ay = y < 0 ? -y : y;
+        if (ax < 100 || az < 100) continue;                 // 双档下界：tier0 = 0.1 m
+        if (ax > 1500000 || az > 1500000) continue;         // 地图量级上限（1500 m）
+        if (ay > 200000) continue;
+        A7C *c = &arr[*n];
+        snprintf(c->fn, sizeof(c->fn), "%s", fn ? fn : "?");
+        c->foff = foff; c->hop = hop; c->sub = k;
+        c->v[0] = x; c->v[1] = y; c->v[2] = z;
+        c->tier = (ax >= 1000 && az >= 1000) ? 1 : 0;       // tier1 = 1 m 以上
+        c->on = 0; c->sx = 0; c->sy = 0;
+        (*n)++;
+    }
+}
+
+static void a7Obj(void *obj, A7C *arr, int *n, int twoHop) {
+    if (!obj || !g_linkerClass || !I2.class_get_fields) return;
+    void *it = NULL, *f = NULL;
+    int g = 0;
+    while ((f = I2.class_get_fields(g_linkerClass, &it)) && f && g++ < 64) {
+        if (g_a7W >= A7_WCAP || *n >= A7_CAP) return;
+        int off = I2.field_get_offset ? (int)I2.field_get_offset(f) : -1;
+        if (off < 0) continue;
+        char fn[26] = "?";
+        safeCopyStr(I2.field_get_name ? I2.field_get_name(f) : NULL, fn, sizeof(fn));
+        if (twoHop) g_a7Fld++;
+        void *p = NULL;
+        if (!rd((char *)obj + off, &p, sizeof(p)) || !p || !okptr((uintptr_t)p)) continue;
+        a7Scan(fn, off, 1, p, 0x200, arr, n);
+        if (!twoHop) continue;
+        for (int k = 0; k < 8 && g_a7W < A7_WCAP && *n < A7_CAP; k++) {
+            void *p2 = NULL;
+            if (!rd((char *)p + k * 8, &p2, sizeof(p2)) || !p2 || !okptr((uintptr_t)p2)) continue;
+            a7Scan(fn, off, 2, p2, 0x100, arr, n);
+        }
+    }
+}
+
+static void v130StructScan(void) {
+    if (!g_a1Done || !g_inMatch || !g_lastEntries || g_lastCnt <= 0) return;
+    if (!g_camObj || !g_miW2S) return;
+    static double s7Next = 0;
+    static int    s7Valid = 0;
+    double now7 = CACurrentMediaTime();
+    if (s7Valid && now7 < s7Next) return;
+    s7Next = now7 + 20.0;
+    s7Valid = 1;
+    g_a7N = 0; g_a7W = 0; g_a7W2 = 0; g_a7Fld = 0; g_a7sN = 0; g_a7eN = 0;
+
+    // v130b（审核 B1）：**两遍扫描** —— 字典顺序常把自己排在后面，
+    // 原写法在前面单位处 selfCamp 还是 -1，enemy 永远选不出来 → M 列必空。
+    void *self = NULL, *enemy = NULL;
+    int selfCamp = -1;
+    int total = g_lastCnt > 200 ? 200 : g_lastCnt;
+    // 第一遍：只找自己 + 自己的阵营
+    for (int i = 0; i < total; i++) {
+        void *v = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        void *k = NULL;
+        if (!rd(v, &k, sizeof(k)) || !k || k != g_linkerClass) continue;
+        unsigned int id = 0;
+        if (!rd((char *)v + 0x4AC, &id, 4) || !id) continue;
+        if (id == (unsigned int)g_rawHostId) {
+            self = v;
+            unsigned char c8 = 0; rd((char *)v + 0x504, &c8, 1);
+            selfCamp = (int)c8;
+            break;
+        }
+    }
+    // 第二遍：找第一个不同阵营的英雄
+    if (self && selfCamp >= 0) {
+        for (int i = 0; i < total; i++) {
+            void *v = NULL;
+            if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+            void *k = NULL;
+            if (!rd(v, &k, sizeof(k)) || !k || k != g_linkerClass) continue;
+            if (v == self) continue;
+            unsigned int id = 0;
+            if (!rd((char *)v + 0x4AC, &id, 4) || !id) continue;
+            unsigned char c8 = 0; rd((char *)v + 0x504, &c8, 1);
+            if ((int)c8 == selfCamp) continue;
+            int T = 0, C = 0, cfg = 0;
+            readIdentity2(v, &T, &C, &cfg, NULL, NULL, NULL);
+            if (cfg <= 0 && !(g_heroType >= 0 && T == g_heroType)) continue;   // 只认英雄
+            enemy = v;
+            break;
+        }
+    }
+    if (!self) { snprintf(g_a7[g_a7N++], sizeof(g_a7[0]), "A7 no self id=%d", g_rawHostId); return; }
+
+    a7Obj(self, g_a7s, &g_a7sN, 1);          // self：1 + 2 跳
+    if (enemy) a7Obj(enemy, g_a7e, &g_a7eN, 0);   // enemy：只 1 跳（控成本）
+
+    // 投影验证（mm→m），全局上限 16 次
+    for (int i = 0; i < g_a7sN && g_a7W2 < 16; i++) {
+        float x = g_a7s[i].v[0] / 1000.0f, y = g_a7s[i].v[1] / 1000.0f, z = g_a7s[i].v[2] / 1000.0f;
+        g_a7s[i].on = w2sPx(x, y, z, &g_a7s[i].sx, &g_a7s[i].sy);
+        g_a7W2++;
+    }
+    // tier1 优先、hop 小优先
+    for (int i = 1; i < g_a7sN; i++) {
+        A7C t = g_a7s[i];
+        int tw = t.tier * -1000 + t.hop;
+        int j = i - 1;
+        while (j >= 0 && (g_a7s[j].tier * -1000 + g_a7s[j].hop) > tw) { g_a7s[j + 1] = g_a7s[j]; j--; }
+        g_a7s[j + 1] = t;
+    }
+    int shown = 0, matchN = 0;
+    for (int i = 0; i < g_a7sN && g_a7N < A7_LINES - 1; i++, shown++) {
+        int m = 0;
+        for (int q = 0; q < g_a7eN; q++)
+            if (g_a7e[q].foff == g_a7s[i].foff && g_a7e[q].sub == g_a7s[i].sub) { m = 1; break; }
+        if (!m) { /* still print */ }
+        matchN += m;
+        float sw = (float)g_scrW, sh = (float)g_scrH;
+        int near = (g_a7s[i].on && g_a7s[i].sx > sw * 0.2f && g_a7s[i].sx < sw * 0.8f &&
+                    g_a7s[i].sy > sh * 0.2f && g_a7s[i].sy < sh * 0.9f);
+        snprintf(g_a7[g_a7N++], sizeof(g_a7[0]), "A7 %s+0x%X/%x h%d t%d (%d,%d,%d) s=%.0f,%.0f%s%s",
+                 g_a7s[i].fn, g_a7s[i].foff, g_a7s[i].sub, g_a7s[i].hop, g_a7s[i].tier,
+                 g_a7s[i].v[0], g_a7s[i].v[1], g_a7s[i].v[2], g_a7s[i].sx, g_a7s[i].sy,
+                 near ? " NEAR" : "", m ? " M" : "");
+        if (shown >= 5) break;
+    }
+    if (g_a7N < A7_LINES)
+        snprintf(g_a7[g_a7N++], sizeof(g_a7[0]),
+                 "A7n self=%d enemy=%d M=%d fld=%d w=%d w2s=%d",
+                 g_a7sN, g_a7eN, matchN, g_a7Fld, g_a7W, g_a7W2);
+}
+
 static void v122DDScan(void) {
     if (!g_a1Done || !g_inMatch) return;
     if (g_cntRaw < 20) { g_a3Wait = 1; return; }
@@ -7898,7 +8052,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v129 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v130 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -7911,7 +8065,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v129 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v130 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -7964,6 +8118,7 @@ static void updateHud(void) {
     for (int i = 0; i < g_a4N; i++) [s appendFormat:@"%s\n", g_a4[i]];
     for (int i = 0; i < g_a5N; i++) [s appendFormat:@"%s\n", g_a5[i]];
     for (int i = 0; i < g_a6N; i++) [s appendFormat:@"%s\n", g_a6[i]];
+    for (int i = 0; i < g_a7N; i++) [s appendFormat:@"%s\n", g_a7[i]];
     // v124b（审核 B1）：A1 只留 1 行 —— abort/seen/hits 已在 RUN 行，命中明细已定案
     if (g_a1Hits > 0) [s appendFormat:@"A1 hits=%d (detail off)\n", g_a1Hits];
     {
@@ -8203,7 +8358,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v129 booting";
+    l.text = @"ESP v130 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
