@@ -887,9 +887,12 @@ static int    g_posOffOk    = 0;
 // v154：阶段标记 —— 崩溃前最后一张 HUD 就能定位死在哪
 // 0=idle 1=find 2=scanTriple 3=a19Enum 4=hunt 5=a18Step 6=a17Back 7=draw
 static volatile int g_stage = 0;
-// v154：全堆扫描总开关。默认 0 —— 字典已有全部英雄，堆扫只带来成本与崩溃面。
-//       置 1 才跑 v144Find（锚点扫）与 a19Enum 的堆枚举，用于一次性仪器核查。
-static int    g_deepScan = 0;
+// v157：**这个开关必须有真实写入者**。v156 里它只是 `static int = 0`、全文无赋值，
+//       clang 证明它恒 0 → A15/A16/A17 三段仪器连同格式串被当死代码删掉，
+//       二进制里少了 5 条标记（check_artifact_version 拦下）。写入者在 deepScanProbe()。
+//       开启：launchctl setenv ESP_DEEP 1 后重启游戏。默认关。
+static volatile int g_deepScan = 0;
+static int    g_deepInitDone = 0;
 static int    g_a19FromHeap = 0;
 static int    g_prevSeed    = 0;      // v146：换局时清零，避免上一局字节造成假 delta
 #define V84_OFFN 32
@@ -1216,7 +1219,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v156 ====");
+    CHECK("==== dump v157 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1227,7 +1230,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v156 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v157 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6052,7 +6055,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v156 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v157 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -8036,9 +8039,18 @@ static void v137Tf(void) {
 //   B7 submap 分支不推进 addr
 #include <mach/mach.h>
 #include <mach/vm_region.h>
+#include <stdlib.h>          // v157：getenv —— deepScan 的写入者要用
 // v154：**不要** include <mach/mach_vm.h> —— iOS SDK 里该文件是 `#error mach_vm.h unsupported.`
 //       桩。mach_vm_* 是 macOS 的 64 位 VM API；iOS 用去掉 mach_ 前缀的 vm_* 家族。
 //       本文件 rd() 从 v67 起用的就是 vm_read_overwrite，这条路一直是通的。
+
+// v157：deepScan 的唯一写入者。getenv 对编译器不透明 ⇒ 分支与格式串一定被保留。
+static void deepScanProbe(void) {
+    if (g_deepInitDone) return;
+    g_deepInitDone = 1;
+    const char *e = getenv("ESP_DEEP");
+    if (e && e[0] == '1') g_deepScan = 1;
+}
 
 #define SCAN_MAXREG   2048
 #define SCAN_CHUNK    (8u << 20)
@@ -8926,6 +8938,7 @@ static void v154Tick(void) {
 
 
 static void v145Kick(void) {
+    deepScanProbe();                     // v157：保证 v144Find 读 g_deepScan 之前已探过
     if (!g_scanQ) g_scanQ = dispatch_queue_create("esp.scan", DISPATCH_QUEUE_SERIAL);
     if (!g_scanQ || g_scanBusy) return;
     g_scanBusy = 1;
@@ -9620,7 +9633,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v156 S=%d u%d d%d on%d off%d scan%d c%d in%d pg%d src=0x%X a20=%d 3-finger UP\n"
+            @"ESP v157 S=%d u%d d%d on%d off%d scan%d c%d in%d pg%d src=0x%X a20=%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_stage, g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -9633,7 +9646,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v156 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v157 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -9942,7 +9955,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v156 booting";
+    l.text = @"ESP v157 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
