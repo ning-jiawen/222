@@ -1205,7 +1205,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v135 ====");
+    CHECK("==== dump v137 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1216,7 +1216,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v135 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v137 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6041,7 +6041,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v135 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v137 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6144,7 +6144,7 @@ static void v128AllHeroes(void);    // v128：全 actor 无过滤位置对照（
 static void v129WorldScan(void);    // v129：世界量级扫描 + 投影验证
 static void v130StructScan(void);   // v130：ActorLinker 1-2 跳 int32 三值扫描
 static void v131GetPos(void);       // v131：直接调 get_Position 等 getter
-static void v132PosProj(void);      // v132：get_Position 投影自证 + 反查字段偏移
+static void v137Tf(void);           // v137：Transform.position vs +0x4C4，相机就近认自己
 static void v135Diff(void);         // v135：差分扫描，找视野外仍在更新的偏移
 
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
@@ -6158,8 +6158,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // if (g_il2cppOk) v129WorldScan();
     // if (g_il2cppOk) v130StructScan();
     // if (g_il2cppOk) v131GetPos();   // v131：已被 v132 取代（getter 只作校准）
-    if (g_il2cppOk) v132PosProj();    // v132：投影自证 + P 反查偏移
-    if (g_il2cppOk) v135Diff();       // v135：差分扫描（找逻辑真值）
+    if (g_il2cppOk) v137Tf();         // v137：Transform vs 0x4C4 并排
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
@@ -7888,83 +7887,111 @@ static void v131GetPos(void) {
 }
 
 // ============================================================================
-// v132 · A9：把 get_Position 降级为"校准工具"
-//   ① 投影自证：w2sPx(P) 是否落在该单位身上（self / 至多 3 个敌人）
-//   ② 反查字段：用 P_self 当针，在 self 内存 0x0…size 里找同一坐标的存放偏移
-//      float 对：|x−P.x|<0.5 && |z−P.z|<0.5
-//      int  对：|x/1000−P.x|<0.5
-//   命中即说明"坐标是存着的"→ v133 可纯读偏移出框（不调方法、不怕 proxy、不怕异常）
-//   调 method 仅作校准：每轮 ≤8 次，5 秒一轮。
+// v137 · A12：Transform.position 与 +0x4C4 并排，self 用"离屏幕中心最近"认
+//   依据评审改判：0x4C4 语义不明（可为死值）、y 恒 0；Transform.position 是引擎每帧
+//   真正用来画的值 —— 可见单位以它为准。先把 90% 做扎实，再谈雾。
+//   失败点必须打出来：tr=%p / klass 名 / mip 是否解析（v131 只知 T=na，不知卡在哪）。
 // ============================================================================
-#define A9_LINES 10
-#define A9_HITS  5
-static char g_a9[A9_LINES][200];
-static int  g_a9N = 0, g_a9Calls = 0, g_a9Got = 0, g_a9Hits = 0;
-static struct { unsigned id; float x, z; int valid; } g_a9p[8];
-static int  g_a9pN = 0;
+#define A12_LINES 9
+#define A12_N     8
+typedef struct { unsigned id; int camp; float p0[3]; float tv[3]; int hasT; float sx, sy; float dcen; } A12R;
+static char g_a12[A12_LINES][200];
+static int  g_a12N = 0;
+static A12R g_a12r[A12_N];
+static int  g_a12rN = 0;
 
-static int a9PrevDelta(unsigned id, float x, float z, float *dp) {
-    for (int i = 0; i < g_a9pN; i++)
-        if (g_a9p[i].id == id && g_a9p[i].valid) {
-            float dx = x - g_a9p[i].x, dz = z - g_a9p[i].z;
-            *dp = sqrtf(dx * dx + dz * dz);
-            g_a9p[i].x = x; g_a9p[i].z = z;
-            return 1;
+static void v137Tf(void) {
+    if (!g_a1Done || !g_inMatch || !g_lastEntries || g_lastCnt <= 0) return;
+    if (!g_camObj || !g_miW2S) return;
+    static double s12Next = 0;
+    static int    s12Valid = 0;
+    double now12 = CACurrentMediaTime();
+    if (s12Valid && now12 < s12Next) return;
+    s12Next = now12 + 3.0;
+    s12Valid = 1;
+    g_a12N = 0; g_a12rN = 0;
+    a8Resolve();
+    if (!g_miPos) { snprintf(g_a12[g_a12N++], sizeof(g_a12[0]), "A12 no get_Position"); return; }
+    if (!g_miTransform) { snprintf(g_a12[g_a12N++], sizeof(g_a12[0]), "A12 no get_MyTransform"); return; }
+
+    float sw = (float)g_scrW, sh = (float)g_scrH;
+    if (sw < 10.0f || sh < 10.0f) return;
+    float sc = (g_camPxW > 0 && sw > 1.0f) ? ((float)g_camPxW / sw)
+                                           : ((g_uiScale > 0.1f) ? g_uiScale : 3.0f);
+    if (!(sc > 0.1f)) sc = 3.0f;
+    float cx = sw * 0.5f, cy = sh * 0.55f;
+
+    int total = g_lastCnt > 200 ? 200 : g_lastCnt;
+    for (int i = 0; i < total && g_a12rN < A12_N; i++) {
+        void *v = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        void *k = NULL;
+        if (!rd(v, &k, sizeof(k)) || !k || k != g_linkerClass) continue;
+        unsigned int id = 0;
+        if (!rd((char *)v + 0x4AC, &id, 4) || !id) continue;
+        float p0[3] = {0, 0, 0};
+        if (!rd((char *)v + 0x4C4, p0, sizeof(p0))) continue;
+        if (p0[0] == 0.0f && p0[1] == 0.0f && p0[2] == 0.0f) continue;
+        float fx = 0, fy = 0;
+        if (!w2sPx(p0[0], p0[1], p0[2], &fx, &fy)) continue;
+        float sx = fx / sc, sy = sh - fy / sc;
+        if (sx < -40.0f || sx > sw + 40.0f || sy < -40.0f || sy > sh + 40.0f) continue;
+
+        A12R *r = &g_a12r[g_a12rN];
+        r->id = id; r->p0[0] = p0[0]; r->p0[1] = p0[1]; r->p0[2] = p0[2];
+        r->sx = sx; r->sy = sy;
+        r->dcen = fabsf(sx - cx) + fabsf(sy - cy);
+        unsigned char c8 = 0; rd((char *)v + 0x504, &c8, 1); r->camp = (int)c8;
+        r->hasT = 0;
+
+        // Transform 链（调用上限：≤8 actor × 2 次）
+        void *fnT = *(void **)g_miTransform;
+        if (fnT) {
+            void *tr = ((void *(*)(void *, void *))fnT)(v, g_miTransform);
+            if (tr && okptr((uintptr_t)tr)) {
+                void *tk = NULL;
+                if (rd(tr, &tk, sizeof(tk)) && tk) {
+                    char kn[48] = "";
+                    if (a3KlassName(tk, kn, sizeof(kn)) && strstr(kn, "Transform") &&
+                        I2.class_get_method_from_name) {
+                        void *mip = I2.class_get_method_from_name(tk, "get_position", 0);
+                        if (mip) {
+                            void *fp = *(void **)mip;
+                            if (fp) {
+                                Vec3 t = ((Vec3 (*)(void *, void *))fp)(tr, mip);
+                                r->tv[0] = t.x; r->tv[1] = t.y; r->tv[2] = t.z;
+                                r->hasT = 1;
+                            }
+                        }
+                    }
+                }
+            }
         }
-    if (g_a9pN < 8) { g_a9p[g_a9pN].id = id; g_a9p[g_a9pN].x = x; g_a9p[g_a9pN].z = z;
-                      g_a9p[g_a9pN].valid = 1; g_a9pN++; }
-    *dp = -1.0f;
-    return 0;
-}
-
-// v132b（审核 B1/B2）：命中池按 dev 升序保留，命中行带 src；本体与 1 跳共用同一探针。
-#define A9_HITPOOL 8
-typedef struct { float dev; char tag[28]; int off; int isI; float x, z; } A9HitT;
-static A9HitT g_a9h[A9_HITPOOL];
-static int    g_a9hN = 0, g_a9R = 0;
-
-static void a9Hit(float dev, const char *tag, int off, int isI, float x, float z) {
-    int slot = -1;
-    if (g_a9hN < A9_HITPOOL) slot = g_a9hN++;
-    else {
-        int mi = 0;
-        for (int i = 1; i < g_a9hN; i++) if (g_a9h[i].dev > g_a9h[mi].dev) mi = i;
-        if (dev >= g_a9h[mi].dev) return;
-        slot = mi;
+        g_a12rN++;
     }
-    g_a9h[slot].dev = dev;
-    snprintf(g_a9h[slot].tag, sizeof(g_a9h[slot].tag), "%s", tag ? tag : "?");
-    g_a9h[slot].off = off; g_a9h[slot].isI = isI;
-    g_a9h[slot].x = x; g_a9h[slot].z = z;
-}
+    if (g_a12rN == 0) { snprintf(g_a12[g_a12N++], sizeof(g_a12[0]), "A12 none on-screen"); return; }
 
-static void a9Needle(const char *tag, void *base, int span, float px, float pz) {
-    if (!base) return;
-    for (int off = 0; off + 12 <= span && g_a9R < 40000; off += 4) {
-        unsigned b[3] = {0, 0, 0};
-        g_a9R++;
-        if (!rd((char *)base + off, b, sizeof(b))) continue;
-        float fx = 0.0f;
-        float fy = 0.0f;
-        float fz = 0.0f;
-        memcpy(&fx, &b[0], 4); memcpy(&fy, &b[1], 4); memcpy(&fz, &b[2], 4);
-        (void)fy;
-        if (isfinite(fx) && isfinite(fz) &&
-            fabsf(fx - px) < 0.5f && fabsf(fz - pz) < 0.5f) {
-            a9Hit(fabsf(fx - px) + fabsf(fz - pz), tag, off, 0, fx, fz);
-            continue;
-        }
-        float ix = (int)b[0] / 1000.0f, iz = (int)b[2] / 1000.0f;
-        if (fabsf(ix - px) < 0.5f && fabsf(iz - pz) < 0.5f)
-            a9Hit(fabsf(ix - px) + fabsf(iz - pz), tag, off, 1, ix, iz);
+    // self = 离屏幕中心最近的（相机跟随，比 id 稳）
+    int si = 0;
+    for (int i = 1; i < g_a12rN; i++) if (g_a12r[i].dcen < g_a12r[si].dcen) si = i;
+
+    int shown = 0;
+    for (int i = 0; i < g_a12rN && g_a12N < A12_LINES - 1 && shown < 7; i++, shown++) {
+        A12R *r = &g_a12r[i];
+        if (r->hasT)
+            snprintf(g_a12[g_a12N++], sizeof(g_a12[0]),
+                     "A12 id=%u c%d T=%.1f,%.1f,%.1f P0=%.1f,%.1f dy=%.1f%s",
+                     r->id, r->camp, r->tv[0], r->tv[1], r->tv[2],
+                     r->p0[0], r->p0[2], r->tv[1] - r->p0[1], (i == si) ? " *" : "");
+        else
+            snprintf(g_a12[g_a12N++], sizeof(g_a12[0]),
+                     "A12 id=%u c%d T=na P0=%.1f,%.1f%s",
+                     r->id, r->camp, r->p0[0], r->p0[2], (i == si) ? " *" : "");
     }
+    snprintf(g_a12[g_a12N++], sizeof(g_a12[0]), "A12n n=%d hasT=%d self=%u sc=%.2f",
+             g_a12rN, (g_a12r[si].hasT ? 1 : 0), g_a12r[si].id, sc);
 }
 
-// ============================================================================
-// v133 · A10：最小出框器 —— 绕开老的过滤器迷宫
-//   依据已判定事实：位置 = actor+0x4C4（float 三元组，与 get_Position dev=0.00 一致），
-//   投影 = 游戏自己的 WorldToScreenPoint（w2sPx），空间与 ImGui DisplaySize 同为"点"。
-// ============================================================================
 static int g_a10Drawn = 0;
 
 static int g_a10Skip[4] = {0,0,0,0};
@@ -8000,7 +8027,7 @@ static void drawBoxesAll(ImDrawList *dl, float sw, float sh) {
         if (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f) { g_a10Skip[2]++; continue; }
         unsigned char camp = 0;
         rd((char *)v + 0x504, &camp, 1);
-        if (camp != 1 && camp != 2) { g_a10Skip[3]++; continue; }   // 只画双方英雄/单位
+        // v136（评审）：**不再按 camp 过滤** —— +0x504 不是阵营，实测砍掉 92/114 个对象。camp 只决定颜色。
         float fx = 0, fy = 0, hx = 0, hy = 0;
         if (!w2sPx(p[0], p[1], p[2], &fx, &fy)) { g_a10Skip[2]++; continue; }
         if (!w2sPx(p[0], p[1] + 1.8f, p[2], &hx, &hy)) { hx = fx; hy = fy - 60.0f; }
@@ -8010,7 +8037,10 @@ static void drawBoxesAll(ImDrawList *dl, float sw, float sh) {
         float h = fy2 - hy2;
         if (!(h > 4.0f && h < 800.0f)) h = 40.0f;
         float bw = h * 0.45f;
-        ImU32 col = (camp == 1) ? IM_COL32(80, 200, 255, 220) : IM_COL32(255, 90, 90, 220);
+        ImU32 col = (camp == 1) ? IM_COL32(80, 200, 255, 230)
+                   : (camp == 2) ? IM_COL32(255, 90, 90, 230)
+                   : (camp == 0) ? IM_COL32(235, 235, 235, 200)
+                                 : IM_COL32(255, 210, 60, 220);
         dl->AddRect(ImVec2(fx2 - bw * 0.5f, hy2), ImVec2(fx2 + bw * 0.5f, fy2), col, 0.0f, 0, 1.6f);
         char nb[24];
         snprintf(nb, sizeof(nb), "%u", id);
@@ -8160,101 +8190,6 @@ static void v135Diff(void) {
              tid, moved, g_a11Frozen, p4[0], p4[2], g_a11pxN);
 }
 
-static void v132PosProj(void) {
-    if (!g_a1Done || !g_inMatch || !g_lastEntries || g_lastCnt <= 0) return;
-    if (!g_camObj || !g_miW2S) return;
-    static double s9Next = 0;
-    static int    s9Valid = 0;
-    double now9 = CACurrentMediaTime();
-    if (s9Valid && now9 < s9Next) return;
-    s9Next = now9 + 5.0;
-    s9Valid = 1;
-    g_a9N = 0; g_a9Calls = 0; g_a9Got = 0; g_a9Hits = 0;
-    a8Resolve();
-    if (!g_miPos) { snprintf(g_a9[g_a9N++], sizeof(g_a9[0]), "A9 no get_Position"); return; }
-    void *fnP = *(void **)g_miPos;
-    if (!fnP) { snprintf(g_a9[g_a9N++], sizeof(g_a9[0]), "A9 miP no fn"); return; }
-
-    int total = g_lastCnt > 200 ? 200 : g_lastCnt;
-    void *self = NULL; int selfCamp = -1;
-    for (int i = 0; i < total && !self; i++) {
-        void *v = NULL;
-        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
-        void *k = NULL; if (!rd(v, &k, sizeof(k)) || k != g_linkerClass) continue;
-        unsigned int id = 0; if (!rd((char *)v + 0x4AC, &id, 4) || !id) continue;
-        if (id == (unsigned int)g_rawHostId) {
-            self = v;
-            unsigned char c8 = 0; rd((char *)v + 0x504, &c8, 1); selfCamp = (int)c8;
-        }
-    }
-    if (!self) { snprintf(g_a9[g_a9N++], sizeof(g_a9[0]), "A9 no self id=%d", g_rawHostId); return; }
-
-    float sx = 0, sy = 0, selfPX = 0, selfPZ = 0;
-    int selfGot = 0, enemies = 0;
-    for (int pass = 0; pass < 2 && g_a9N < A9_LINES - 3; pass++) {
-        for (int i = 0; i < total && g_a9Calls < 8 && g_a9N < A9_LINES - 3; i++) {
-            void *v = NULL;
-            if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
-            void *k = NULL; if (!rd(v, &k, sizeof(k)) || k != g_linkerClass) continue;
-            unsigned int id = 0; if (!rd((char *)v + 0x4AC, &id, 4) || !id) continue;
-            unsigned char c8 = 0; rd((char *)v + 0x504, &c8, 1);
-            int isSelf = (id == (unsigned int)g_rawHostId);
-            if (pass == 0 && !isSelf) continue;                 // 第一遍只取自己
-            if (pass == 1 && (isSelf || (int)c8 == selfCamp)) continue;
-            if (pass == 1 && enemies >= 3) continue;
-            Vec3 r = ((Vec3 (*)(void *, void *))fnP)(v, g_miPos);
-            g_a9Calls++; g_a9Got++;
-            float dp = -1.0f;
-            int had = a9PrevDelta(id, r.x, r.z, &dp);
-            int on = w2sPx(r.x, r.y, r.z, &sx, &sy);
-            snprintf(g_a9[g_a9N++], sizeof(g_a9[0]),
-                     "A9 %s id=%u c%d P=%.2f,%.2f s=%.0f,%.0f on=%d dp=%s%.2f%s",
-                     isSelf ? "self" : "enemy", id, (int)c8, r.x, r.z, sx, sy, on,
-                     had ? "" : "new/", dp, (had && dp > 0.05f) ? " MOV" : "");
-            if (isSelf) { selfPX = r.x; selfPZ = r.z; selfGot = 1; }
-            if (pass == 1) enemies++;
-        }
-    }
-
-    // ② 用 P_self 当针反查：**本体 + 1 跳**（ActorLinker 全是 proxy 句柄，只扫本体会假阴性）
-    int sz = (I2.class_instance_size && g_linkerClass) ? (int)I2.class_instance_size(g_linkerClass) : 0;
-    if (sz <= 0 || sz > 0x4000) sz = 0x2000;
-    g_a9hN = 0; g_a9R = 0;
-    if (selfGot) {
-        a9Needle("self", self, sz, selfPX, selfPZ);
-        // 1 跳：对每个指针字段，验 klass 后扫 0x0…0x200
-        void *it = NULL, *f = NULL;
-        int gidx = 0, used = 0;
-        while (I2.class_get_fields && (f = I2.class_get_fields(g_linkerClass, &it)) && f && gidx++ < 48 && used < 24) {
-            int off = I2.field_get_offset ? (int)I2.field_get_offset(f) : -1;
-            if (off < 0) continue;
-            void *pv = NULL;
-            if (!rd((char *)self + off, &pv, sizeof(pv)) || !pv || !okptr((uintptr_t)pv)) continue;
-            void *pk = NULL;
-            if (!rd(pv, &pk, sizeof(pk)) || !pk || !okptr((uintptr_t)pk)) continue;
-            char pn[28] = "?", kn[48] = "";
-            safeCopyStr(I2.field_get_name ? I2.field_get_name(f) : NULL, pn, sizeof(pn));
-            if (!a3KlassName(pk, kn, sizeof(kn))) continue;
-            a9Needle(pn, pv, 0x200, selfPX, selfPZ);
-            used++;
-        }
-        // 按 dev 升序取前 5
-        for (int i = 1; i < g_a9hN; i++) {
-            A9HitT t = g_a9h[i]; int j = i - 1;
-            while (j >= 0 && g_a9h[j].dev > t.dev) { g_a9h[j + 1] = g_a9h[j]; j--; }
-            g_a9h[j + 1] = t;
-        }
-        for (int i = 0; i < g_a9hN && i < 5 && g_a9N < A9_LINES - 1; i++) {
-            g_a9Hits++;
-            snprintf(g_a9[g_a9N++], sizeof(g_a9[0]), "A9S %s off=0x%X (%.2f,%.2f) dev=%.2f src=%s",
-                     g_a9h[i].isI ? "i" : "f", g_a9h[i].off, g_a9h[i].x, g_a9h[i].z,
-                     g_a9h[i].dev, g_a9h[i].tag);
-        }
-    }
-    if (g_a9N < A9_LINES)
-        snprintf(g_a9[g_a9N++], sizeof(g_a9[0]), "A9n got=%d hits=%d size=%d calls=%d w2s=%d",
-                 g_a9Got, g_a9Hits, sz, g_a9Calls, (g_camObj && g_miW2S) ? 1 : 0);
-}
 
 static void v122DDScan(void) {
     if (!g_a1Done || !g_inMatch) return;
@@ -8563,7 +8498,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v135 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v137 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -8576,7 +8511,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v135 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v137 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -8629,8 +8564,7 @@ static void updateHud(void) {
     for (int i = 0; i < g_a4N; i++) [s appendFormat:@"%s\n", g_a4[i]];
     for (int i = 0; i < g_a5N; i++) [s appendFormat:@"%s\n", g_a5[i]];
     for (int i = 0; i < g_a6N; i++) [s appendFormat:@"%s\n", g_a6[i]];
-    for (int i = 0; i < g_a9N; i++) [s appendFormat:@"%s\n", g_a9[i]];
-    for (int i = 0; i < g_a11N; i++) [s appendFormat:@"%s\n", g_a11[i]];
+    for (int i = 0; i < g_a12N; i++) [s appendFormat:@"%s\n", g_a12[i]];
     [s appendFormat:@"A10 d=%d sc=%.2f sk=%d/%d/%d/%d px=%d\n", g_a10Drawn,
         (g_camPxW > 0 && g_scrW > 1.0f) ? ((float)g_camPxW / g_scrW) : 0.0f,
         g_a10Skip[0], g_a10Skip[1], g_a10Skip[2], g_a10Skip[3], g_camPxW];
@@ -8873,7 +8807,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v135 booting";
+    l.text = @"ESP v137 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
