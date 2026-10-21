@@ -6760,24 +6760,38 @@ static void renderOverlay(void);
 // v115 · 连续运行 / 崩溃计数（审核放行条件：先证明不崩，再证明有货）
 // crash 跨启动：init 读文件里的 "C <sig>" 行；装 SIGBUS/SIGSEGV/SIGTRAP 处理器追加一行再交还系统。
 // ============================================================================
-static int    g_runCrash = 0;
+static int    g_runCrash = 0;       // 本局崩溃数（v125h：启动时截断，本局计数）
+static int    g_runCrashPrev = 0;   // 上一次运行留下的崩溃数（仅显示，用于确认修复生效）
 static double g_runStart = 0;
 
-static const char *runLogPath(void) {
-    static char buf[512];
-    if (!buf[0]) {
+// v125i（审核 B1）：路径必须**预算好**放在静态区。
+// 信号处理器里绝不能调 NSTemporaryDirectory / stringByAppendingPathComponent —— 那是 ObjC 分配，
+// async-signal-unsafe；崩在 malloc 内部时这里会死锁/失败，'C <sig>' 写不进去 → prev 少计 → 假清白。
+static char g_runPath[512];
+
+static const char *runLogPath(void) {          // 只允许在 runInit 里调用
+    if (!g_runPath[0]) {
         NSString *f = [NSTemporaryDirectory() stringByAppendingPathComponent:@"esp_run.log"];
-        strncpy(buf, [f fileSystemRepresentation], sizeof(buf) - 1);
+        strncpy(g_runPath, [f fileSystemRepresentation], sizeof(g_runPath) - 1);
     }
-    return buf;
+    return g_runPath;
 }
 
 static void runCrashHandler(int sig) {
-    int fd = open(runLogPath(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    g_runCrash++;                                   // v125h：本局计数（内存内，信号安全）
+    // v125i：只读预算好的静态路径，不做任何 ObjC 调用
+    int fd = g_runPath[0] ? open(g_runPath, O_WRONLY | O_CREAT | O_APPEND, 0644) : -1;
     if (fd >= 0) {
-        char b[24];
-        int n = snprintf(b, sizeof(b), "C %d\n", sig);
-        if (n > 0) { ssize_t w = write(fd, b, (size_t)n); (void)w; }
+        // v125i：连 snprintf 都不用 —— 手写 "C <sig>\n"，只保留 write()/close() 两个信号安全调用
+        char b[16];
+        int n = 0;
+        b[n++] = 'C'; b[n++] = ' ';
+        if (sig >= 100) b[n++] = (char)('0' + (sig / 100) % 10);
+        if (sig >= 10)  b[n++] = (char)('0' + (sig / 10) % 10);
+        b[n++] = (char)('0' + sig % 10);
+        b[n++] = '\n';
+        ssize_t w = write(fd, b, (size_t)n);
+        (void)w;
         close(fd);
     }
     signal(sig, SIG_DFL);
@@ -6786,14 +6800,18 @@ static void runCrashHandler(int sig) {
 
 static void runInit(void) {
     g_runStart = CACurrentMediaTime();
+    (void)runLogPath();                            // v125i：先把路径预算进 g_runPath
+
+    // v125h（审核）：不再跨启动累加 —— 先读上一次的条数用于显示，然后**截断**，本局从 0 数。
     FILE *rf = fopen(runLogPath(), "r");
     if (rf) {
         char line[64];
-        while (fgets(line, sizeof(line), rf)) if (line[0] == 'C' && line[1] == ' ') g_runCrash++;
+        while (fgets(line, sizeof(line), rf)) if (line[0] == 'C' && line[1] == ' ') g_runCrashPrev++;
         fclose(rf);
     }
-    FILE *af = fopen(runLogPath(), "a");
+    FILE *af = fopen(runLogPath(), "w");            // 截断：本局重新开始
     if (af) { fprintf(af, "B %.0f\n", (double)[[NSDate date] timeIntervalSince1970]); fclose(af); }
+    g_runCrash = 0;
     signal(SIGBUS,  runCrashHandler);
     signal(SIGSEGV, runCrashHandler);
     signal(SIGTRAP, runCrashHandler);
@@ -7060,7 +7078,8 @@ typedef struct { float d; int qok; char s[170]; } A3CandT;
 static int   g_a3Done = 0, g_a3N = 0, g_a3CN = 0, g_a3Drop = 0, g_a3Wait = 0, g_a3Nodes = 0;
 static float g_a3sx = 0, g_a3sz = 0;   // B2：实际用于算距离的那对坐标（自证单位用）
 static int   g_a3SkipC = 0;           // B1：因严格探针不过被跳过的容器数
-static int   g_a3Zero = 0, g_a3Dup = 0, g_a3Nz = 0;   // v124：空槽 / 重复地址 / 非零位置
+static int   g_a3Zero = 0, g_a3Dup = 0, g_a3Nz = 0, g_a3Nz0 = 0;   // v125：空槽/重复/非零(qok)/非零(q0)
+static int   g_a3X0 = 0, g_a3X0w = 0;   // v125g：x恒0(z非0) —— X0 只算容器路径（stride60 过严格探针），X0w 是 walk 命中
 static unsigned long g_a3Seen[4096];                   // v124b（审核 B3）：512 → 4096，避免哈希冲突误判已访问
 static int   a3Seen(unsigned long a) {                 // 返回 1 = 已见过
     unsigned h = (unsigned)((a >> 4) & 4095);
@@ -7145,23 +7164,33 @@ static int a3IsDD(void *p, unsigned *outId, float *outPos, int *outQok) {
 // v124c（崩溃修复）：类名一律先拷进本地缓冲再 strstr。
 // 崩溃现场：SIGSEGV at 0x11，_platform_strstr ← a3Probe ← a3ClsOf 的原始名字指针。
 // 说明"klass 看起来合法"并不代表 class_get_name 返回的是有效字符串。
+// v125d（崩溃修复 3/3）：**绝不**把可疑指针交给 il2cpp_class_get_name ——
+// 崩溃现场 SIGSEGV at 0x74000000dc030010，栈顶就是 il2cpp_class_get_name。
+// okptr 只保证地址可读，不代表它是 Il2CppClass。这里按布局直读 klass+16 的 name，
+// 并校验首字符是标识符，双闸都过才认。
+static int a3KlassName(void *k, char *out, int cap) {
+    if (!out || cap < 2) return 0;
+    out[0] = 0;
+    if (!k || !okptr((uintptr_t)k)) return 0;
+    void *img = NULL, *nm = NULL;
+    if (!rd(k, &img, sizeof(img)) || !img || !okptr((uintptr_t)img)) return 0;
+    if (!rd((char *)k + 16, &nm, sizeof(nm)) || !nm || !okptr((uintptr_t)nm)) return 0;
+    if (!safeCopyStr(nm, out, cap) || !out[0]) return 0;
+    unsigned char c0 = (unsigned char)out[0];
+    if (!((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_')) { out[0] = 0; return 0; }
+    return 1;
+}
+
 static int a3ClsNameSafe(void *obj, char *out, int cap) {
     if (!out || cap < 2) return 0;
     out[0] = 0;
     void *k = NULL;
-    if (!obj || !rd(obj, &k, sizeof(k)) || !k || !okptr((uintptr_t)k)) return 0;
-    const char *nm = real_class_get_name ? real_class_get_name(k)
-                                         : (I2.class_get_name ? I2.class_get_name(k) : NULL);
-    if (!nm) return 0;
-    return safeCopyStr(nm, out, cap);
+    if (!obj || !rd(obj, &k, sizeof(k))) return 0;
+    return a3KlassName(k, out, cap);      // 走直读 + 校验，不调 il2cpp_class_get_name
 }
 
-static const char *a3ClsOf(void *obj) {
-    void *k = NULL;
-    if (!obj || !rd(obj, &k, sizeof(k)) || !k || !okptr((uintptr_t)k)) return NULL;
-    return real_class_get_name ? real_class_get_name(k)
-                               : (I2.class_get_name ? I2.class_get_name(k) : NULL);
-}
+// v125h：`a3ClsOf()` 已删除 —— 它把 rd 出来的指针直接交给 real_class_get_name。
+// 规矩：il2cpp_* 只对 il2cpp 自己枚举出来的指针安全；rd 出来的指针一律走 a3KlassName（纯 rd + 校验）。
 
 // B1：容器展开 —— 读 _size@0x18 / _items@0x10，数据区 +0x20，按 60 字节切
 static void a3ScanContainer(void *obj, const char *src) {
@@ -7200,8 +7229,9 @@ static void a3ScanContainer(void *obj, const char *src) {
         unsigned id = 0; float pos[3] = {0}; int qok = 0;
         if (!a3IsDD(e, &id, pos, &qok)) continue;
         if (a3Seen((unsigned long)e)) { g_a3Dup++; continue; }
-        if (fabsf(pos[0]) < 0.5f && fabsf(pos[2]) < 0.5f) { g_a3Zero++; continue; }   // 近零=空槽
-        g_a3Nz++;
+        if (fabsf(pos[0]) < 0.5f && fabsf(pos[1]) < 0.5f && fabsf(pos[2]) < 0.5f) { g_a3Zero++; continue; }
+        if (qok == 1) g_a3Nz++; else g_a3Nz0++;
+        if (pos[0] == 0.0f && pos[2] != 0.0f) g_a3X0++;   // 容器路径：stride 60 + 严格探针，才可作偏移线索
         float d = a3SelfDist(pos);
         a3Cand(d, qok, "%s[%d] a=%p id=%u d=%.1f%s (%.2f,%.2f,%.2f)",
                src, i, e, id, d, qok ? "" : " q0", pos[0], pos[1], pos[2]);
@@ -7233,8 +7263,10 @@ static void a3Probe(const char *src, void *base, int hop) {
         float p[3] = {0};
         int qok = 0;
         if (a3IsDD(v, &id, p, &qok)) {
-            if (fabsf(p[0]) < 0.5f && fabsf(p[2]) < 0.5f) { g_a3Zero++; continue; }   // v125：近零=空槽（带容差）
-            g_a3Nz++;
+            // v125e（审核 B2）：nz 只数"四元数已初始化"的；q0 另计 nz0 —— 否则 nz 被未初始化数据灌水
+            if (fabsf(p[0]) < 0.5f && fabsf(p[1]) < 0.5f && fabsf(p[2]) < 0.5f) { g_a3Zero++; continue; }
+            if (qok == 1) g_a3Nz++; else g_a3Nz0++;
+            if (p[0] == 0.0f && p[2] != 0.0f) g_a3X0w++;   // walk 命中：地址差 0x20、非 60 步长，不能用来推偏移
             float d = a3SelfDist(p);
             a3Cand(d, qok, "%s h%d +%d a=%p id=%u d=%.1f%s (%.2f,%.2f,%.2f)",
                    src, hop, k * 8, v, id, d, qok ? "" : " q0", p[0], p[1], p[2]);
@@ -7253,6 +7285,7 @@ static void a3Probe(const char *src, void *base, int hop) {
 #define A3_C2MAX 4
 static char g_a3c2[A3_C2MAX][170];
 static int  g_a3c2N = 0, g_a3Sc = 0, g_a3Ic = 0, g_a3ValSkip = 0, g_a3Cls5 = 0;   // v125
+static int  g_a3KTried = 0, g_a3KOkN = 0;   // v125e：klass 取名成功/尝试 比例（替代单样本判定）
 
 static int a3TryDDContainer(const char *tag, void *obj) {
     if (!obj || !okptr((uintptr_t)obj) || g_a3c2N >= A3_C2MAX) return 0;
@@ -7295,7 +7328,7 @@ static void v122DDScan(void) {
     s_lastCnt = g_cntRaw;
     g_a3Done = 1; g_a3Wait = 0;
     g_a3N = 0; g_a3CN = 0; g_a3Drop = 0; g_a3MsgN = 0; g_a3Nodes = 0; g_a3SkipC = 0;
-    g_a3Zero = 0; g_a3Dup = 0; g_a3Nz = 0; g_a3c2N = 0; g_a3Sc = 0; g_a3Ic = 0; g_a3ValSkip = 0; g_a3Cls5 = 0;
+    g_a3Zero = 0; g_a3Dup = 0; g_a3Nz = 0; g_a3Nz0 = 0; g_a3X0 = 0; g_a3X0w = 0; g_a3KTried = 0; g_a3KOkN = 0; g_a3c2N = 0; g_a3Sc = 0; g_a3Ic = 0; g_a3ValSkip = 0; g_a3Cls5 = 0;
     for (int i = 0; i < 4096; i++) g_a3Seen[i] = 0;
 
     if (g_lastEntries) {
@@ -7328,7 +7361,9 @@ static void v122DDScan(void) {
                 // B2（审核）：不再扫全部 64k 类 —— 对每个类调 field_static_get_value 会触发它的 cctor，
                 // 这正是 v17/v19 定位过的崩溃源。只扫名字命中的类（Frame/Record/Synchr/Manager/Data/System）。
                 char cn5[48] = "";
-                if (!a3ClsNameSafe(c5, cn5, sizeof(cn5))) continue;
+                g_a3KTried++;
+                if (!a3KlassName(c5, cn5, sizeof(cn5))) continue;   // c5 是 Il2CppClass*
+                g_a3KOkN++;
                 if (!strstr(cn5, "Frame") && !strstr(cn5, "Record") && !strstr(cn5, "Synchr") &&
                     !strstr(cn5, "Manager") && !strstr(cn5, "Data") && !strstr(cn5, "System")) continue;
                 cls5++;
@@ -7363,6 +7398,7 @@ static void v122DDScan(void) {
         void *srcs[2] = { NULL, g_mgr };
         void *fs3 = a2FindClassByName("FrameSynchr");
         srcs[0] = fs3 ? findInstanceByStatic(fs3) : NULL;
+
         void *kls[2] = { fs3, g_mgrClass };
         const char *tags[2] = { "I fs", "I mgr" };
         for (int z = 0; z < 2; z++) {
@@ -7408,8 +7444,8 @@ static void v122DDScan(void) {
         snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "%s", g_a3Msg[i]);
     if (g_a3MsgN > 2) snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "s +%d more", g_a3MsgN - 2);
     snprintf(g_a3[g_a3N++], sizeof(g_a3[0]),
-             "pool=%d nz=%d zero=%d dup=%d skipc=%d nodes=%d sc=%d ic=%d vs=%d c5=%d w0=%.0f/%.0f alt=%.0f/%.0f",
-             g_a3CN, g_a3Nz, g_a3Zero, g_a3Dup, g_a3SkipC, g_a3Nodes, g_a3Sc, g_a3Ic, g_a3ValSkip, g_a3Cls5,
+             "pool=%d nz=%d nz0=%d x0=%d x0w=%d zero=%d dup=%d skipc=%d nodes=%d sc=%d ic=%d vs=%d c5=%d k=%d/%d w0=%.0f/%.0f alt=%.0f/%.0f",
+             g_a3CN, g_a3Nz, g_a3Nz0, g_a3X0, g_a3X0w, g_a3Zero, g_a3Dup, g_a3SkipC, g_a3Nodes, g_a3Sc, g_a3Ic, g_a3ValSkip, g_a3Cls5, g_a3KOkN, g_a3KTried,
              g_a3sx, g_a3sz, g_selfOk ? g_selfX : 0.0f, g_selfOk ? g_selfZ : 0.0f);
 }
 static void v119FrameGraph(void) {
@@ -7631,8 +7667,8 @@ static void updateHud(void) {
         [s appendFormat:@"%@\n", e];
     }
     // ---- v115：连续运行/崩溃计数 + 路径 A 探针进度 ----
-    [s appendFormat:@"RUN %ds crash=%d names_bad=%d  A1 abort=%d seen=%d/%d hits=%d asm ok=%d skip=%d other=%d%s\n",
-        (int)(CACurrentMediaTime() - g_runStart), g_runCrash, g_namesBad, g_a1Abort,
+    [s appendFormat:@"RUN %ds crash=%d/%d names_bad=%d  A1 abort=%d seen=%d/%d hits=%d asm ok=%d skip=%d other=%d%s\n",
+        (int)(CACurrentMediaTime() - g_runStart), g_runCrash, g_runCrashPrev, g_namesBad, g_a1Abort,
         g_a1Seen, g_a1Total, g_a1Hits,
         g_a1AsmOk, g_a1AsmSkip, g_a1AsmOther, g_a1Done ? " done" : ""];
     // v122d（审核 B2）：A3 排在最前（本轮唯一问题），A1/A2 压到结论级 3 行
