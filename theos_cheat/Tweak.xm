@@ -1205,7 +1205,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v132 ====");
+    CHECK("==== dump v133 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1216,7 +1216,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v132 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v133 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6041,7 +6041,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v132 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v133 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -7958,6 +7958,58 @@ static void a9Needle(const char *tag, void *base, int span, float px, float pz) 
     }
 }
 
+// ============================================================================
+// v133 · A10：最小出框器 —— 绕开老的过滤器迷宫
+//   依据已判定事实：位置 = actor+0x4C4（float 三元组，与 get_Position dev=0.00 一致），
+//   投影 = 游戏自己的 WorldToScreenPoint（w2sPx），空间与 ImGui DisplaySize 同为"点"。
+// ============================================================================
+static int g_a10Drawn = 0;
+
+static void drawBoxesAll(ImDrawList *dl, float sw, float sh) {
+    g_a10Drawn = 0;
+    if (!dl || !g_lastEntries || g_lastCnt <= 0) return;
+    if (!g_camObj || !g_miW2S || !g_linkerClass) return;
+    // v133b（评审预期的一轮修正）：W2S 返回的是**像素**（Unity Screen 空间，y 自下而上），
+    // 而 ImGui 用**点**（左上原点）。用 EXP 做换算，Y 轴翻转。
+    float pw = (g_expW > 0) ? (float)g_expW : sw;
+    float ph = (g_expH > 0) ? (float)g_expH : sh;
+    float kx = sw / pw, ky = sh / ph;
+    int total = g_lastCnt > 200 ? 200 : g_lastCnt;
+    for (int i = 0; i < total; i++) {
+        void *v = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        void *k = NULL;
+        if (!rd(v, &k, sizeof(k)) || !k || k != g_linkerClass) continue;
+        unsigned int id = 0;
+        if (!rd((char *)v + 0x4AC, &id, 4) || !id) continue;
+        float p[3] = {0, 0, 0};
+        if (!rd((char *)v + 0x4C4, p, sizeof(p))) continue;
+        if (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f) continue;
+        unsigned char camp = 0;
+        rd((char *)v + 0x504, &camp, 1);
+        float fx = 0, fy = 0, hx = 0, hy = 0;
+        if (!w2sPx(p[0], p[1], p[2], &fx, &fy)) continue;               // 脚下（像素）
+        if (!w2sPx(p[0], p[1] + 1.8f, p[2], &hx, &hy)) { hx = fx; hy = fy - 60.0f; }
+        // 像素 → 点（x 直接缩放；y 先翻转）
+        float fx2 = fx * kx, fy2 = (ph - fy) * ky;
+        float hx2 = hx * kx, hy2 = (ph - hy) * ky;
+        if (fx2 < -150.0f || fx2 > sw + 150.0f || fy2 < -150.0f || fy2 > sh + 150.0f) continue;
+        float h = fy2 - hy2;
+        if (!(h > 4.0f && h < 900.0f)) h = 40.0f;
+        float bw = h * 0.45f;
+        ImU32 col = (camp == 1) ? IM_COL32(80, 200, 255, 230)
+                   : (camp == 2) ? IM_COL32(255, 90, 90, 230)
+                                 : IM_COL32(235, 235, 235, 200);
+        dl->AddRect(ImVec2(fx2 - bw * 0.5f, hy2), ImVec2(fx2 + bw * 0.5f, fy2), col, 0.0f, 0, 1.8f);
+        char nb[24];
+        snprintf(nb, sizeof(nb), "%u", id);
+        dl->AddText(ImVec2(fx2 - bw * 0.5f, hy2 - 14.0f), col, nb);
+        g_a10Drawn++;
+        if (g_a10Drawn >= 40) break;
+    }
+}
+
+
 static void v132PosProj(void) {
     if (!g_a1Done || !g_inMatch || !g_lastEntries || g_lastCnt <= 0) return;
     if (!g_camObj || !g_miW2S) return;
@@ -8361,7 +8413,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v132 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v133 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -8374,7 +8426,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v132 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v133 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -8428,6 +8480,9 @@ static void updateHud(void) {
     for (int i = 0; i < g_a5N; i++) [s appendFormat:@"%s\n", g_a5[i]];
     for (int i = 0; i < g_a6N; i++) [s appendFormat:@"%s\n", g_a6[i]];
     for (int i = 0; i < g_a9N; i++) [s appendFormat:@"%s\n", g_a9[i]];
+    [s appendFormat:@"A10 drawn=%d k=%.2f/%.2f exp=%dx%d\n", g_a10Drawn,
+        (g_expW > 0) ? (g_scrW / (float)g_expW) : 0.0f,
+        (g_expH > 0) ? (g_scrH / (float)g_expH) : 0.0f, g_expW, g_expH];
     // v124b（审核 B1）：A1 只留 1 行 —— abort/seen/hits 已在 RUN 行，命中明细已定案
     if (g_a1Hits > 0) [s appendFormat:@"A1 hits=%d (detail off)\n", g_a1Hits];
     {
@@ -8667,7 +8722,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v132 booting";
+    l.text = @"ESP v133 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -8831,6 +8886,7 @@ static void renderOverlay(void) {
         ImGui::NewFrame();
 
         if (g_espOn) renderFrame(ImGui::GetBackgroundDrawList(), io.DisplaySize.x, io.DisplaySize.y);
+        if (g_espOn) drawBoxesAll(ImGui::GetBackgroundDrawList(), io.DisplaySize.x, io.DisplaySize.y);   // v133
         // v112r6：drawMenu 需要 dl/sw/sh（它内部要调 drawFixedPanel），签名与调用点必须一起改。
         // 这三个值只存在于本函数的 Io/参数里，过去写成无参调用 → 编译期 undeclared identifier。
         if (g_menuOpen) drawMenu(ImGui::GetBackgroundDrawList(), io.DisplaySize.x, io.DisplaySize.y);
