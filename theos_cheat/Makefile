@@ -15,7 +15,7 @@ cheat_FILES = Tweak.xm \
 
 cheat_CFLAGS  = -fobjc-arc -Iimgui -Iimgui/backends -w
 cheat_CCFLAGS = -std=c++17 -fno-exceptions -fno-rtti -Iimgui -w
-cheat_LDFLAGS = -framework UIKit -framework Metal -framework MetalKit -framework QuartzCore
+cheat_LDFLAGS = -framework UIKit -framework Metal -framework MetalKit -framework QuartzCore -framework AVFoundation
 
 # No substrate: PxExtFFi / tersafe / owl / pxauth all have zero third-party hook deps.
 # We do objc-runtime IMP swapping only, so there is nothing to link here.
