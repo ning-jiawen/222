@@ -1205,7 +1205,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v122 ====");
+    CHECK("==== dump v123 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1216,7 +1216,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v122 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v123 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6041,7 +6041,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v122 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v123 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -7044,19 +7044,26 @@ static void a2DumpObj(const char *tag, void *obj) {
 }
 
 // ============================================================================
-// v122 · A3：用 DD 指纹（60B / position@0x18 / 四元数@0x28）认记录
-// v122b（审核 B1/B2）：
-//   B1 命中先入候选表，按 |pos−自己| **升序**取前 10 —— 不再让"自己那条"被挤掉
-//   B2 走链从 k=1 起：base+0 是 klass 指针（off=8 已证明前面有 8 字节前缀），
-//      klass 也是合法指针，okptr 会放行 → 会把类元数据当对象、凑出假 DD
+// v123 · A3：加深走链 + 容器展开 + 距离用 W0
+// ----------------------------------------------------------------------------
+// B1（审核）：白名单必须含容器类（List`1 / Queue`1 / Dictionary`2 / HashSet`1 / []），
+//             且遇到容器要**展开 _items 按 60 字节切元素** —— DD 就在里面。
+// B2（审核）：距离改用 g_w0（米制世界坐标）；g_selfOk 来自老 ActorLinker 路径，d=0 时不可靠。
+// B3（审核）：四元数全 0 的候选接受但**降级**（qok=0），排序时排在合格候选之后。
 // ============================================================================
 #define A3_MAX   10
-#define A3_CAND  40
-static int  g_a3Done = 0, g_a3N = 0, g_a3CN = 0, g_a3Drop = 0, g_a3Wait = 0;
-static char g_a3[A3_MAX][170];
-static char g_a3Msg[3][170];
-static int  g_a3MsgN = 0;
-static struct { float d; char s[170]; } g_a3c[A3_CAND];
+#define A3_CAND  60
+#define A3_DDSTR 60
+#define A3_NODE  600
+
+typedef struct { float d; int qok; char s[170]; } A3CandT;
+static int   g_a3Done = 0, g_a3N = 0, g_a3CN = 0, g_a3Drop = 0, g_a3Wait = 0, g_a3Nodes = 0;
+static float g_a3sx = 0, g_a3sz = 0;   // B2：实际用于算距离的那对坐标（自证单位用）
+static int   g_a3SkipC = 0;           // B1：因严格探针不过被跳过的容器数
+static char  g_a3[A3_MAX][170];
+static char  g_a3Msg[3][170];
+static int   g_a3MsgN = 0;
+static A3CandT g_a3c[A3_CAND];
 
 static void a3Msg(const char *fmt, ...) {
     if (g_a3MsgN >= 3) return;
@@ -7066,29 +7073,42 @@ static void a3Msg(const char *fmt, ...) {
     g_a3MsgN++;
 }
 
-static void a3Cand(float d, const char *fmt, ...) {
+static float a3SelfDist(const float *pos) {
+    float sx, sz; int ok = 0;
+    if (g_selfOk) { sx = g_selfX; sz = g_selfZ; ok = 1; }
+    else if (g_w0[0] != 0.0f || g_w0[2] != 0.0f) { sx = g_w0[0]; sz = g_w0[2]; ok = 1; }  // B2
+    if (!ok) { g_a3sx = 0; g_a3sz = 0; return -1.0f; }
+    g_a3sx = sx; g_a3sz = sz;
+    float dx = pos[0] - sx, dz = pos[2] - sz;
+    return sqrtf(dx * dx + dz * dz);
+}
+
+static void a3Cand(float d, int qok, const char *fmt, ...) {
     char tmp[170];
     va_list ap; va_start(ap, fmt);
     vsnprintf(tmp, sizeof(tmp), fmt, ap);
     va_end(ap);
     if (g_a3CN < A3_CAND) {
-        g_a3c[g_a3CN].d = d;
+        g_a3c[g_a3CN].d = d; g_a3c[g_a3CN].qok = qok;
         snprintf(g_a3c[g_a3CN].s, sizeof(g_a3c[0].s), "%s", tmp);
         g_a3CN++;
         return;
     }
-    // B1（审核）：池满**不能先到先得** —— 否则最近的"自己"会被远处小兵挤掉。
-    // 找池内最差（d 最大）的那条，新候选更近就顶掉它。
-    int mi = 0;
-    for (int i = 1; i < g_a3CN; i++) if (g_a3c[i].d > g_a3c[mi].d) mi = i;
-    if (d < g_a3c[mi].d) {
-        g_a3c[mi].d = d;
+    // 池满：按 (qok, d) 找"最差"的替换 —— 合格的四元数优先、距离近的优先
+    int mi = 0; float mw = -2.0f;
+    for (int i = 0; i < g_a3CN; i++) {
+        float w = (float)g_a3c[i].qok * 1000000.0f - (g_a3c[i].d < 0 ? 5.0e5f : g_a3c[i].d);
+        if (w < mw || i == 0) { mw = w; mi = i; }
+    }
+    float nw = (float)qok * 1000000.0f - (d < 0 ? 5.0e5f : d);
+    if (nw > mw) {
+        g_a3c[mi].d = d; g_a3c[mi].qok = qok;
         snprintf(g_a3c[mi].s, sizeof(g_a3c[0].s), "%s", tmp);
     }
-    g_a3Drop++;      // B2：无论顶掉别人还是自己被丢，都记一笔
+    g_a3Drop++;
 }
 
-static int a3IsDD(void *p, unsigned *outId, float *outPos) {
+static int a3IsDD(void *p, unsigned *outId, float *outPos, int *outQok) {
     if (!p || !okptr((uintptr_t)p)) return 0;
     unsigned id = 0, pid = 0;
     float fw[3] = {0}, pos[3] = {0}, q[4] = {0,0,0,0};
@@ -7103,37 +7123,93 @@ static int a3IsDD(void *p, unsigned *outId, float *outPos) {
     if (!isfinite(pos[0]) || !isfinite(pos[2])) return 0;
     if (fabsf(pos[0]) > 20000.f || fabsf(pos[2]) > 20000.f) return 0;
     float qn = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
-    if (!isfinite(qn) || qn < 0.98f || qn > 1.02f) return 0;
+    if (!isfinite(qn)) return 0;
+    int qok = (qn >= 0.98f && qn <= 1.02f) ? 1 : (qn == 0.0f ? 0 : -1);
+    if (qok < 0) return 0;                     // 半初始化/异常 → 拒绝
     if (outId) *outId = id;
-    if (outPos) { outPos[0] = pos[0]; outPos[1] = pos[1]; outPos[2] = pos[2]; }
+    if (outPos) { outPos[0]=pos[0]; outPos[1]=pos[1]; outPos[2]=pos[2]; }
+    if (outQok) *outQok = qok;
     (void)fw; (void)gy; (void)pid;
     return 1;
 }
 
+static const char *a3ClsOf(void *obj) {
+    void *k = NULL;
+    if (!obj || !rd(obj, &k, sizeof(k)) || !k || !okptr((uintptr_t)k)) return NULL;
+    return real_class_get_name ? real_class_get_name(k)
+                               : (I2.class_get_name ? I2.class_get_name(k) : NULL);
+}
+
+// B1：容器展开 —— 读 _size@0x18 / _items@0x10，数据区 +0x20，按 60 字节切
+static void a3ScanContainer(void *obj, const char *src) {
+    int32_t n = -1;
+    if (!rd((char *)obj + 0x18, &n, 4)) return;
+    if (n <= 0 || n > 256) return;          // 上限提到 256（i<32 已封住实际扫描量）
+    void *items = NULL;
+    char *data = NULL;
+    if (rd((char *)obj + 0x10, &items, sizeof(items)) && items && okptr((uintptr_t)items))
+        data = (char *)items + 0x20;          // List<T>._items -> 数组数据区
+    else
+        data = (char *)obj + 0x20;            // 本身是数组
+    // B1（审核）：展开前严格试 **0…3 四条** —— DD 数组按 actor 槽位排布，第 0 槽常空；
+    // 只看第 0 条会把整条容器误杀，而屏上只显示 pool=0，与"图里没有 DD"无法区分。
+    // 任一条严格通过（非 q0）就展开；全不过才跳过，并计入 skipc。
+    {
+        int okAny = 0;
+        for (int q = 0; q < 4; q++) {
+            unsigned idq = 0; float pq[3] = {0}; int qq = 0;
+            if (a3IsDD(data + (size_t)q * A3_DDSTR, &idq, pq, &qq) && qq == 1) { okAny = 1; break; }
+        }
+        if (!okAny) { g_a3SkipC++; return; }
+    }
+    for (int i = 0; i < n && i < 32 && g_a3CN < A3_CAND; i++) {
+        void *e = (void *)(data + (size_t)i * A3_DDSTR);
+        unsigned id = 0; float pos[3] = {0}; int qok = 0;
+        if (!a3IsDD(e, &id, pos, &qok)) continue;
+        float d = a3SelfDist(pos);
+        a3Cand(d, qok, "%s[%d] a=%p id=%u d=%.1f%s (%.1f,%.1f,%.1f)",
+               src, i, e, id, d, qok ? "" : " q0", pos[0], pos[1], pos[2]);
+    }
+}
+
+static int a3Traversable(const char *cn) {
+    if (!cn) return 0;
+    if (strstr(cn, "String") || strstr(cn, "Type") || strstr(cn, "Assembly") ||
+        strstr(cn, "Method") || strstr(cn, "FieldInfo") || strstr(cn, "PropertyInfo")) return 0;
+    static const char *ok[] = { "Actor","Hero","Com","Entity","Unit","Frame","Record","Data",
+                                "Player","List","Queue","Dictionary","HashSet","[]","Object" };
+    for (unsigned i = 0; i < sizeof(ok)/sizeof(ok[0]); i++)
+        if (strstr(cn, ok[i])) return 1;
+    return 0;
+}
+
 static void a3Probe(const char *src, void *base, int hop) {
     if (!base || !okptr((uintptr_t)base)) return;
-    if (g_a3CN >= A3_CAND) return;
-    for (int k = 1; k < 16; k++) {          // B2：k 从 1 起，跳过 klass
+    if (g_a3CN >= A3_CAND || g_a3Nodes >= A3_NODE) return;
+    for (int k = 1; k < 16; k++) {          // k=0 是 klass，跳过
+        if (g_a3Nodes >= A3_NODE || g_a3CN >= A3_CAND) return;
         void *v = NULL;
         if (!rd((char *)base + k * 8, &v, sizeof(v))) continue;
         if (!v || !okptr((uintptr_t)v)) continue;
+        g_a3Nodes++;
         unsigned id = 0;
         float p[3] = {0};
-        if (a3IsDD(v, &id, p)) {
-            float d = 1e9f;
-            if (g_selfOk) { float dx = p[0] - g_selfX, dz = p[2] - g_selfZ; d = sqrtf(dx*dx + dz*dz); }
-            a3Cand(d, "%s h%d +%d a=%p id=%u d=%.1f (%.1f,%.1f,%.1f)",
-                   src, hop, k * 8, v, id, d, p[0], p[1], p[2]);
+        int qok = 0;
+        if (a3IsDD(v, &id, p, &qok)) {
+            float d = a3SelfDist(p);
+            a3Cand(d, qok, "%s h%d +%d a=%p id=%u d=%.1f%s (%.1f,%.1f,%.1f)",
+                   src, hop, k * 8, v, id, d, qok ? "" : " q0", p[0], p[1], p[2]);
             continue;
         }
-        if (hop < 2) a3Probe(src, v, hop + 1);
+        const char *cn = a3ClsOf(v);
+        if (cn && (strstr(cn, "List") || strstr(cn, "[]") || strstr(cn, "Queue") || strstr(cn, "HashSet")))
+            a3ScanContainer(v, src);        // B1：容器就地展开
+        if (hop < 4 && a3Traversable(cn)) a3Probe(src, v, hop + 1);
     }
 }
 
 static void v122DDScan(void) {
     if (!g_a1Done || !g_inMatch) return;
-    // B1（审核）：g_inMatch 是 cnt>0 推出来的 → 早期只有 1~3 条时会扫出 pool=0 并永久锁死。
-    // 现在：① 门限 g_cntRaw>=20；② 每 30 秒或 cnt 变化 >20% 允许重跑；③ wait 状态可显示。
     if (g_cntRaw < 20) { g_a3Wait = 1; return; }
     static double s_next = 0;
     static int    s_lastCnt = 0;
@@ -7143,19 +7219,17 @@ static void v122DDScan(void) {
     if (!need) return;
     s_next = now2 + 30.0;
     s_lastCnt = g_cntRaw;
-    g_a3Done = 1;
-    g_a3Wait = 0;
-    g_a3N = 0; g_a3CN = 0; g_a3Drop = 0; g_a3MsgN = 0;   // 重扫前清空
+    g_a3Done = 1; g_a3Wait = 0;
+    g_a3N = 0; g_a3CN = 0; g_a3Drop = 0; g_a3MsgN = 0; g_a3Nodes = 0; g_a3SkipC = 0;
 
     if (g_lastEntries) {
-        for (int i = 0; i < 24 && g_a3CN < A3_CAND; i++) {
+        for (int i = 0; i < 32 && g_a3CN < A3_CAND && g_a3Nodes < A3_NODE; i++) {
             void *val = NULL;
             if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &val, sizeof(val))) continue;
             if (val && okptr((uintptr_t)val)) a3Probe("d", val, 0);
         }
-    } else {
-        a3Msg("g no entries");
-    }
+    } else a3Msg("g no entries");
+
     {
         void *fs2 = a2FindClassByName("FrameSynchr");
         void *inst2 = fs2 ? findInstanceByStatic(fs2) : NULL;
@@ -7163,27 +7237,28 @@ static void v122DDScan(void) {
         else a3Msg("g fsInst none");
     }
 
-    // B1：按 |pos−自己| 升序，取前 A3_MAX
+    // 排序：qok 优先（合格在前），同级按 d 升序（未知 d 排最后）
     for (int i = 1; i < g_a3CN; i++) {
-        float d = g_a3c[i].d;
-        char s[170];
-        snprintf(s, sizeof(s), "%s", g_a3c[i].s);
+        A3CandT t = g_a3c[i];
+        float tw = (float)t.qok * 1000000.0f - (t.d < 0 ? 5.0e5f : t.d);
         int j = i - 1;
-        while (j >= 0 && g_a3c[j].d > d) {
-            g_a3c[j + 1].d = g_a3c[j].d;
-            snprintf(g_a3c[j + 1].s, sizeof(g_a3c[0].s), "%s", g_a3c[j].s);
+        while (j >= 0) {
+            float jw = (float)g_a3c[j].qok * 1000000.0f - (g_a3c[j].d < 0 ? 5.0e5f : g_a3c[j].d);
+            if (jw >= tw) break;
+            g_a3c[j + 1] = g_a3c[j];
             j--;
         }
-        g_a3c[j + 1].d = d;
-        snprintf(g_a3c[j + 1].s, sizeof(g_a3c[0].s), "%s", s);
+        g_a3c[j + 1] = t;
     }
-    for (int i = 0; i < g_a3CN && g_a3N < A3_MAX - 1; i++)   // 留最后一格给统计
+    for (int i = 0; i < g_a3CN && g_a3N < A3_MAX - 1; i++)
         snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "%s", g_a3c[i].s);
     if (g_a3N == 0 && g_a3CN == 0) a3Msg("g A3 none");
     for (int i = 0; i < g_a3MsgN && g_a3N < A3_MAX - 1; i++)
         snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "%s", g_a3Msg[i]);
-    snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "drop=%d pool=%d self=%d",
-             g_a3Drop, g_a3CN, g_selfOk ? 1 : 0);
+    snprintf(g_a3[g_a3N++], sizeof(g_a3[0]),
+             "drop=%d pool=%d nodes=%d skipc=%d self=%d sx=%.0f sz=%.0f",
+             g_a3Drop, g_a3CN, g_a3Nodes, g_a3SkipC,
+             (g_selfOk || g_w0[0] != 0.0f) ? 1 : 0, g_a3sx, g_a3sz);
 }
 static void v119FrameGraph(void) {
     if (g_a2Done || !g_a1Done) return;
@@ -7353,7 +7428,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v122 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v123 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -7365,7 +7440,7 @@ static void updateHud(void) {
         return;
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
-    [s appendFormat:@"ESP v122 BC=%d dn=%d\n", g_bc, g_dumpN];
+    [s appendFormat:@"ESP v123 BC=%d dn=%d\n", g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
     [s appendFormat:@"imgs %d cls %zu hits %d u %d r %d b %d p %d in %d c %d d %d%s\n",
@@ -7647,7 +7722,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v122 booting";
+    l.text = @"ESP v123 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
