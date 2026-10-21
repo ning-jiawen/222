@@ -1205,7 +1205,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v124 ====");
+    CHECK("==== dump v125 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1216,7 +1216,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v124 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v125 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6041,7 +6041,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v124 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v125 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -7051,7 +7051,7 @@ static void a2DumpObj(const char *tag, void *obj) {
 // B2（审核）：距离改用 g_w0（米制世界坐标）；g_selfOk 来自老 ActorLinker 路径，d=0 时不可靠。
 // B3（审核）：四元数全 0 的候选接受但**降级**（qok=0），排序时排在合格候选之后。
 // ============================================================================
-#define A3_MAX   12
+#define A3_MAX   14
 #define A3_CAND  60
 #define A3_DDSTR 60
 #define A3_NODE  2000
@@ -7081,13 +7081,13 @@ static void a3Msg(const char *fmt, ...) {
     g_a3MsgN++;
 }
 
+// v125（审核 B1）：距离**只认 W0**（米制世界坐标）。
+// g_selfOk 那条走的是老 ActorLinker 路径（实测 53/56 vs W0 1743/1007，同一自己的两个来源），
+// 用它算 d 会让全部候选"变远"，于是永远看不到 d<2。
 static float a3SelfDist(const float *pos) {
-    float sx, sz; int ok = 0;
-    if (g_selfOk) { sx = g_selfX; sz = g_selfZ; ok = 1; }
-    else if (g_w0[0] != 0.0f || g_w0[2] != 0.0f) { sx = g_w0[0]; sz = g_w0[2]; ok = 1; }  // B2
-    if (!ok) { g_a3sx = 0; g_a3sz = 0; return -1.0f; }
-    g_a3sx = sx; g_a3sz = sz;
-    float dx = pos[0] - sx, dz = pos[2] - sz;
+    if (g_w0[0] == 0.0f && g_w0[2] == 0.0f) { g_a3sx = 0; g_a3sz = 0; return -1.0f; }
+    g_a3sx = g_w0[0]; g_a3sz = g_w0[2];
+    float dx = pos[0] - g_a3sx, dz = pos[2] - g_a3sz;
     return sqrtf(dx * dx + dz * dz);
 }
 
@@ -7128,8 +7128,9 @@ static int a3IsDD(void *p, unsigned *outId, float *outPos, int *outQok) {
     if (!rd((char *)p + 36, &gy, 4)) return 0;
     if (!rd((char *)p + 40, q,   16)) return 0;
     if (!rd((char *)p + 56, &pid, 4)) return 0;
-    if (!isfinite(pos[0]) || !isfinite(pos[2])) return 0;
-    if (fabsf(pos[0]) > 20000.f || fabsf(pos[2]) > 20000.f) return 0;
+    if (!isfinite(pos[0]) || !isfinite(pos[1]) || !isfinite(pos[2])) return 0;
+    if (fabsf(pos[0]) > 20000.f || fabsf(pos[1]) > 20000.f || fabsf(pos[2]) > 20000.f) return 0;
+    // v125c：y 也必须量级正常 —— 实测有候选读出 (0, 6.9e22, 0)，那是错位内存，不是坐标
     float qn = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
     if (!isfinite(qn)) return 0;
     int qok = (qn >= 0.98f && qn <= 1.02f) ? 1 : (qn == 0.0f ? 0 : -1);
@@ -7199,10 +7200,10 @@ static void a3ScanContainer(void *obj, const char *src) {
         unsigned id = 0; float pos[3] = {0}; int qok = 0;
         if (!a3IsDD(e, &id, pos, &qok)) continue;
         if (a3Seen((unsigned long)e)) { g_a3Dup++; continue; }
-        if (pos[0] == 0.0f && pos[2] == 0.0f) { g_a3Zero++; continue; }   // 空槽
+        if (fabsf(pos[0]) < 0.5f && fabsf(pos[2]) < 0.5f) { g_a3Zero++; continue; }   // 近零=空槽
         g_a3Nz++;
         float d = a3SelfDist(pos);
-        a3Cand(d, qok, "%s[%d] a=%p id=%u d=%.1f%s (%.1f,%.1f,%.1f)",
+        a3Cand(d, qok, "%s[%d] a=%p id=%u d=%.1f%s (%.2f,%.2f,%.2f)",
                src, i, e, id, d, qok ? "" : " q0", pos[0], pos[1], pos[2]);
     }
 }
@@ -7232,10 +7233,10 @@ static void a3Probe(const char *src, void *base, int hop) {
         float p[3] = {0};
         int qok = 0;
         if (a3IsDD(v, &id, p, &qok)) {
-            if (p[0] == 0.0f && p[2] == 0.0f) { g_a3Zero++; continue; }   // v124：空槽不占池
+            if (fabsf(p[0]) < 0.5f && fabsf(p[2]) < 0.5f) { g_a3Zero++; continue; }   // v125：近零=空槽（带容差）
             g_a3Nz++;
             float d = a3SelfDist(p);
-            a3Cand(d, qok, "%s h%d +%d a=%p id=%u d=%.1f%s (%.1f,%.1f,%.1f)",
+            a3Cand(d, qok, "%s h%d +%d a=%p id=%u d=%.1f%s (%.2f,%.2f,%.2f)",
                    src, hop, k * 8, v, id, d, qok ? "" : " q0", p[0], p[1], p[2]);
             continue;
         }
@@ -7245,6 +7246,40 @@ static void a3Probe(const char *src, void *base, int hop) {
             a3ScanContainer(v, src);        // B1：容器就地展开
         if (hop < 4 && a3Traversable(cnb)) a3Probe(src, v, hop + 1);
     }
+}
+
+// v125（审核 B3）：按**内容**判断一个容器是不是 DD 数组 —— 不看类型名。
+// 读 size@0x18、data@(_items+0x20 或 obj+0x20)，0…3 槽严格探针；通过则记前 2 条。
+#define A3_C2MAX 4
+static char g_a3c2[A3_C2MAX][170];
+static int  g_a3c2N = 0, g_a3Sc = 0, g_a3Ic = 0, g_a3ValSkip = 0, g_a3Cls5 = 0;   // v125
+
+static int a3TryDDContainer(const char *tag, void *obj) {
+    if (!obj || !okptr((uintptr_t)obj) || g_a3c2N >= A3_C2MAX) return 0;
+    int32_t n = -1;
+    if (!rd((char *)obj + 0x18, &n, 4)) return 0;
+    if (n <= 0 || n > 512) return 0;
+    void *items = NULL;
+    char *data = NULL;
+    if (rd((char *)obj + 0x10, &items, sizeof(items)) && items && okptr((uintptr_t)items))
+        data = (char *)items + 0x20;
+    else
+        data = (char *)obj + 0x20;
+    int okAny = 0;
+    for (int q = 0; q < 4; q++) {
+        unsigned idq = 0; float pq[3] = {0}; int qq = 0;
+        if (a3IsDD(data + (size_t)q * A3_DDSTR, &idq, pq, &qq) && qq == 1) { okAny = 1; break; }
+    }
+    if (!okAny) return 0;
+    snprintf(g_a3c2[g_a3c2N++], sizeof(g_a3c2[0]), "%s n=%d a=%p", tag, (int)n, obj);
+    for (int i = 0; i < n && i < 2 && g_a3c2N < A3_C2MAX; i++) {
+        unsigned id = 0; float pos[3] = {0}; int qok = 0;
+        if (!a3IsDD(data + (size_t)i * A3_DDSTR, &id, pos, &qok)) continue;
+        float d = a3SelfDist(pos);
+        snprintf(g_a3c2[g_a3c2N++], sizeof(g_a3c2[0]),
+                 "%s[%d] id=%u d=%.1f (%.2f,%.2f,%.2f)", tag, i, id, d, pos[0], pos[1], pos[2]);
+    }
+    return 1;
 }
 
 static void v122DDScan(void) {
@@ -7260,7 +7295,7 @@ static void v122DDScan(void) {
     s_lastCnt = g_cntRaw;
     g_a3Done = 1; g_a3Wait = 0;
     g_a3N = 0; g_a3CN = 0; g_a3Drop = 0; g_a3MsgN = 0; g_a3Nodes = 0; g_a3SkipC = 0;
-    g_a3Zero = 0; g_a3Dup = 0; g_a3Nz = 0;
+    g_a3Zero = 0; g_a3Dup = 0; g_a3Nz = 0; g_a3c2N = 0; g_a3Sc = 0; g_a3Ic = 0; g_a3ValSkip = 0; g_a3Cls5 = 0;
     for (int i = 0; i < 4096; i++) g_a3Seen[i] = 0;
 
     if (g_lastEntries) {
@@ -7276,6 +7311,78 @@ static void v122DDScan(void) {
         void *inst2 = fs2 ? findInstanceByStatic(fs2) : NULL;
         if (inst2) a3Probe("f", inst2, 0);
         else a3Msg("g fsInst none");
+    }
+
+    // ---- B3-①：全类**静态**字段，按内容验容器（不看类型名）----
+    {
+        size_t n5 = 0;
+        void **a5 = (void **)I2.domain_get_assemblies(I2.domain, &n5);
+        int fv5 = 0, cls5 = 0;
+        for (size_t i5 = 0; a5 && i5 < n5 && fv5 < 200000 && cls5 < 600 && g_a3c2N < A3_C2MAX; i5++) {
+            void *im5 = a5[i5] ? I2.assembly_get_image(a5[i5]) : NULL;
+            if (!im5) continue;
+            int cc5 = (int)I2.image_get_class_count(im5);
+            for (int k5 = 0; k5 < cc5 && fv5 < 200000 && cls5 < 600 && g_a3c2N < A3_C2MAX; k5++) {
+                void *c5 = I2.image_get_class(im5, k5);
+                if (!c5) continue;
+                // B2（审核）：不再扫全部 64k 类 —— 对每个类调 field_static_get_value 会触发它的 cctor，
+                // 这正是 v17/v19 定位过的崩溃源。只扫名字命中的类（Frame/Record/Synchr/Manager/Data/System）。
+                char cn5[48] = "";
+                if (!a3ClsNameSafe(c5, cn5, sizeof(cn5))) continue;
+                if (!strstr(cn5, "Frame") && !strstr(cn5, "Record") && !strstr(cn5, "Synchr") &&
+                    !strstr(cn5, "Manager") && !strstr(cn5, "Data") && !strstr(cn5, "System")) continue;
+                cls5++;
+                void *it5 = NULL, *f5 = NULL;
+                int g5 = 0;
+                while ((f5 = I2.class_get_fields(c5, &it5)) && f5 && g5++ < 200 && fv5++ < 200000) {
+                    if (!(I2.field_get_flags(f5) & 0x10)) continue;              // 只取 static
+                    // B1（审核）：先判类型 —— 值类型静态字段**直接跳过**（既防栈踩，也少触发 cctor）
+                    void *ft5 = I2.field_get_type ? I2.field_get_type(f5) : NULL;
+                    void *fc5 = ft5 ? I2.class_from_il2cpp_type(ft5) : NULL;
+                    int isVal5 = (fc5 && I2.class_is_valuetype) ? I2.class_is_valuetype(fc5) : -1;
+                    if (isVal5 != 0) { g_a3ValSkip++; continue; }
+                    // 引用类型：用 256 字节缓冲接（API 按字段类型大小写入，绝不能用 8 字节栈槽）
+                    unsigned char sbuf[256];
+                    memset(sbuf, 0, sizeof(sbuf));
+                    I2.field_static_get_value(f5, sbuf);
+                    void *v5 = NULL;
+                    memcpy(&v5, sbuf, sizeof(v5));
+                    if (!v5 || !okptr((uintptr_t)v5)) continue;
+                    char fn5[40] = "?", tag5[110];
+                    safeCopyStr(I2.field_get_name ? I2.field_get_name(f5) : NULL, fn5, sizeof(fn5));
+                    snprintf(tag5, sizeof(tag5), "S %s.%s", cn5, fn5);
+                    if (a3TryDDContainer(tag5, v5)) g_a3Sc++;
+                }
+            }
+        }
+        g_a3Cls5 = cls5;
+    }
+
+    // ---- B3-②：实例侧（FrameSynchr 单例 / ActorManager）字段，同样按内容验 ----
+    {
+        void *srcs[2] = { NULL, g_mgr };
+        void *fs3 = a2FindClassByName("FrameSynchr");
+        srcs[0] = fs3 ? findInstanceByStatic(fs3) : NULL;
+        void *kls[2] = { fs3, g_mgrClass };
+        const char *tags[2] = { "I fs", "I mgr" };
+        for (int z = 0; z < 2; z++) {
+            void *ob = srcs[z], *kl = kls[z];
+            if (!ob || !kl || !okptr((uintptr_t)ob)) continue;
+            void *it6 = NULL, *f6 = NULL;
+            int g6 = 0;
+            while ((f6 = I2.class_get_fields(kl, &it6)) && f6 && g6++ < 200 && g_a3c2N < A3_C2MAX) {
+                if (I2.field_get_flags(f6) & 0x10) continue;                 // 只取实例字段
+                int off6 = I2.field_get_offset ? I2.field_get_offset(f6) : -1;
+                if (off6 < 0) continue;
+                void *v6 = NULL;
+                if (!rd((char *)ob + off6, &v6, sizeof(v6))) continue;
+                if (!v6 || !okptr((uintptr_t)v6)) continue;
+                char fn6[40] = "?", tag6[110];
+                safeCopyStr(I2.field_get_name ? I2.field_get_name(f6) : NULL, fn6, sizeof(fn6));
+                snprintf(tag6, sizeof(tag6), "%s.%s", tags[z], fn6);
+                if (a3TryDDContainer(tag6, v6)) g_a3Ic++;
+            }
+        }
     }
 
     // 排序：qok 优先（合格在前），同级按 d 升序（未知 d 排最后）
@@ -7295,13 +7402,15 @@ static void v122DDScan(void) {
     for (int i = 0; i < g_a3CN && i < 6; i++)
         snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "%s", g_a3c[i].s);
     if (g_a3N == 0 && g_a3CN == 0) a3Msg("g A3 none");
+    for (int i = 0; i < g_a3c2N && i < A3_C2MAX; i++)
+        snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "%s", g_a3c2[i]);
     for (int i = 0; i < g_a3MsgN && i < 2; i++)
         snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "%s", g_a3Msg[i]);
     if (g_a3MsgN > 2) snprintf(g_a3[g_a3N++], sizeof(g_a3[0]), "s +%d more", g_a3MsgN - 2);
     snprintf(g_a3[g_a3N++], sizeof(g_a3[0]),
-             "pool=%d nz=%d zero=%d dup=%d skipc=%d nodes=%d self=%d %.0f/%.0f",
-             g_a3CN, g_a3Nz, g_a3Zero, g_a3Dup, g_a3SkipC, g_a3Nodes,
-             (g_selfOk || g_w0[0] != 0.0f) ? 1 : 0, g_a3sx, g_a3sz);
+             "pool=%d nz=%d zero=%d dup=%d skipc=%d nodes=%d sc=%d ic=%d vs=%d c5=%d w0=%.0f/%.0f alt=%.0f/%.0f",
+             g_a3CN, g_a3Nz, g_a3Zero, g_a3Dup, g_a3SkipC, g_a3Nodes, g_a3Sc, g_a3Ic, g_a3ValSkip, g_a3Cls5,
+             g_a3sx, g_a3sz, g_selfOk ? g_selfX : 0.0f, g_selfOk ? g_selfZ : 0.0f);
 }
 static void v119FrameGraph(void) {
     if (g_a2Done || !g_a1Done) return;
@@ -7471,7 +7580,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v124 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v125 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -7484,7 +7593,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v124 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v125 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -7771,7 +7880,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v124 booting";
+    l.text = @"ESP v125 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
