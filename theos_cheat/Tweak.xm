@@ -1205,7 +1205,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v128 ====");
+    CHECK("==== dump v129 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1216,7 +1216,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v128 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v129 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6041,7 +6041,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v128 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v129 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6141,6 +6141,7 @@ static void v119FrameGraph(void);   // v119：定义在 updateHud 之前
 static void v122DDScan(void);       // v122：DD 指纹扫描（对局内一次性）
 static void v127Keys(void);         // v127：字典 key 纯打印（v128 native 搜的输入）
 static void v128AllHeroes(void);    // v128：全 actor 无过滤位置对照（评审①）
+static void v129WorldScan(void);    // v129：世界量级扫描 + 投影验证
 
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v115：M1 扫描关闭（v114 因 SAT=1 被 VOID，本版只回答路径 A）
@@ -6149,6 +6150,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     if (g_il2cppOk) v122DDScan();     // v122：对局内一次性，用 DD 指纹认记录
     if (g_il2cppOk) v127Keys();       // v127：只打 key 列表，不搜索
     if (g_il2cppOk) v128AllHeroes();  // v128：全 actor 位置对照
+    if (g_il2cppOk) v129WorldScan();  // v129：世界量级 + 投影验证
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
@@ -7407,7 +7409,7 @@ static void v127Keys(void) {
 // 目的：把一个敌人放进雾里，对比前后两屏 —— 坐标不变 = 真值一直在（省 2-3 版）。
 // 偏移全部沿用既有代码：id@0x4AC、pos@0x4C4、camp@0x504。
 // ============================================================================
-#define A5_LINES 6
+#define A5_LINES 3
 static char g_a5[A5_LINES][200];
 static int  g_a5N = 0;
 
@@ -7459,6 +7461,134 @@ static void v128AllHeroes(void) {
     if (g_a5N < A5_LINES)
         snprintf(g_a5[g_a5N++], sizeof(g_a5[0]),
                  "A5n shown=%d zero=%d nz=%d cnt=%d", shown, zero, nonZero, g_lastCnt);
+}
+
+// ============================================================================
+// v129 · A6：世界量级扫描 + 投影验证（评审①）
+//   背景：W0 其实是 W2S(世界原点) 的**屏幕像素**，不是米制；此前所有 d= 都无效。
+//         +0x4C4 实测两小时不变 —— 是出生点，不是位置。
+//   做法：在 self(ActorLinker) 内扫 0x8…size，挑 x,z 落在世界量级的 float/int 三元组，
+//         逐个用游戏自己的 WorldToScreenPoint 投影，打印 off / 原始三值 / 屏幕坐标。
+//   判据：哪个候选投影落在我自己身上（第三人称下稳定在屏幕中心附近）。
+// ============================================================================
+#define A6_LINES 8
+#define A6_CAND  256
+typedef struct { int off; int isI; float v[3]; float sx, sy; int on; } A6CandT;
+static char  g_a6[A6_LINES][200];
+static int   g_a6N = 0;
+static A6CandT g_a6c[A6_CAND];
+static float g_a6key[A6_CAND];
+static int   g_a6cN = 0;
+static struct { int off; float sx, sy; } g_a6prev[A6_CAND];
+static int   g_a6prevN = 0;
+
+static float a6Key(const A6CandT *c, float cx, float cy) {
+    if (!c->on) return 1e7f;                       // 投影失败：排到底
+    return fabsf(c->sx - cx) + fabsf(c->sy - cy);   // 到屏幕中下的距离
+}
+
+// v129c（审核 B1）：**top-K 保留** —— 槽满时若新 key 更小就顶掉池内最大者。
+// 与 v122 的 a3Cand 同一写法；先到先得会让"真实位置"永远进不来（第 11 次同类错误）。
+static void a6Push(A6CandT c, float key) {
+    if (g_a6cN < A6_CAND) { g_a6c[g_a6cN] = c; g_a6key[g_a6cN] = key; g_a6cN++; return; }
+    int mi = 0;
+    float mw = g_a6key[0];
+    for (int i = 1; i < g_a6cN; i++) if (g_a6key[i] > mw) { mw = g_a6key[i]; mi = i; }
+    if (key < mw) { g_a6c[mi] = c; g_a6key[mi] = key; }
+}
+
+static void v129WorldScan(void) {
+    if (!g_a1Done || !g_inMatch || !g_lastEntries || g_lastCnt <= 0) return;
+    if (!g_camObj || !g_miW2S) return;
+    static double s6Next = 0;
+    static int    s6Valid = 0;
+    double now6 = CACurrentMediaTime();
+    if (s6Valid && now6 < s6Next) return;
+    s6Next = now6 + 20.0;
+    s6Valid = 1;
+    g_a6N = 0; g_a6cN = 0;
+
+    void *self = NULL;
+    int total = g_lastCnt > 200 ? 200 : g_lastCnt;
+    for (int i = 0; i < total; i++) {
+        void *v = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        void *k = NULL;
+        if (!rd(v, &k, sizeof(k)) || !k || k != g_linkerClass) continue;
+        unsigned int id = 0;
+        if (rd((char *)v + 0x4AC, &id, 4) && id == (unsigned int)g_rawHostId) { self = v; break; }
+    }
+    if (!self) { snprintf(g_a6[g_a6N++], sizeof(g_a6[0]), "A6 no self id=%d", g_rawHostId); return; }
+
+    int sz = (I2.class_instance_size && g_linkerClass) ? (int)I2.class_instance_size(g_linkerClass) : 0;
+    if (sz <= 0 || sz > 0x4000) sz = 0x2000;
+    float sw = (float)g_scrW, sh = (float)g_scrH;
+    float cx = sw * 0.5f, cy = sh * 0.65f;
+
+    for (int off = 0x8; off + 12 <= sz; off += 4) {          // 整段扫完，无行数限制
+        float f[3] = {0, 0, 0};
+        if (!rd((char *)self + off, f, sizeof(f))) continue;
+        int isI = 0;
+        // v129c（审核 B2）：三值有限、|y|<=2000、|x|+|z|>=1 —— 减少噪声占地
+        int okF = (isfinite(f[0]) && isfinite(f[1]) && isfinite(f[2]) &&
+                   fabsf(f[0]) <= 1400.0f && fabsf(f[2]) <= 1400.0f &&
+                   fabsf(f[1]) <= 2000.0f && (fabsf(f[0]) + fabsf(f[2]) >= 1.0f));
+        if (!okF) {
+            int iv[3] = {0, 0, 0};
+            if (rd((char *)self + off, iv, sizeof(iv))) {
+                float ix = iv[0] / 1000.0f, iy = iv[1] / 1000.0f, iz = iv[2] / 1000.0f;
+                if (fabsf(ix) <= 1400.0f && fabsf(iz) <= 1400.0f && fabsf(iy) <= 2000.0f &&
+                    (fabsf(ix) + fabsf(iz) >= 1.0f)) {
+                    isI = 1; f[0] = ix; f[1] = iy; f[2] = iz;
+                }
+            }
+            if (!isI) continue;
+        }
+        A6CandT c;
+        c.off = off; c.isI = isI;
+        c.v[0] = f[0]; c.v[1] = f[1]; c.v[2] = f[2];
+        c.on = w2sPx(f[0], f[1], f[2], &c.sx, &c.sy);
+        a6Push(c, a6Key(&c, cx, cy));
+    }
+
+    // 排序取前 6
+    for (int i = 1; i < g_a6cN; i++) {
+        A6CandT t = g_a6c[i]; float tw = g_a6key[i];
+        int j = i - 1;
+        while (j >= 0 && g_a6key[j] > tw) {
+            g_a6c[j + 1] = g_a6c[j]; g_a6key[j + 1] = g_a6key[j]; j--;
+        }
+        g_a6c[j + 1] = t; g_a6key[j + 1] = tw;
+    }
+
+    int shown = 0;
+    for (int i = 0; i < g_a6cN && g_a6N < A6_LINES - 1 && shown < 6; i++, shown++) {
+        float dpx = -1.0f;
+        for (int q = 0; q < g_a6prevN; q++)
+            if (g_a6prev[q].off == g_a6c[i].off) {
+                dpx = fabsf(g_a6prev[q].sx - g_a6c[i].sx) + fabsf(g_a6prev[q].sy - g_a6c[i].sy);
+                break;
+            }
+        int near = (g_a6c[i].on && g_a6c[i].sx > sw * 0.2f && g_a6c[i].sx < sw * 0.8f &&
+                    g_a6c[i].sy > sh * 0.2f && g_a6c[i].sy < sh * 0.9f);
+        if (dpx >= 0.0f)
+            snprintf(g_a6[g_a6N++], sizeof(g_a6[0]), "A6%s off=0x%X (%.0f,%.0f,%.0f) s=%.0f,%.0f dpx=%.0f%s",
+                     g_a6c[i].isI ? "i" : "f", g_a6c[i].off, g_a6c[i].v[0], g_a6c[i].v[1], g_a6c[i].v[2],
+                     g_a6c[i].sx, g_a6c[i].sy, dpx, near ? " NEAR" : "");
+        else
+            snprintf(g_a6[g_a6N++], sizeof(g_a6[0]), "A6%s off=0x%X (%.0f,%.0f,%.0f) s=%.0f,%.0f dpx=new%s",
+                     g_a6c[i].isI ? "i" : "f", g_a6c[i].off, g_a6c[i].v[0], g_a6c[i].v[1], g_a6c[i].v[2],
+                     g_a6c[i].sx, g_a6c[i].sy, near ? " NEAR" : "");
+    }
+    g_a6prevN = 0;
+    for (int i = 0; i < g_a6cN && g_a6prevN < A6_CAND; i++) {
+        g_a6prev[g_a6prevN].off = g_a6c[i].off;
+        g_a6prev[g_a6prevN].sx = g_a6c[i].sx;
+        g_a6prev[g_a6prevN].sy = g_a6c[i].sy;
+        g_a6prevN++;
+    }
+    if (g_a6N < A6_LINES)
+        snprintf(g_a6[g_a6N++], sizeof(g_a6[0]), "A6n cand=%d size=%d scr=%.0fx%.0f", g_a6cN, sz, sw, sh);
 }
 
 static void v122DDScan(void) {
@@ -7768,7 +7898,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v128 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v129 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -7781,7 +7911,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v128 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v129 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -7833,6 +7963,7 @@ static void updateHud(void) {
     // v127c（审核 M2）：A4 独立打印 —— 不能挂在 A3 分支里，否则 A3 一条不出时 A4 跟着消失
     for (int i = 0; i < g_a4N; i++) [s appendFormat:@"%s\n", g_a4[i]];
     for (int i = 0; i < g_a5N; i++) [s appendFormat:@"%s\n", g_a5[i]];
+    for (int i = 0; i < g_a6N; i++) [s appendFormat:@"%s\n", g_a6[i]];
     // v124b（审核 B1）：A1 只留 1 行 —— abort/seen/hits 已在 RUN 行，命中明细已定案
     if (g_a1Hits > 0) [s appendFormat:@"A1 hits=%d (detail off)\n", g_a1Hits];
     {
@@ -8072,7 +8203,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v128 booting";
+    l.text = @"ESP v129 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
