@@ -1205,7 +1205,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v130 ====");
+    CHECK("==== dump v131 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1216,7 +1216,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v130 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v131 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6041,7 +6041,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v130 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v131 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6143,6 +6143,7 @@ static void v127Keys(void);         // v127：字典 key 纯打印（v128 native
 static void v128AllHeroes(void);    // v128：全 actor 无过滤位置对照（评审①）
 static void v129WorldScan(void);    // v129：世界量级扫描 + 投影验证
 static void v130StructScan(void);   // v130：ActorLinker 1-2 跳 int32 三值扫描
+static void v131GetPos(void);       // v131：直接调 get_Position 等 getter
 
 static void renderFrame(ImDrawList *dl, float sw, float sh) {
     // v115：M1 扫描关闭（v114 因 SAT=1 被 VOID，本版只回答路径 A）
@@ -6150,9 +6151,11 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     if (g_il2cppOk) v119FrameGraph(); // A1 完成后一次性：顺 FrameSynchr 找 FrameRecord
     if (g_il2cppOk) v122DDScan();     // v122：对局内一次性，用 DD 指纹认记录
     if (g_il2cppOk) v127Keys();       // v127：只打 key 列表，不搜索
-    if (g_il2cppOk) v128AllHeroes();  // v128：全 actor 位置对照
-    if (g_il2cppOk) v129WorldScan();  // v129：世界量级 + 投影验证
-    if (g_il2cppOk) v130StructScan(); // v130：1-2 跳 int32 坐标扫描
+    // v131（评审）：A5/A6/A7 全部停用 —— 位置不在字段里，只在 getter 里
+    // if (g_il2cppOk) v128AllHeroes();
+    // if (g_il2cppOk) v129WorldScan();
+    // if (g_il2cppOk) v130StructScan();
+    if (g_il2cppOk) v131GetPos();     // v131：get_Position / get_GroundY / 可见性
     // v82：这两个必须在所有 early return 之前 —— v81 放在 5 个 return 之后，
     // 只要有一帧 entries 读失败（Dent fail），诊断包就整帧被跳过，一行都出不来。
     rtTick();
@@ -7745,6 +7748,141 @@ static void v130StructScan(void) {
                  g_a7sN, g_a7eN, matchN, g_a7Fld, g_a7W, g_a7W2);
 }
 
+// ============================================================================
+// v131 · A8：直接调用游戏自己的 getter（唯一命中"位置"语义的一条路）
+//   metadata 已确认 IActorLinker 有 get_Position/get_Rotation/get_Forward/get_GroundY/
+//   get_MyTransform/get_Visible/get_InCamera/get_MeshVisible，且 Vector3 返回 ABI 已由 W2S 验证。
+// 安全约束（评审要求）：
+//   · 只对**当帧从字典拿到、且 klass==g_linkerClass** 的活对象调用；绝不对缓存指针调用
+//   · 每次刷新最多 6 次调用（self: P/G/V/IC/MV，enemy: P），5 秒一轮
+//   · 任何 mi 为空 → 打印并跳过，不调用
+// ============================================================================
+#define A8_LINES 7
+static char g_a8[A8_LINES][200];
+static int  g_a8N = 0, g_a8Calls = 0;
+static void *g_miPos = NULL, *g_miGY = NULL, *g_miVis = NULL, *g_miInCam = NULL, *g_miMeshVis = NULL;
+static void *g_miTransform = NULL;   // v131b：get_MyTransform → Transform.get_position
+
+static void a8Resolve(void) {
+    if (g_miPos || !g_linkerClass || !I2.class_get_method_from_name) return;
+    g_miPos     = I2.class_get_method_from_name(g_linkerClass, "get_Position", 0);
+    g_miGY      = I2.class_get_method_from_name(g_linkerClass, "get_GroundY", 0);
+    g_miVis     = I2.class_get_method_from_name(g_linkerClass, "get_Visible", 0);
+    g_miInCam   = I2.class_get_method_from_name(g_linkerClass, "get_InCamera", 0);
+    g_miMeshVis = I2.class_get_method_from_name(g_linkerClass, "get_MeshVisible", 0);
+    g_miTransform = I2.class_get_method_from_name(g_linkerClass, "get_MyTransform", 0);
+}
+
+static void a8Dump(const char *tag, void *actor) {
+    if (!actor || g_a8N >= A8_LINES) return;
+    float px = 0, py = 0, pz = 0, gy = -1.0f;
+    float tx = 0, ty = 0, tz = 0;
+    int vis = -1, incam = -1, mv = -1, tOK = 0;
+    if (g_miPos && g_a8Calls < 8) {
+        void *fn = *(void **)g_miPos;
+        if (fn) { Vec3 r = ((Vec3 (*)(void *, void *))fn)(actor, g_miPos);
+                  px = r.x; py = r.y; pz = r.z; g_a8Calls++; }
+    }
+    if (g_miGY && g_a8Calls < 8) {
+        void *fn = *(void **)g_miGY;
+        if (fn) { gy = ((float (*)(void *, void *))fn)(actor, g_miGY); g_a8Calls++; }
+    }
+    if (g_miVis && g_a8Calls < 8) {
+        void *fn = *(void **)g_miVis;
+        if (fn) { vis = (int)((char (*)(void *, void *))fn)(actor, g_miVis); g_a8Calls++; }
+    }
+    if (g_miInCam && g_a8Calls < 8) {
+        void *fn = *(void **)g_miInCam;
+        if (fn) { incam = (int)((char (*)(void *, void *))fn)(actor, g_miInCam); g_a8Calls++; }
+    }
+    if (g_miMeshVis && g_a8Calls < 8) {
+        void *fn = *(void **)g_miMeshVis;
+        if (fn) { mv = (int)((char (*)(void *, void *))fn)(actor, g_miMeshVis); g_a8Calls++; }
+    }
+    // v131b（审核 B1）：Transform.position 作为**并列主输出** —— 用来分辨"局部量 vs Unity 世界"
+    if (g_miTransform && g_a8Calls < 8) {
+        void *fn = *(void **)g_miTransform;
+        if (fn) {
+            void *tr = ((void *(*)(void *, void *))fn)(actor, g_miTransform);
+            g_a8Calls++;
+            if (tr && okptr((uintptr_t)tr)) {
+                void *tk = NULL;
+                if (rd(tr, &tk, sizeof(tk)) && tk) {
+                    char kn[48] = "";
+                    // 崩溃面守则：类名必须含 Transform，否则跳过（native 侧被销毁时调用会崩）
+                    if (a3KlassName(tk, kn, sizeof(kn)) && strstr(kn, "Transform") &&
+                        I2.class_get_method_from_name && g_a8Calls < 8) {
+                        void *mip = I2.class_get_method_from_name(tk, "get_position", 0);
+                        if (mip) {
+                            void *fp = *(void **)mip;
+                            if (fp) { Vec3 t = ((Vec3 (*)(void *, void *))fp)(tr, mip);
+                                      tx = t.x; ty = t.y; tz = t.z; tOK = 1; g_a8Calls++; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    unsigned int id = 0;
+    rd((char *)actor + 0x4AC, &id, 4);
+    if (tOK)
+        snprintf(g_a8[g_a8N++], sizeof(g_a8[0]),
+                 "A8 %s id=%u P=%.2f,%.2f,%.2f T=%.2f,%.2f,%.2f G=%.2f V=%d IC=%d MV=%d",
+                 tag, id, px, py, pz, tx, ty, tz, gy, vis, incam, mv);
+    else
+        snprintf(g_a8[g_a8N++], sizeof(g_a8[0]),
+                 "A8 %s id=%u P=%.2f,%.2f,%.2f T=na G=%.2f V=%d IC=%d MV=%d",
+                 tag, id, px, py, pz, gy, vis, incam, mv);
+}
+
+static void v131GetPos(void) {
+    if (!g_a1Done || !g_inMatch || !g_lastEntries || g_lastCnt <= 0) return;
+    static double s8Next = 0;
+    static int    s8Valid = 0;
+    double now8 = CACurrentMediaTime();
+    if (s8Valid && now8 < s8Next) return;
+    s8Next = now8 + 5.0;                       // 5 秒一轮，方便比对"雾前/雾后"
+    s8Valid = 1;
+    g_a8N = 0; g_a8Calls = 0;
+    a8Resolve();
+    if (!g_miPos) { snprintf(g_a8[g_a8N++], sizeof(g_a8[0]), "A8 no get_Position"); return; }
+
+    void *self = NULL, *enemy = NULL;
+    int selfCamp = -1;
+    int total = g_lastCnt > 200 ? 200 : g_lastCnt;
+    for (int i = 0; i < total && !self; i++) {
+        void *v = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        void *k = NULL;
+        if (!rd(v, &k, sizeof(k)) || !k || k != g_linkerClass) continue;
+        unsigned int id = 0;
+        if (!rd((char *)v + 0x4AC, &id, 4) || !id) continue;
+        if (id == (unsigned int)g_rawHostId) {
+            self = v;
+            unsigned char c8 = 0; rd((char *)v + 0x504, &c8, 1); selfCamp = (int)c8;
+        }
+    }
+    if (!self) { snprintf(g_a8[g_a8N++], sizeof(g_a8[0]), "A8 no self id=%d", g_rawHostId); return; }
+    for (int i = 0; i < total && !enemy; i++) {
+        void *v = NULL;
+        if (!rd((char *)g_lastEntries + g_arrBase + (size_t)i * 24 + 16, &v, sizeof(v)) || !v) continue;
+        void *k = NULL;
+        if (!rd(v, &k, sizeof(k)) || !k || k != g_linkerClass) continue;
+        if (v == self) continue;
+        unsigned int id = 0;
+        if (!rd((char *)v + 0x4AC, &id, 4) || !id) continue;
+        unsigned char c8 = 0; rd((char *)v + 0x504, &c8, 1);
+        if (selfCamp >= 0 && (int)c8 == selfCamp) continue;   // v131：只按阵营区分，不要求 cfg
+        enemy = v;
+    }
+    a8Dump("self", self);
+    if (enemy) a8Dump("enemy", enemy);
+    else snprintf(g_a8[g_a8N++], sizeof(g_a8[0]), "A8 no enemy camp=%d", selfCamp);
+    if (g_a8N < A8_LINES)
+        snprintf(g_a8[g_a8N++], sizeof(g_a8[0]), "A8n calls=%d miP=%d miT=%d gy=%d",
+                 g_a8Calls, g_miPos ? 1 : 0, g_miTransform ? 1 : 0, g_miGY ? 1 : 0);
+}
+
 static void v122DDScan(void) {
     if (!g_a1Done || !g_inMatch) return;
     if (g_cntRaw < 20) { g_a3Wait = 1; return; }
@@ -8052,7 +8190,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v130 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
+            @"ESP v131 u%d d%d on%d off%d scan%d c%d in%d pg%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -8065,7 +8203,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v130 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v131 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -8118,7 +8256,7 @@ static void updateHud(void) {
     for (int i = 0; i < g_a4N; i++) [s appendFormat:@"%s\n", g_a4[i]];
     for (int i = 0; i < g_a5N; i++) [s appendFormat:@"%s\n", g_a5[i]];
     for (int i = 0; i < g_a6N; i++) [s appendFormat:@"%s\n", g_a6[i]];
-    for (int i = 0; i < g_a7N; i++) [s appendFormat:@"%s\n", g_a7[i]];
+    for (int i = 0; i < g_a8N; i++) [s appendFormat:@"%s\n", g_a8[i]];
     // v124b（审核 B1）：A1 只留 1 行 —— abort/seen/hits 已在 RUN 行，命中明细已定案
     if (g_a1Hits > 0) [s appendFormat:@"A1 hits=%d (detail off)\n", g_a1Hits];
     {
@@ -8358,7 +8496,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v130 booting";
+    l.text = @"ESP v131 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
