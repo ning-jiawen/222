@@ -881,7 +881,7 @@ static void   resolveCam(void);
 //     还会每 2 秒跑一遍，实战里就是周期性卡顿。
 static int    g_camBadN     = 0;      // camcall bad 次数：有限重试，不再一次就永久放弃
 static int    g_boxDrawn    = 0;      // 本帧真正画出的框数
-// v151（D2）：坐标源状态提到全局区 —— 换局时要能清，且 edgeIn 早于 v151 区块
+// v152（D2）：坐标源状态提到全局区 —— 换局时要能清，且 edgeIn 早于 v152 区块
 static int    g_posOff      = 0x4C4;  // 坐标源偏移（A18 判据命中后换到逻辑副本）
 static int    g_posOffOk    = 0;
 static int    g_prevSeed    = 0;      // v146：换局时清零，避免上一局字节造成假 delta
@@ -1209,7 +1209,7 @@ static void selfCheck(void) {
     g_hudPage = 0;
     g_found = 0;
     g_clsScanned = 0;
-    CHECK("==== dump v151 ====");
+    CHECK("==== dump v152 ====");
 
     if (!I2.domain || !I2.domain_get_assemblies || !I2.class_from_name) {
         CHECK("no il2cpp"); return;
@@ -1220,7 +1220,7 @@ static void selfCheck(void) {
     CHECK("images: %zu", n);
     if (n == 0) return;
 
-    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v151 images=%zu\n", n];
+    g_dumpFile = [NSMutableString stringWithFormat:@"esp dump v152 images=%zu\n", n];
 
     // 只统计扫描面给 HUD 看（不影响选取）
     for (size_t a = 0; a < n; a++) {
@@ -6045,7 +6045,7 @@ static void drawFixedPanel(ImDrawList *dl, float sw, float sh) {
     int lines = 3 + 6 + 4 + 2;
     dl->AddRectFilled(ImVec2(x0 - 8, y - 4), ImVec2(sw - 6, y + lines * lh + 8),
                       IM_COL32(0, 0, 0, 175), 6.0f);
-    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v151 P0");
+    dl->AddText(f, fs, ImVec2(x0, y), IM_COL32(0, 255, 180, 255), "PANEL v152 P0");
     y += lh;
 
     snprintf(buf, sizeof(buf), "TBL cnt=%d ty0=%d gHero=%d enumN=%d c1=%d c2=%d self=%d metaMode=%d head=%016llx",
@@ -6298,7 +6298,7 @@ static void renderFrame(ImDrawList *dl, float sw, float sh) {
     }
     if (edgeIn) {                                 // v48：每次进对局重置探针额度 ——
         g_prevSeed = 0;                           // v146（D1）：换局清播种，防跨局假 delta
-        g_posOffOk = 0;                           // v151（D2）：换局清坐标源，防旧偏移跨局失效
+        g_posOffOk = 0;                           // v152（D2）：换局清坐标源，防旧偏移跨局失效
         g_posOff = 0x4C4;
         g_verifyN = 0;                            // 载入界面那点零星 actor 会把 3 次额度吃光，
         g_pstRuns = 0;                            // 正式对局里就再也不打印 CNT/TH/PST 了
@@ -8029,7 +8029,9 @@ static void v137Tf(void) {
 //   B7 submap 分支不推进 addr
 #include <mach/mach.h>
 #include <mach/vm_region.h>
-#include <mach/mach_vm.h>   // v151（B1）：mach_vm_* 族在这里声明（region / 分块读）
+// v152：**不要** include <mach/mach_vm.h> —— iOS SDK 里该文件是 `#error mach_vm.h unsupported.`
+//       桩。mach_vm_* 是 macOS 的 64 位 VM API；iOS 用去掉 mach_ 前缀的 vm_* 家族。
+//       本文件 rd() 从 v67 起用的就是 vm_read_overwrite，这条路一直是通的。
 
 #define SCAN_MAXREG   2048
 #define SCAN_CHUNK    (8u << 20)
@@ -8065,17 +8067,17 @@ static int g_skipN = 0;                         // 被跳过的区数（含 subm
 static int g_iters = 0;                         // 实际迭代次数（防"收集数当循环条件"看不清）
 
 // v148（评审 B1/方案A）：vm_region_basic_info_data_64_t **没有 is_submap 成员**。
-// mach_vm_region + BASIC_INFO 会把 submap 当顶层区返回，其 protection == VM_PROT_NONE，
+// vm_region_64 + BASIC_INFO 会把 submap 当顶层区返回，其 protection == VM_PROT_NONE，
 // 天然被保护位判断过滤；所以不需要 is_submap，用 else 计数即可。
 static void mapRegions(void) {
     g_nreg = 0; g_rwMB = 0.0; g_skipN = 0; g_iters = 0;
-    mach_vm_address_t addr = 0;
+    vm_address_t addr = 0;
     for (int it = 0; it < 20000 && g_nreg < SCAN_MAXREG; it++) {
-        mach_vm_size_t sz = 0;
+        vm_size_t sz = 0;
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t obj = MACH_PORT_NULL;
-        if (mach_vm_region(mach_task_self(), &addr, &sz, VM_REGION_BASIC_INFO_64,
+        if (vm_region_64(mach_task_self(), &addr, &sz, VM_REGION_BASIC_INFO_64,
                            (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS) break;
         if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);   // 防句柄累积
         if (sz == 0) break;
@@ -8112,9 +8114,9 @@ static int scanTriple(float x, float y, float z) {
         for (size_t off = 0; off < g_reg[r].len; off += SCAN_CHUNK) {
             size_t len = g_reg[r].len - off;
             if (len > SCAN_CHUNK) len = SCAN_CHUNK;
-            mach_vm_size_t got = 0;
-            if (mach_vm_read_overwrite(mach_task_self(), g_reg[r].base + off, len,
-                                       (mach_vm_address_t)g_chunk, &got) != KERN_SUCCESS) continue;
+            vm_size_t got = 0;
+            if (vm_read_overwrite(mach_task_self(), g_reg[r].base + off, len,
+                                       (vm_address_t)g_chunk, &got) != KERN_SUCCESS) continue;
             size_t nf = (size_t)got / 4;
             const float *pf = (const float *)g_chunk;
             for (size_t i2 = 0; i2 + 3 <= nf; i2++) {
@@ -8145,9 +8147,9 @@ static int findArray(float x, float z, uintptr_t *baseOut, int *nOut) {
         for (size_t off = 0; off + 8 <= g_reg[r].len; off += SCAN_CHUNK) {
             size_t len = g_reg[r].len - off;
             if (len > SCAN_CHUNK) len = SCAN_CHUNK;
-            mach_vm_size_t got = 0;
-            if (mach_vm_read_overwrite(mach_task_self(), g_reg[r].base + off, len,
-                                       (mach_vm_address_t)g_chunk, &got) != KERN_SUCCESS) continue;
+            vm_size_t got = 0;
+            if (vm_read_overwrite(mach_task_self(), g_reg[r].base + off, len,
+                                       (vm_address_t)g_chunk, &got) != KERN_SUCCESS) continue;
             size_t nq = (size_t)got / 8;
             const uintptr_t *sl = (const uintptr_t *)g_chunk;
             for (size_t i2 = 0; i2 < nq; i2++) {
@@ -8292,7 +8294,7 @@ static void v144Hunt(void) {
     }
     g_huntRuns++;
     g_a16N = 0;
-    for (int w = 1; w < OBJ_SZ / 4 - 2 && g_a16N < 2; w++) {   // v151：A16 明细降到 2 行，首屏预算让给 A17/A18/A19/A20
+    for (int w = 1; w < OBJ_SZ / 4 - 2 && g_a16N < 2; w++) {   // v152：A16 明细降到 2 行，首屏预算让给 A17/A18/A19/A20
         if (g_live[w] < 3) continue;
         if (!(g_live[w - 1] >= 3 || g_live[w + 1] >= 3 || g_live[w + 2] >= 3)) continue;
         if (g_live[w - 1] >= 3) continue;
@@ -8308,7 +8310,7 @@ static void v144Hunt(void) {
 }
 
 // ============================================================================
-// v151 · A17/A18/A19/A20 —— 从「仪表」走到「雾中出框」
+// v152 · A17/A18/A19/A20 —— 从「仪表」走到「雾中出框」
 //   v148 判读表已经把路指清：+0x4C4 是 view 层，无视野即冻结 —— 框在、人不动。
 //   本版只做一件事：换坐标源；而且先把「换成哪一份」测出来，测不出来就留证词。
 //     A19  klass 指针枚举：il2cpp 对象头 +0 就是 klass ⇒ 扫到 g_linkerClass 值 = actor 基址。
@@ -8381,7 +8383,7 @@ static uint8_t  *g_a18wCur = NULL;
 static uint8_t  *g_a18wPrev = NULL;
 static int       g_a18wCnt[A18W_SZ / 4];
 
-// g_posOff / g_posOffOk 已在全局区声明（v151 D2：换局要清），此处不再重复定义
+// g_posOff / g_posOffOk 已在全局区声明（v152 D2：换局要清），此处不再重复定义
 
 static int       g_a20Drawn = 0;
 static int       g_a20Edge = 0;
@@ -8395,7 +8397,7 @@ static uintptr_t g_a20PObj[A19_MAXOBJ];
 static float     g_a20PP[A19_MAXOBJ][3];
 static int       g_a20PStill[A19_MAXOBJ];
 
-static void a20Draw(ImDrawList *dl, float sw, float sh, float sc);   // v151：定义在 a10 记录之后（要读 g_a10Seen）
+static void a20Draw(ImDrawList *dl, float sw, float sh, float sc);   // v152：定义在 a10 记录之后（要读 g_a10Seen）
 
 // --- A19：一个地址是不是活的 ActorLinker 实例（klass 在 +0，id 在 0x4AC，坐标在 0x4C4）---
 static int a19ValidObj(uintptr_t obj, unsigned *idOut, int *campOut, int *lvOut, int *typeOut) {
@@ -8451,9 +8453,9 @@ static void a19Enum(void) {
         for (size_t off = 0; off + 8 <= g_reg[r].len; off += SCAN_CHUNK) {
             size_t len = g_reg[r].len - off;
             if (len > SCAN_CHUNK) len = SCAN_CHUNK;
-            mach_vm_size_t got = 0;
-            if (mach_vm_read_overwrite(mach_task_self(), g_reg[r].base + off, len,
-                                       (mach_vm_address_t)g_chunk, &got) != KERN_SUCCESS) continue;
+            vm_size_t got = 0;
+            if (vm_read_overwrite(mach_task_self(), g_reg[r].base + off, len,
+                                       (vm_address_t)g_chunk, &got) != KERN_SUCCESS) continue;
             size_t nq = (size_t)got / 8;
             const uintptr_t *sl = (const uintptr_t *)g_chunk;
             for (size_t i2 = 0; i2 < nq; i2++) {
@@ -8550,7 +8552,7 @@ static void a17Back(void) {
 }
 
 // --- A18：双轨比对 + 广域字段猎 ---
-// v151（B2）：不再假设 y == 0（那条前提从没被验证过）。参照系改成「该单位自己 0x4C4 的 y」，
+// v152（B2）：不再假设 y == 0（那条前提从没被验证过）。参照系改成「该单位自己 0x4C4 的 y」，
 // 逻辑副本必然与该单位同高；被拒的个数记在 g_a18YRej，首屏必须看到它是否为 0。
 static int a18ShapeOk(const float *p, float yRef) {
     if (!p) return 0;
@@ -8558,7 +8560,7 @@ static int a18ShapeOk(const float *p, float yRef) {
     if (fabsf(p[0]) > 20000.0f) return 0;
     if (fabsf(p[2]) > 20000.0f) return 0;
     if (p[0] == 0.0f && p[2] == 0.0f) return 0;
-    // v151（B2）：高度闸放最后 —— yRej 只统计「本来像坐标、但高度不对」的候选，
+    // v152（B2）：高度闸放最后 —— yRej 只统计「本来像坐标、但高度不对」的候选，
     // 不是把每个零碎 float 都算进去（否则这个计数器就只是一条噪声曲线）
     if (fabsf(p[1] - yRef) > 1.0f) { g_a18YRej++; return 0; }
     if (fabsf(p[1]) > 2000.0f) { g_a18YRej++; return 0; }
@@ -8579,13 +8581,13 @@ static int a18SelfAgree(int cand) {
         if (!rd((void *)(g_a19[i] + (uintptr_t)cand), b, 12)) return -1;
         if (!isfinite(b[0]) || !isfinite(b[2])) return 0;
         float d = fabsf(b[0] - a[0]) + fabsf(b[2] - a[2]);
-        return (d <= 2.0f) ? 1 : 0;      // v151（D3）：20 m 是半个屏幕，会把诱饵放进来
+        return (d <= 2.0f) ? 1 : 0;      // v152（D3）：20 m 是半个屏幕，会把诱饵放进来
     }
     return -1;
 }
 
 static void a18SeedCand(void) {
-    // v151（B6）：A17 偏移表或 A19 世代变了就必须重播，否则候选永久卡在 {0x4F8}
+    // v152（B6）：A17 偏移表或 A19 世代变了就必须重播，否则候选永久卡在 {0x4F8}
     int fp = g_a19Gen * 31 + g_a17OffN;
     if (g_a18CandN > 0 && fp == g_a18CandSrc) return;
     g_a18CandSrc = fp;
@@ -8653,7 +8655,7 @@ static void a18Step(void) {
     g_a18Frozen = frozenN;
 
     // ① 候选偏移双轨：0x4C4 冻结、候选在动、候选形状像坐标
-    g_a18YRej = 0;                 // v151：与 tot/mv/dx 同口径（每拍量）；0 才代表「本拍高度闸没杀过候选」
+    g_a18YRej = 0;                 // v152：与 tot/mv/dx 同口径（每拍量）；0 才代表「本拍高度闸没杀过候选」
     for (int c = 0; c < g_a18CandN; c++) {
         g_a18Mv[c] = 0;
         g_a18Tot[c] = 0;
@@ -8683,7 +8685,7 @@ static void a18Step(void) {
     }
 
     // ② 广域字段猎：只对冻结对象整块 diff，并强制「(x,*,z) + 贴近最后已知位置」形状闸
-    //    v151（B3）：计数必须是「本拍量」—— 累计量几十秒内一定被噪声攒到阈值（v142 复发）
+    //    v152（B3）：计数必须是「本拍量」—— 累计量几十秒内一定被噪声攒到阈值（v142 复发）
     for (int w = 0; w < A18W_SZ / 4; w++) g_a18wCnt[w] = 0;
     if (g_a18Seed) {
         for (int f = 0; f < frozenN; f++) {
@@ -8734,7 +8736,7 @@ static void a18Step(void) {
     for (int w = 2; w + 2 < A18W_SZ / 4; w++) {
         if (g_a18wCnt[w] > wmv) { wmv = g_a18wCnt[w]; wbest = w; }
     }
-    // v151（B2/B3）：同一赢家必须连续两拍都在才算证据（单拍噪声不算）
+    // v152（B2/B3）：同一赢家必须连续两拍都在才算证据（单拍噪声不算）
     if (wmv >= 2 && wbest == g_a18wLast) g_a18wStreak++;
     else { g_a18wLast = wbest; g_a18wStreak = (wmv >= 2) ? 1 : 0; }
     g_a18Scan = frozenN;
@@ -8747,7 +8749,7 @@ static void a18Step(void) {
         if (best >= 0) cand = g_a18Cand[best];
         else if (wmv >= 2 && g_a18wStreak >= 2) cand = wbest * 4;
         g_a18SelfV = (cand > 0) ? a18SelfAgree(cand) : -1;
-        // v151（B4）：只有 selfV == 1 才准接管坐标源。-1 只显示证据，不放行。
+        // v152（B4）：只有 selfV == 1 才准接管坐标源。-1 只显示证据，不放行。
         if (cand > 0 && g_a18SelfV == 1) {
             g_posOff = cand;
             g_posOffOk = 1;
@@ -8791,7 +8793,7 @@ static void a18Step(void) {
              g_a18wStreak, g_a18YRej);
 }
 
-static void v151Tick(void) {
+static void v152Tick(void) {
     a19Enum();
     a18Step();
     a17Back();
@@ -8804,7 +8806,7 @@ static void v145Kick(void) {
     g_scanBusy = 1;
     dispatch_async(g_scanQ, ^{
         v144Find();
-        v151Tick();          // v151：A19 枚举 → A18 双轨 → A17 反查
+        v152Tick();          // v152：A19 枚举 → A18 双轨 → A17 反查
         v144Hunt();
         g_scanBusy = 0;
     });
@@ -8820,7 +8822,7 @@ static int g_a10SeenN = 0;
 static void a20Draw(ImDrawList *dl, float sw, float sh, float sc) {
     g_a20Drawn = 0; g_a20Edge = 0; g_a20Far = 0; g_a20Stale = 0; g_a20Bad = 0; g_a20Seen = 0;
     g_a20NonHero = 0;
-    g_a20Last = 0;                  // v151（B5）：提前归零，早退时也代表「这帧没画」
+    g_a20Last = 0;                  // v152（B5）：提前归零，早退时也代表「这帧没画」
     if (!dl || !g_camObj || !g_miW2S) return;
     if (!(sw > 1.0f && sh > 1.0f)) return;
     if (!(sc > 0.1f)) sc = (g_camPxW > 0) ? ((float)g_camPxW / sw) : ((g_uiScale > 0.1f) ? g_uiScale : 3.0f);
@@ -8874,7 +8876,7 @@ static void a20Draw(ImDrawList *dl, float sw, float sh, float sc) {
         if (!obj || !id) continue;
         if (selfId && id == selfId) continue;
         if (camp != 0 && g_myCamp != 0 && camp == g_myCamp) continue;   // 队友不画
-        // v151：类型闸 —— g_heroType 已知时只画英雄；类型未知(0)一律照画（宁多勿漏）
+        // v152：类型闸 —— g_heroType 已知时只画英雄；类型未知(0)一律照画（宁多勿漏）
         if (g_heroType >= 0 && g_a19Type[i] != 0 && g_a19Type[i] != g_heroType) { g_a20NonHero++; continue; }
         int dup = 0;
         for (int q = 0; q < g_a10SeenN; q++) if (g_a10Seen[q] == id) { dup = 1; break; }
@@ -8929,7 +8931,7 @@ static void a20Draw(ImDrawList *dl, float sw, float sh, float sc) {
             if (!(len > 0.001f)) continue;
             vx /= len;
             vy /= len;
-            if (fabsf(vx) < 1e-4f) vx = (vx < 0.0f) ? -1e-4f : 1e-4f;   // v151（D1）：防 inf/NaN
+            if (fabsf(vx) < 1e-4f) vx = (vx < 0.0f) ? -1e-4f : 1e-4f;   // v152（D1）：防 inf/NaN
             if (fabsf(vy) < 1e-4f) vy = (vy < 0.0f) ? -1e-4f : 1e-4f;
             float tx = (fabsf(vx) > 0.0001f) ? (mx / fabsf(vx)) : 1e9f;
             float ty = (fabsf(vy) > 0.0001f) ? (my / fabsf(vy)) : 1e9f;
@@ -8946,7 +8948,7 @@ static void a20Draw(ImDrawList *dl, float sw, float sh, float sc) {
             g_a20Far++;
         }
     }
-    g_a20Last = g_a20Drawn;        // v151（B5）：供下一帧 A10 判断要不要顶上
+    g_a20Last = g_a20Drawn;        // v152（B5）：供下一帧 A10 判断要不要顶上
 }
 
 
@@ -8954,7 +8956,7 @@ static void drawBoxesAll(ImDrawList *dl, float sw, float sh) {
     g_a10Drawn = 0;
     g_a10SeenN = 0;
     g_a10Skip[0] = g_a10Skip[1] = g_a10Skip[2] = g_a10Skip[3] = 0;
-    // v151（B5）：A20 上一帧一个框都没画出来 → A10 必须照画，否则屏幕上什么都看不到
+    // v152（B5）：A20 上一帧一个框都没画出来 → A10 必须照画，否则屏幕上什么都看不到
     if (g_a19N > 0 && g_posOffOk && g_a20Last > 0) return;
     if (!dl || !g_lastEntries || g_lastCnt <= 0) return;
     if (!g_camObj || !g_miW2S || !g_linkerClass) return;
@@ -9452,7 +9454,7 @@ static void updateHud(void) {
         // v122d（审核 B3）：两行模式必须带 A3 首行，否则一出框就再也看不到判定行
         NSString *a3line = (g_a3N > 0) ? [NSString stringWithUTF8String:g_a3[0]] : @"A3 -";
         g_hudLabel.text = [NSString stringWithFormat:
-            @"ESP v151 u%d d%d on%d off%d scan%d c%d in%d pg%d src=0x%X a20=%d 3-finger UP\n"
+            @"ESP v152 u%d d%d on%d off%d scan%d c%d in%d pg%d src=0x%X a20=%d 3-finger UP\n"
              "A3 %@\n"
              "P0 50k=%d(F%d) 55k=%d(F%d) vis=%d inv=%d gone=%d enum=%d src=%d err=%d off=%d\n",
             g_unitCount, g_boxDrawn, g_offN, g_scanN, g_boxDrawn, g_camCallState, g_inMatch,
@@ -9465,7 +9467,7 @@ static void updateHud(void) {
     }
     NSMutableString *s = [NSMutableString stringWithCapacity:4096];
     // v124b（审核 B1/B2）：第一行必须带 R（条目数）—— "该不该拍"的操作前提
-    [s appendFormat:@"ESP v151 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
+    [s appendFormat:@"ESP v152 R=%d ab=%d pg=%d in=%d d=%d bc=%d dn=%d\n",
         g_cntRaw, g_arrBase, g_hudPage % 100, g_inMatch, g_boxDrawn, g_bc, g_dumpN];
     // v13：不再报“选了哪本 DLL”，报扫描面：image 数 / 扫过的类 / 命中数
     // v16：再补单位数和 VP 状态；v22 再补 d（本帧画出的框数）
@@ -9480,7 +9482,7 @@ static void updateHud(void) {
     [s appendFormat:@"A16n frozen=%d/%d runs=%d next=%.0fs\n",
         g_frozenN, g_frozenTot, g_huntRuns, (g_huntNext > 0) ? (g_huntNext - CACurrentMediaTime()) : 0.0];
     for (int i = 0; i < g_a16N; i++) [s appendFormat:@"%s\n", g_a16[i]];
-    // v151：验收顺序反过来 —— A20（出框，立刻可验收）在前，A18（逻辑副本，第二台阶）在后
+    // v152：验收顺序反过来 —— A20（出框，立刻可验收）在前，A18（逻辑副本，第二台阶）在后
     [s appendFormat:@"A20 box=%d edge=%d far=%d stale=%d seen=%d bad=%d self=%u src=0x%X nh=%d\n",
         g_a20Drawn, g_a20Edge, g_a20Far, g_a20Stale, g_a20Seen, g_a20Bad, g_a20Self, g_posOff, g_a20NonHero];
     for (int i = 0; i < g_a19Ln; i++) [s appendFormat:@"%s\n", g_a19L[i]];
@@ -9773,7 +9775,7 @@ static void setupOverlay(void) {
     l.textColor = [UIColor colorWithRed:0.45 green:1.0 blue:0.45 alpha:1.0];
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
     l.userInteractionEnabled = NO;      // 只是个 UILabel，全程不吃触摸
-    l.text = @"ESP v151 booting";
+    l.text = @"ESP v152 booting";
     [vc.view addSubview:l];
 
     g_uiScale = (float)[UIScreen mainScreen].scale;
@@ -9938,7 +9940,7 @@ static void renderOverlay(void) {
 
         if (g_espOn) renderFrame(ImGui::GetBackgroundDrawList(), io.DisplaySize.x, io.DisplaySize.y);
         if (g_espOn) drawBoxesAll(ImGui::GetBackgroundDrawList(), io.DisplaySize.x, io.DisplaySize.y);   // v133
-    if (g_espOn) a20Draw(ImGui::GetBackgroundDrawList(), io.DisplaySize.x, io.DisplaySize.y, 0.0f);   // v151：全量 actor 表 + 穿雾出框
+    if (g_espOn) a20Draw(ImGui::GetBackgroundDrawList(), io.DisplaySize.x, io.DisplaySize.y, 0.0f);   // v152：全量 actor 表 + 穿雾出框
         // v112r6：drawMenu 需要 dl/sw/sh（它内部要调 drawFixedPanel），签名与调用点必须一起改。
         // 这三个值只存在于本函数的 Io/参数里，过去写成无参调用 → 编译期 undeclared identifier。
         if (g_menuOpen) drawMenu(ImGui::GetBackgroundDrawList(), io.DisplaySize.x, io.DisplaySize.y);
