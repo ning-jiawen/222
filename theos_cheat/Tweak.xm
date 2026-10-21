@@ -7175,7 +7175,7 @@ static int a3KlassName(void *k, char *out, int cap) {
     void *img = NULL, *nm = NULL;
     if (!rd(k, &img, sizeof(img)) || !img || !okptr((uintptr_t)img)) return 0;
     if (!rd((char *)k + 16, &nm, sizeof(nm)) || !nm || !okptr((uintptr_t)nm)) return 0;
-    if (!safeCopyStr(nm, out, cap) || !out[0]) return 0;
+    if (!safeCopyStr((const char *)nm, out, cap) || !out[0]) return 0;
     unsigned char c0 = (unsigned char)out[0];
     if (!((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z') || c0 == '_')) { out[0] = 0; return 0; }
     return 1;
